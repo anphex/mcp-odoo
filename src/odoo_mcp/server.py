@@ -492,8 +492,20 @@ def allowed_side_effect_methods() -> List[str]:
 
 
 def side_effect_method_allowed(model: str, method: str) -> bool:
-    """Check exact side-effect allowlist entries."""
-    return f"{model}.{method}" in set(allowed_side_effect_methods())
+    """Check exact side-effect allowlist entries.
+
+    NESA: in addition to the upstream CSV env var, an optional DB-driven
+    allowlist is consulted when ``ODOO_MCP_METHOD_ALLOWLIST_MODEL`` points
+    at an Odoo model (typically ``nesa.mcp.allowed_method``). The DB-side
+    can be managed via Odoo backend without touching the systemd unit and
+    enforces NESA's DATEV/Payroll blocklist on the constraint layer.
+    """
+    target = f"{model}.{method}"
+    if target in set(allowed_side_effect_methods()):
+        return True
+    # NESA DB-Allowlist (additive). Returns frozenset() when env unset.
+    from . import _nesa_db_allowlist
+    return target in _nesa_db_allowlist.methods()
 
 
 def chatter_direct_enabled() -> bool:
@@ -515,6 +527,11 @@ def runtime_security_report() -> Dict[str, Any]:
         "unknown_execute_method_enabled": broad_unknown_enabled,
         "chatter_direct_enabled": chatter_direct_enabled(),
         "allowed_side_effect_methods": allowed_side_effect_methods(),
+        "nesa_db_allowlist": (
+            __import__(
+                "odoo_mcp._nesa_db_allowlist", fromlist=["describe_state"],
+            ).describe_state()
+        ),
         "broad_unknown_method_mode": {
             "enabled": broad_unknown_enabled,
             "risk": ("broad" if broad_unknown_enabled else "off"),
