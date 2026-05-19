@@ -54,7 +54,19 @@ def _model_name() -> str | None:
 
 
 def _fetch_once() -> tuple[frozenset[str], dict[str, str]]:
-    """Single XML-RPC fetch. Caller holds ``_lock``."""
+    """Single XML-RPC fetch. Caller holds ``_lock``.
+
+    Two-phase: first reads ``method_path`` + ``description`` from the
+    allowlist model. For rows with an empty description, the Python
+    docstring of the referenced method is fetched as a fallback via
+    ``nesa.mcp.allowed_method.get_method_doc(model_name, method_name)``
+    (NESA-Patch 4). Lets allowlist-authors skip writing descriptions
+    when the source docstring is already LLM-ready.
+
+    Docstring lookups are best-effort: if the fallback call fails or
+    returns an empty string, the method stays in the allowlist set but
+    contributes no description (consumers handle ``None``).
+    """
     # Import lazily so that pure unit-test imports of this module do not
     # pull the full OdooClient stack (avoids import cycles during pytest).
     from .odoo_client import get_odoo_client
@@ -71,6 +83,7 @@ def _fetch_once() -> tuple[frozenset[str], dict[str, str]]:
     )
     methods: set[str] = set()
     descriptions: dict[str, str] = {}
+    fallback_targets: list[tuple[str, str, str]] = []  # (path, model_name, method_name)
     for row in rows or []:
         path = (row.get("method_path") or "").strip()
         if not path:
@@ -79,6 +92,29 @@ def _fetch_once() -> tuple[frozenset[str], dict[str, str]]:
         desc = row.get("description")
         if isinstance(desc, str) and desc.strip():
             descriptions[path] = desc.strip()
+            continue
+        # Empty description -> queue for docstring fallback.
+        if "." in path:
+            model_name, _, method_name = path.rpartition(".")
+            if model_name and method_name:
+                fallback_targets.append((path, model_name, method_name))
+
+    # Phase 2: docstring fallback. One XML-RPC call per target. Cheap (cache
+    # TTL keeps refresh-rate low) and only hits rows without explicit desc.
+    for path, model_name, method_name in fallback_targets:
+        try:
+            doc = odoo.execute_method(
+                model, "get_method_doc", model_name, method_name,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort enrichment
+            _logger.debug(
+                "[nesa_db_allowlist] get_method_doc fallback failed for %s: %s",
+                path, exc,
+            )
+            continue
+        if isinstance(doc, str) and doc.strip():
+            descriptions[path] = doc.strip()
+
     return frozenset(methods), descriptions
 
 
