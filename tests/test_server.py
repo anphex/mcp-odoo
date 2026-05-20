@@ -26,14 +26,105 @@ class FakeRequest:
 
 class FakeCtx:
     def __init__(self, odoo):
-        self.request_context = FakeRequest(FakeLife(odoo))
+        self.request_context = FakeRequest(FakeLife(_wrap_with_approval_store(odoo)))
 
 
 class FakeLife:
     def __init__(self, odoo):
         self.odoo = odoo
         self.schema_cache = {}
-        self.write_approvals = {}
+
+
+# ---------------------------------------------------------------------------
+# NESA Patch 3 (2026-05-20): Approval-Tokens werden seit nesa_mcp_bridge
+# 18.0.1.2.0 / server.py "Patch 3" in Odoo persistiert (Tabelle
+# nesa.mcp.approval.token). Die alten Tests assertierten gegen
+# AppContext.write_approvals (in-memory dict, jetzt entfernt). Hier wird
+# ein FakeApprovalStore um den Test-OdooClient gewickelt, der die drei
+# Helper-Methoden 1:1 mit der DB-Implementation simuliert. Tests bleiben
+# damit semantisch dasselbe und greifen weiter den End-to-End-Flow ab
+# (preview -> validate -> execute_approved -> revoke).
+# ---------------------------------------------------------------------------
+
+class _FakeApprovalStoreClient:
+    """Wraps a test-OdooClient so that execute_method calls against
+    'nesa.mcp.approval.token' hit an in-memory store with the same
+    contract as the bridge-side helper methods."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.approval_store = {}
+
+    def __getattr__(self, name):
+        # Forward anything not explicitly overridden to the wrapped client.
+        return getattr(self._inner, name)
+
+    def get_model_fields(self, model):
+        return self._inner.get_model_fields(model)
+
+    @staticmethod
+    def _canonical_hash(payload):
+        import hashlib as _h
+        import json as _j
+        if not isinstance(payload, dict):
+            return ""
+        return _h.sha256(
+            _j.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def execute_method(self, model, method, *args, **kwargs):
+        if model == "nesa.mcp.approval.token":
+            return self._dispatch_token(method, args)
+        return self._inner.execute_method(model, method, *args, **kwargs)
+
+    def _dispatch_token(self, method, args):
+        import time as _t
+        if method == "mcp_register_approval":
+            token, model_name, operation, payload, _validated_at_iso = args
+            existing = self.approval_store.get(token)
+            payload_hash = self._canonical_hash(payload)
+            if existing and existing["payload_hash"] != payload_hash:
+                return {"success": False, "error": "token already exists with different payload"}
+            self.approval_store[token] = {
+                "model_name": model_name,
+                "operation": operation,
+                "payload": payload,
+                "payload_hash": payload_hash,
+                "validated_at": _t.time(),
+                "expires_at": _t.time() + 600,
+            }
+            return {"success": True, "token": token, "expires_at_iso": "2030-01-01 00:00:00"}
+        if method == "mcp_consume_approval":
+            token, expected_hash = args
+            record = self.approval_store.get(token)
+            if not record:
+                return {"success": False, "error": "approval token has not been validated in this server session or has expired; call validate_write first"}
+            if _t.time() > record["expires_at"]:
+                self.approval_store.pop(token, None)
+                return {"success": False, "error": "approval token expired"}
+            if expected_hash and record["payload_hash"] != expected_hash:
+                return {"success": False, "error": "approval payload does not match the stored validation record"}
+            return {
+                "success": True,
+                "payload": record["payload"],
+                "validated_at_iso": "2030-01-01 00:00:00",
+                "expires_at_iso": "2030-01-01 00:10:00",
+            }
+        if method == "mcp_revoke_approval":
+            token, = args
+            self.approval_store.pop(token, None)
+            return {"success": True, "revoked": True}
+        raise AssertionError(f"unexpected token-store method {method!r}")
+
+
+def _wrap_with_approval_store(odoo):
+    """Wrap a test OdooClient so token-store roundtrips work transparently.
+
+    Idempotent: if already wrapped, return as-is.
+    """
+    if odoo is None or isinstance(odoo, _FakeApprovalStoreClient):
+        return odoo
+    return _FakeApprovalStoreClient(odoo)
 
 
 def test_server_import_initializes_fastmcp_with_current_sdk_without_lifespan():
@@ -517,7 +608,7 @@ def test_validate_write_only_registers_live_metadata_approvals(monkeypatch):
 
     assert shape_only["success"] is True
     assert shape_only["approval_status"]["stored"] is False
-    assert ctx.request_context.lifespan_context.write_approvals == {}
+    assert ctx.request_context.lifespan_context.odoo.approval_store == {}
 
     monkeypatch.setenv("ODOO_MCP_ENABLE_WRITES", "1")
     blocked = server.execute_approved_write(ctx, shape_only["approval"], confirm=True)
@@ -559,7 +650,7 @@ def test_validate_write_rejects_empty_live_metadata_for_unlink(monkeypatch):
     assert validation["success"] is False
     assert "metadata was empty" in validation["error"]
     assert validation["approval_status"]["stored"] is False
-    assert ctx.request_context.lifespan_context.write_approvals == {}
+    assert ctx.request_context.lifespan_context.odoo.approval_store == {}
 
     monkeypatch.setenv("ODOO_MCP_ENABLE_WRITES", "1")
     preview = server.preview_write("res.partner", "unlink", record_ids=[7])
@@ -1926,25 +2017,54 @@ def test_register_write_approval_returns_false_for_missing_token():
 
 
 def test_require_validated_write_approval_returns_none_when_token_missing():
+    """NESA Patch 3: token lookup now goes through app_context.odoo. Use the
+    FakeCtx wrapper which routes 'nesa.mcp.approval.token' to an in-memory
+    store; missing token -> require returns None."""
     server = importlib.import_module("odoo_mcp.server")
-    ctx = server.AppContext()
-    assert server.require_validated_write_approval(ctx, {"token": "ghost"}) is None
+
+    class _DummyClient:
+        def get_model_fields(self, model):
+            return {}
+
+        def execute_method(self, *args, **kwargs):
+            raise AssertionError("non-token methods should not be called")
+
+    ctx = FakeCtx(_DummyClient())
+    assert server.require_validated_write_approval(
+        ctx.request_context.lifespan_context, {"token": "ghost"}
+    ) is None
 
 
 def test_require_validated_write_approval_clears_expired_records():
+    """NESA Patch 3: expired tokens are evicted by _mcp_consume_approval in
+    the bridge model. Server-side, the require helper simply observes a
+    failure-dict (success=False) and returns None — the bridge eviction is
+    invisible to the server lifespan."""
     server = importlib.import_module("odoo_mcp.server")
-    ctx = server.AppContext()
-    ctx.write_approvals["odoo-write:expired"] = {
-        "approval": {},
+
+    class _DummyClient:
+        def get_model_fields(self, model):
+            return {}
+
+        def execute_method(self, *args, **kwargs):
+            raise AssertionError("non-token methods should not be called")
+
+    ctx = FakeCtx(_DummyClient())
+    life = ctx.request_context.lifespan_context
+    # Seed expired record directly in the wrapped client's in-memory store.
+    life.odoo.approval_store["odoo-write:expired"] = {
+        "model_name": "res.partner",
+        "operation": "write",
         "payload": {},
+        "payload_hash": "",
         "validated_at": 0,
         "expires_at": 0,  # already expired
     }
-    assert (
-        server.require_validated_write_approval(ctx, {"token": "odoo-write:expired"})
-        is None
-    )
-    assert "odoo-write:expired" not in ctx.write_approvals
+    assert server.require_validated_write_approval(
+        life, {"token": "odoo-write:expired"}
+    ) is None
+    # Bridge-side eviction: store should drop the expired record after consume.
+    assert "odoo-write:expired" not in life.odoo.approval_store
 
 
 # ----- configured_addons_roots / restrict_addons_paths ------------------
@@ -2435,10 +2555,14 @@ def test_execute_approved_write_rejects_invalid_operation(monkeypatch):
     }
     token = server.build_approval_token(canonical)
     approval = {**canonical, "token": token}
-    # Register as if validate_write had stored it
-    ctx.request_context.lifespan_context.write_approvals[token] = {
-        "approval": dict(approval),
-        "payload": server.write_approval_payload(approval),
+    # Register as if validate_write had stored it — NESA Patch 3: dict lives
+    # in the wrapped client's approval_store (mimics the DB-backed table).
+    canonical_payload = server.write_approval_payload(approval)
+    ctx.request_context.lifespan_context.odoo.approval_store[token] = {
+        "model_name": canonical_payload["model"],
+        "operation": canonical_payload["operation"],
+        "payload": canonical_payload,
+        "payload_hash": ctx.request_context.lifespan_context.odoo._canonical_hash(canonical_payload),
         "validated_at": _time.time(),
         "expires_at": _time.time() + 600,
     }
@@ -2462,8 +2586,13 @@ def test_execute_approved_write_rejects_when_payload_does_not_match(monkeypatch)
     validation = server.validate_write(
         ctx, "res.partner", "write", values={"name": "Ada"}, record_ids=[7]
     )
-    # Mutate stored validation record's payload so equality fails
-    record = list(ctx.request_context.lifespan_context.write_approvals.values())[0]
+    # Mutate stored validation record's payload but KEEP the original
+    # payload_hash. This exercises the server-side defense-in-depth check:
+    # consume passes (caller-supplied hash matches stored hash because both
+    # were computed over the original payload), but the dict-equality
+    # comparison in execute_approved_write detects the divergence and
+    # produces the "stored validation record" error.
+    record = list(ctx.request_context.lifespan_context.odoo.approval_store.values())[0]
     record["payload"]["values"] = {"name": "DIFFERENT"}
     monkeypatch.setenv("ODOO_MCP_ENABLE_WRITES", "1")
     result = server.execute_approved_write(ctx, validation["approval"], confirm=True)

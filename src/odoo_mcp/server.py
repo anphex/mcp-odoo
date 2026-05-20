@@ -4,13 +4,15 @@ MCP server for Odoo integration
 Provides MCP tools and resources for interacting with Odoo ERP systems
 """
 
+import hashlib
 import json
+import logging
 import os
 import re
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
 
@@ -41,6 +43,8 @@ from .diagnostics import (
 )
 from .odoo_client import OdooClient, get_odoo_client
 
+logger = logging.getLogger(__name__)
+
 MODEL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*$")
 METHOD_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 MAX_SEARCH_LIMIT = 100
@@ -49,14 +53,27 @@ WRITE_APPROVAL_TTL_SECONDS = 10 * 60
 
 @dataclass
 class AppContext:
-    """Application context with lazy Odoo client access."""
+    """Application context with lazy Odoo client access.
+
+    NESA Patch 3 (2026-05-20): write_approvals wurde aus dem AppContext
+    entfernt — Token-Store lebt jetzt in der Odoo-Tabelle
+    nesa.mcp.approval.token. Grund: StreamableHTTPSessionManager spawnt
+    pro Mcp-Session-Id einen eigenen app.run()-Aufruf mit eigener
+    AppContext-Instanz. Die NESA-Bridge baut pro Tool-Call eine neue
+    Client-Session auf (siehe nesa_mcp_bridge/services/mcp_proxy.py
+    Lifetime-Kommentar) — Token aus validate_write war nicht in der
+    AppContext-Instanz von execute_approved_write sichtbar.
+    Sub-Agent-Smoke 2026-05-20 bestaetigte das Verhalten.
+    Helper-Funktionen register/require/revoke_write_approval rufen jetzt
+    via app_context.odoo die Tabellen-Methoden _mcp_register_approval /
+    _mcp_consume_approval / _mcp_revoke_approval auf.
+    """
 
     odoo_factory: Callable[[], OdooClient] = field(
         default_factory=lambda: get_odoo_client
     )
     _odoo: OdooClient | None = None
     schema_cache: Dict[str, Dict[str, Any]] = field(default_factory=dict)
-    write_approvals: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     @property
     def odoo(self) -> OdooClient:
@@ -564,21 +581,65 @@ def mcp_surface_counts() -> Dict[str, int]:
     }
 
 
+def _canonical_payload_hash(payload: Dict[str, Any]) -> str:
+    """SHA-256 ueber kanonische JSON-Serialisierung (sort_keys, no whitespace).
+
+    Identisch zur Hash-Funktion im NESA-Modul (nesa_mcp_bridge/models/
+    nesa_mcp_approval_token.py) — beide Seiten muessen denselben Hash
+    fuer denselben Payload errechnen, sonst matcht der Approval-Vergleich
+    beim consume nicht.
+    """
+    if not isinstance(payload, dict):
+        return ""
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def register_write_approval(app_context: AppContext, report: Dict[str, Any]) -> bool:
-    """Persist validated write approvals inside the current server lifespan."""
+    """Persist validated write approval via NESA bridge (DB-backed token store).
+
+    NESA Patch 3 (2026-05-20): ersetzt In-Memory-Dict (per-lifespan, also
+    per-MCP-Session) durch persistierte Odoo-Tabelle nesa.mcp.approval.token.
+    Begrundung siehe AppContext-Docstring + Modul-Datei
+    nesa_mcp_approval_token.py.
+
+    Aufrufer behaelt boolean-API. Erfolgs/Fehler-Branch identisch zum
+    Vorgaenger — Caller (validate_write) annotiert ``approval_status.stored``.
+    """
     approval = report.get("approval")
     if not report.get("success") or not isinstance(approval, dict):
         return False
     token = str(approval.get("token", ""))
     if not token:
         return False
+
+    payload = write_approval_payload(approval)
     now = time.time()
-    app_context.write_approvals[token] = {
-        "approval": dict(approval),
-        "payload": write_approval_payload(approval),
-        "validated_at": now,
-        "expires_at": now + WRITE_APPROVAL_TTL_SECONDS,
-    }
+    validated_at_iso = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        result = app_context.odoo.execute_method(
+            "nesa.mcp.approval.token",
+            "mcp_register_approval",
+            token,
+            str(approval.get("model", "")),
+            str(approval.get("operation", "")),
+            payload,
+            validated_at_iso,
+        )
+    except Exception:  # noqa: BLE001 — odoo_client wraps multiple xmlrpc/json2 errors
+        logger.exception("[approval-token] DB register failed for token=%s", token)
+        return False
+
+    if not isinstance(result, dict) or not result.get("success"):
+        logger.warning(
+            "[approval-token] DB register rejected token=%s reason=%s",
+            token, (result or {}).get("error") if isinstance(result, dict) else "non-dict reply",
+        )
+        return False
+
+    # Surface validated_at + expires_at back to the LLM via the report —
+    # downstream prompt-engineering refers to expires_at_iso for retry windows.
     approval["validated_at"] = now
     approval["expires_at"] = now + WRITE_APPROVAL_TTL_SECONDS
     return True
@@ -587,15 +648,68 @@ def register_write_approval(app_context: AppContext, report: Dict[str, Any]) -> 
 def require_validated_write_approval(
     app_context: AppContext, approval: Dict[str, Any]
 ) -> Dict[str, Any] | None:
-    """Return a server-side validation record or None when it is missing/expired."""
+    """Return server-side validation record or None when missing/expired/mismatched.
+
+    NESA Patch 3 (2026-05-20): liest aus DB-Tabelle nesa.mcp.approval.token
+    statt aus In-Memory-Dict. Payload-Hash wird ge-pruef damit der Token
+    nicht fuer einen abweichenden Payload missbraucht werden kann.
+    """
     token = str(approval.get("token", ""))
-    record = app_context.write_approvals.get(token)
-    if record is None:
+    if not token:
         return None
-    if time.time() > float(record.get("expires_at", 0)):
-        app_context.write_approvals.pop(token, None)
+    expected_hash = _canonical_payload_hash(write_approval_payload(approval))
+
+    try:
+        result = app_context.odoo.execute_method(
+            "nesa.mcp.approval.token",
+            "mcp_consume_approval",
+            token,
+            expected_hash,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("[approval-token] DB consume failed for token=%s", token)
         return None
-    return record
+
+    if not isinstance(result, dict) or not result.get("success"):
+        # Caller (execute_approved_write) maps None to the public error
+        # string. Reason logged for forensics.
+        if isinstance(result, dict):
+            logger.info(
+                "[approval-token] consume rejected token=%s reason=%s",
+                token, result.get("error"),
+            )
+        return None
+
+    payload = result.get("payload") or {}
+    return {
+        "approval": dict(approval),
+        "payload": payload,
+        "validated_at_iso": result.get("validated_at_iso"),
+        "expires_at_iso": result.get("expires_at_iso"),
+    }
+
+
+def revoke_write_approval(app_context: AppContext, token: str) -> None:
+    """Best-effort token revocation after successful execute_approved_write.
+
+    Failures are logged but never re-raised — at this point the write has
+    already landed; a dangling token will be cleaned up by the bridge cron
+    within an hour anyway. Caller should not block the success-response on
+    revoke errors.
+    """
+    if not token:
+        return
+    try:
+        app_context.odoo.execute_method(
+            "nesa.mcp.approval.token",
+            "mcp_revoke_approval",
+            token,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[approval-token] revoke failed for token=%s — cleanup-cron will sweep",
+            token,
+        )
 
 
 def write_approval_payload(approval: Dict[str, Any]) -> Dict[str, Any]:
@@ -1554,7 +1668,11 @@ def execute_approved_write(
                     "or has expired; call validate_write first"
                 ),
             }
-        if write_approval_payload(approval) != validation_record.get("payload"):
+        # NESA Patch 3 — payload-hash already verified inside _mcp_consume_approval;
+        # this extra equality check stays as defense-in-depth in case the DB store
+        # ever returns a partial record. Cheap dict-equality, no roundtrip.
+        stored_payload = validation_record.get("payload") or {}
+        if write_approval_payload(approval) != stored_payload:
             return {
                 "success": False,
                 "tool": "execute_approved_write",
@@ -1591,7 +1709,8 @@ def execute_approved_write(
             args = [record_ids]
 
         result = app_context.odoo.execute_method(model, operation, *args, **kwargs)
-        app_context.write_approvals.pop(str(approval.get("token", "")), None)
+        # NESA Patch 3 — DB-backed token revocation (replaces in-memory pop).
+        revoke_write_approval(app_context, str(approval.get("token", "")))
         return {
             "success": True,
             "tool": "execute_approved_write",
