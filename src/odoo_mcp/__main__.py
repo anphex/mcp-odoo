@@ -280,7 +280,27 @@ def main() -> int:
             if args.transport == "streamable-http":
                 print(f"  Path: {args.path}", file=sys.stderr)
         sys.stderr.flush()
-        mcp.run(transport=args.transport)
+
+        if args.transport == "streamable-http":
+            # NESA Patch 2 (Per-User-Auth): wrap the streamable-http app
+            # in an ASGI middleware that pins X-Odoo-User /
+            # X-Odoo-Api-Key onto a request-scoped ContextVar before the
+            # FastMCP session manager handles the call. ``get_odoo_client``
+            # then resolves a per-user OdooClient instead of the
+            # env-based service account.
+            import uvicorn
+
+            from ._nesa_per_user_auth import NesaPerUserAuthMiddleware
+
+            wrapped_app = NesaPerUserAuthMiddleware(mcp.streamable_http_app())
+            uvicorn.run(
+                wrapped_app,
+                host=mcp.settings.host,
+                port=mcp.settings.port,
+                log_level=mcp.settings.log_level.lower(),
+            )
+        else:
+            mcp.run(transport=args.transport)
 
         print("MCP server stopped normally", file=sys.stderr)
         return 0

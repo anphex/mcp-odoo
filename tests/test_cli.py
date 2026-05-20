@@ -22,12 +22,19 @@ def test_parse_args_defaults_to_stdio(monkeypatch):
 
 def test_cli_applies_streamable_http_runtime_settings(monkeypatch):
     cli = importlib.import_module("odoo_mcp.__main__")
-    calls = []
+    uvicorn_calls = []
 
-    def fake_run(*, transport):
-        calls.append(transport)
+    # NESA Patch 2: streamable-http now goes through uvicorn.run with the
+    # NesaPerUserAuthMiddleware-wrapped Starlette app instead of mcp.run.
+    # The test still asserts that the runtime settings reach FastMCP and
+    # that the streamable-http branch was taken — by capturing
+    # uvicorn.run + skipping mcp.streamable_http_app construction.
+    import uvicorn
 
-    monkeypatch.setattr(cli.mcp, "run", fake_run)
+    monkeypatch.setattr(
+        cli.mcp, "streamable_http_app", lambda: object(), raising=False,
+    )
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: uvicorn_calls.append((a, kw)))
     monkeypatch.setattr(
         cli.sys,
         "argv",
@@ -52,7 +59,11 @@ def test_cli_applies_streamable_http_runtime_settings(monkeypatch):
     )
 
     assert cli.main() == 0
-    assert calls == ["streamable-http"]
+    assert len(uvicorn_calls) == 1
+    _, kwargs = uvicorn_calls[0]
+    assert kwargs["host"] == "0.0.0.0"
+    assert kwargs["port"] == 9999
+    assert kwargs["log_level"] == "warning"
     assert cli.mcp.settings.host == "0.0.0.0"
     assert cli.mcp.settings.port == 9999
     assert cli.mcp.settings.streamable_http_path == "/mcp-test"
@@ -293,7 +304,10 @@ def test_main_masks_secret_environment_values_in_startup_log(monkeypatch, capsys
 def test_main_logs_streamable_http_bind_and_path(monkeypatch, capsys):
     cli = importlib.import_module("odoo_mcp.__main__")
 
-    monkeypatch.setattr(cli.mcp, "run", lambda *, transport: None)
+    import uvicorn
+
+    monkeypatch.setattr(cli.mcp, "streamable_http_app", lambda: object(), raising=False)
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: None)
     monkeypatch.setattr(
         cli.sys,
         "argv",
