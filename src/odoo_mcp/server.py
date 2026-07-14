@@ -63,10 +63,10 @@ class AppContext:
     Client-Session auf (siehe nesa_mcp_bridge/services/mcp_proxy.py
     Lifetime-Kommentar) — Token aus validate_write war nicht in der
     AppContext-Instanz von execute_approved_write sichtbar.
-    Sub-Agent-Smoke 2026-05-20 bestaetigte das Verhalten.
+    Sub-Agent-Smoke 2026-05-20 bestätigte das Verhalten.
     Helper-Funktionen register/require/revoke_write_approval rufen jetzt
-    via app_context.odoo die Tabellen-Methoden _mcp_register_approval /
-    _mcp_consume_approval / _mcp_revoke_approval auf.
+    via app_context.odoo die Tabellen-Methoden mcp_register_approval /
+    mcp_consume_approval / mcp_revoke_approval auf.
     """
 
     odoo_factory: Callable[[], OdooClient] = field(
@@ -547,6 +547,11 @@ def runtime_security_report() -> Dict[str, Any]:
         "nesa_db_allowlist": (
             __import__(
                 "odoo_mcp._nesa_db_allowlist", fromlist=["describe_state"],
+            ).describe_state()
+        ),
+        "nesa_per_user_auth": (
+            __import__(
+                "odoo_mcp._nesa_per_user_auth", fromlist=["describe_state"],
             ).describe_state()
         ),
         "broad_unknown_method_mode": {
@@ -1668,7 +1673,7 @@ def execute_approved_write(
                     "or has expired; call validate_write first"
                 ),
             }
-        # NESA Patch 3 — payload-hash already verified inside _mcp_consume_approval;
+        # NESA Patch 3 — payload-hash already verified inside mcp_consume_approval;
         # this extra equality check stays as defense-in-depth in case the DB store
         # ever returns a partial record. Cheap dict-equality, no roundtrip.
         stored_payload = validation_record.get("payload") or {}

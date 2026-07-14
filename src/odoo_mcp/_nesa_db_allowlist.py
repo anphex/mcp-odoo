@@ -18,8 +18,10 @@ Design rules:
     (or an empty set if there is none). The MCP-server keeps serving
     on the upstream CSV allowlist; the failure is logged and exposed
     via :func:`describe_state`.
-  - Thread-safe: a coarse-grained lock guards refresh; the gate
-    function reads a snapshot tuple under the same lock.
+  - Thread-safe: state transitions are locked, while XML-RPC network calls
+    happen outside the lock. Concurrent readers keep the last-known snapshot.
+  - Service-owned: refresh always uses the configured service account, never
+    credentials inherited from the human request that happened to trigger it.
 
 Intended caller: :mod:`odoo_mcp.server` ``side_effect_method_allowed``
 (see ``_nesa_*``-prefixed integration there).
@@ -37,6 +39,7 @@ _logger = logging.getLogger(__name__)
 
 _CACHE_TTL_SECONDS = int(os.environ.get("ODOO_MCP_METHOD_ALLOWLIST_TTL", "60"))
 _ALLOWLIST_MODEL_ENV = "ODOO_MCP_METHOD_ALLOWLIST_MODEL"
+_ALLOW_EMPTY_ENV = "ODOO_MCP_METHOD_ALLOWLIST_ALLOW_EMPTY"
 
 # State guarded by ``_lock``.
 _lock = threading.Lock()
@@ -45,6 +48,7 @@ _cache_descriptions: dict[str, str] = {}
 _cache_fetched_at: float = 0.0
 _cache_last_error: str | None = None
 _cache_last_success_at: float = 0.0
+_refresh_in_progress = False
 
 
 def _model_name() -> str | None:
@@ -53,8 +57,15 @@ def _model_name() -> str | None:
     return val or None
 
 
+def _allow_empty_result() -> bool:
+    """Allow an intentional empty DB policy only after explicit opt-in."""
+    return os.environ.get(_ALLOW_EMPTY_ENV, "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 def _fetch_once() -> tuple[frozenset[str], dict[str, str]]:
-    """Single XML-RPC fetch. Caller holds ``_lock``.
+    """Perform one XML-RPC fetch without holding the process state lock.
 
     Two-phase: first reads ``method_path`` + ``description`` from the
     allowlist model. For rows with an empty description, the Python
@@ -69,12 +80,12 @@ def _fetch_once() -> tuple[frozenset[str], dict[str, str]]:
     """
     # Import lazily so that pure unit-test imports of this module do not
     # pull the full OdooClient stack (avoids import cycles during pytest).
-    from .odoo_client import get_odoo_client
+    from .odoo_client import get_service_odoo_client
 
     model = _model_name()
     if not model:
         return frozenset(), {}
-    odoo = get_odoo_client()
+    odoo = get_service_odoo_client()
     rows: list[dict[str, Any]] = odoo.execute_method(
         model,
         "search_read",
@@ -119,51 +130,85 @@ def _fetch_once() -> tuple[frozenset[str], dict[str, str]]:
 
 
 def _refresh_if_stale() -> None:
-    """Refresh cache under ``_lock`` when TTL expired and env var set."""
+    """Refresh stale state once while concurrent callers use the old snapshot."""
     global _cache_methods, _cache_descriptions
     global _cache_fetched_at, _cache_last_error, _cache_last_success_at
-    if not _model_name():
-        # Disabled -> drop any stale cache so describe_state is honest.
-        if _cache_methods or _cache_descriptions:
+    global _refresh_in_progress
+
+    model = _model_name()
+    with _lock:
+        if not model:
+            # Disabled -> drop stale state so describe_state is honest.
             _cache_methods = frozenset()
             _cache_descriptions = {}
-        return
-    now = time.time()
-    if now - _cache_fetched_at < _CACHE_TTL_SECONDS:
-        return
-    _cache_fetched_at = now
+            _cache_fetched_at = 0.0
+            _cache_last_error = None
+            _cache_last_success_at = 0.0
+            _refresh_in_progress = False
+            return
+        now = time.monotonic()
+        if (
+            now - _cache_fetched_at < _CACHE_TTL_SECONDS
+            or _refresh_in_progress
+        ):
+            return
+        _refresh_in_progress = True
+
     try:
         methods, descriptions = _fetch_once()
+        if not methods and not _allow_empty_result():
+            raise RuntimeError(
+                "DB allowlist returned no methods; keeping last-known policy. "
+                f"Set {_ALLOW_EMPTY_ENV}=1 only for an intentional empty policy."
+            )
     except Exception as exc:  # noqa: BLE001 — failure-soft by design
-        _cache_last_error = f"{type(exc).__name__}: {exc}"
+        finished_at = time.monotonic()
+        error = f"{type(exc).__name__}: {exc}"
+        with _lock:
+            _cache_fetched_at = finished_at
+            _cache_last_error = error
+            cached_count = len(_cache_methods)
+            success_age = (
+                finished_at - _cache_last_success_at
+                if _cache_last_success_at else -1
+            )
         _logger.warning(
             "[nesa_db_allowlist] fetch failed, keeping last known set "
             "(%d entries, last_success_age=%.1fs): %s",
-            len(_cache_methods),
-            now - _cache_last_success_at if _cache_last_success_at else -1,
-            _cache_last_error,
+            cached_count,
+            success_age,
+            error,
         )
         return
-    _cache_methods = methods
-    _cache_descriptions = descriptions
-    _cache_last_error = None
-    _cache_last_success_at = now
-    _logger.info(
-        "[nesa_db_allowlist] cache refreshed: %d methods", len(methods),
-    )
+    else:
+        finished_at = time.monotonic()
+        with _lock:
+            _cache_methods = methods
+            _cache_descriptions = descriptions
+            _cache_fetched_at = finished_at
+            _cache_last_error = None
+            _cache_last_success_at = finished_at
+        _logger.info(
+            "[nesa_db_allowlist] cache refreshed: %d methods", len(methods),
+        )
+    finally:
+        # Also reset on BaseException (shutdown/interrupt). Without this,
+        # future readers could remain pinned to the last snapshot forever.
+        with _lock:
+            _refresh_in_progress = False
 
 
 def methods() -> frozenset[str]:
     """Return the current allowlist set (cached, may trigger refresh)."""
+    _refresh_if_stale()
     with _lock:
-        _refresh_if_stale()
         return _cache_methods
 
 
 def description(method_path: str) -> str | None:
     """Return the LLM-facing description for ``method_path`` if cached."""
+    _refresh_if_stale()
     with _lock:
-        _refresh_if_stale()
         return _cache_descriptions.get(method_path)
 
 
@@ -181,14 +226,16 @@ def describe_state() -> dict[str, Any]:
             "ttl_seconds": _CACHE_TTL_SECONDS,
             "cached_method_count": len(_cache_methods),
             "cache_age_seconds": (
-                round(time.time() - _cache_fetched_at, 1)
+                round(time.monotonic() - _cache_fetched_at, 1)
                 if _cache_fetched_at else None
             ),
             "last_error": _cache_last_error,
             "last_success_age_seconds": (
-                round(time.time() - _cache_last_success_at, 1)
+                round(time.monotonic() - _cache_last_success_at, 1)
                 if _cache_last_success_at else None
             ),
+            "refresh_in_progress": _refresh_in_progress,
+            "empty_result_allowed": _allow_empty_result(),
         }
 
 
@@ -196,9 +243,11 @@ def reset_for_tests() -> None:
     """Drop all cached state. For unit tests only."""
     global _cache_methods, _cache_descriptions
     global _cache_fetched_at, _cache_last_error, _cache_last_success_at
+    global _refresh_in_progress
     with _lock:
         _cache_methods = frozenset()
         _cache_descriptions = {}
         _cache_fetched_at = 0.0
         _cache_last_error = None
         _cache_last_success_at = 0.0
+        _refresh_in_progress = False

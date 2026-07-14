@@ -10,6 +10,7 @@ Covers:
 from __future__ import annotations
 
 import importlib
+import threading
 import time
 
 import pytest
@@ -42,6 +43,8 @@ class _FakeOdoo:
     def execute_method(self, model, method, *args, **kwargs):
         self.calls.append((model, method, args, kwargs))
         if method == "search_read":
+            if isinstance(self.search_read_rows, BaseException):
+                raise self.search_read_rows
             return self.search_read_rows
         if method == "get_method_doc":
             target = f"{args[0]}.{args[1]}"
@@ -55,7 +58,7 @@ def _patch_client(monkeypatch, fake):
     """Force `_fetch_once` to use the supplied fake OdooClient."""
     import odoo_mcp.odoo_client as oc
 
-    monkeypatch.setattr(oc, "get_odoo_client", lambda: fake)
+    monkeypatch.setattr(oc, "get_service_odoo_client", lambda: fake)
 
 
 def test_env_unset_disables_module(monkeypatch):
@@ -173,10 +176,135 @@ def test_cache_refreshes_after_ttl_expiry(monkeypatch, allowlist_module):
     # Simulate TTL expiry by rewinding the cache timestamp.
     monkeypatch.setattr(
         allowlist_module, "_cache_fetched_at",
-        time.time() - allowlist_module._CACHE_TTL_SECONDS - 1,
+        time.monotonic() - allowlist_module._CACHE_TTL_SECONDS - 1,
     )
 
     allowlist_module.methods()
 
     search_calls = [c for c in fake.calls if c[1] == "search_read"]
     assert len(search_calls) == 2
+
+
+def test_refresh_uses_service_account_not_request_identity(
+    monkeypatch, allowlist_module,
+):
+    fake = _FakeOdoo([
+        {"method_path": "sale.order.action_confirm", "description": "Confirm."},
+    ])
+    import odoo_mcp.odoo_client as oc
+
+    monkeypatch.setattr(oc, "get_service_odoo_client", lambda: fake)
+    monkeypatch.setattr(
+        oc,
+        "get_odoo_client",
+        lambda: (_ for _ in ()).throw(AssertionError("request identity leaked")),
+    )
+
+    assert allowlist_module.methods() == frozenset({"sale.order.action_confirm"})
+
+
+def test_failed_refresh_keeps_last_known_policy(monkeypatch, allowlist_module):
+    good = _FakeOdoo([
+        {"method_path": "sale.order.action_confirm", "description": "Confirm."},
+    ])
+    _patch_client(monkeypatch, good)
+    expected = allowlist_module.methods()
+
+    broken = _FakeOdoo(ConnectionError("odoo unavailable"))
+    _patch_client(monkeypatch, broken)
+    monkeypatch.setattr(allowlist_module, "_cache_fetched_at", 0.0)
+
+    assert allowlist_module.methods() == expected
+    state = allowlist_module.describe_state()
+    assert "ConnectionError" in state["last_error"]
+    assert state["cached_method_count"] == 1
+
+
+def test_interrupt_resets_refresh_in_progress(monkeypatch, allowlist_module):
+    _patch_client(monkeypatch, _FakeOdoo(KeyboardInterrupt()))
+
+    with pytest.raises(KeyboardInterrupt):
+        allowlist_module.methods()
+
+    assert allowlist_module.describe_state()["refresh_in_progress"] is False
+
+
+def test_empty_refresh_is_failure_soft_without_explicit_opt_in(
+    monkeypatch, allowlist_module,
+):
+    good = _FakeOdoo([
+        {"method_path": "sale.order.action_confirm", "description": "Confirm."},
+    ])
+    _patch_client(monkeypatch, good)
+    expected = allowlist_module.methods()
+
+    _patch_client(monkeypatch, _FakeOdoo([]))
+    monkeypatch.setattr(allowlist_module, "_cache_fetched_at", 0.0)
+
+    assert allowlist_module.methods() == expected
+    assert "returned no methods" in allowlist_module.describe_state()["last_error"]
+
+
+def test_explicit_empty_policy_replaces_cache(monkeypatch, allowlist_module):
+    monkeypatch.setenv("ODOO_MCP_METHOD_ALLOWLIST_ALLOW_EMPTY", "1")
+    _patch_client(monkeypatch, _FakeOdoo([]))
+
+    assert allowlist_module.methods() == frozenset()
+    state = allowlist_module.describe_state()
+    assert state["last_error"] is None
+    assert state["empty_result_allowed"] is True
+
+
+def test_network_fetch_runs_outside_state_lock(monkeypatch, allowlist_module):
+    lock_was_free = []
+    fake = _FakeOdoo([
+        {"method_path": "sale.order.action_confirm", "description": "Confirm."},
+    ])
+    import odoo_mcp.odoo_client as oc
+
+    def build_service_client():
+        acquired = allowlist_module._lock.acquire(blocking=False)
+        lock_was_free.append(acquired)
+        if acquired:
+            allowlist_module._lock.release()
+        return fake
+
+    monkeypatch.setattr(oc, "get_service_odoo_client", build_service_client)
+    allowlist_module.methods()
+
+    assert lock_was_free == [True]
+
+
+def test_parallel_reader_uses_snapshot_without_duplicate_fetch(
+    monkeypatch, allowlist_module,
+):
+    started = threading.Event()
+    release = threading.Event()
+
+    class SlowOdoo(_FakeOdoo):
+        def execute_method(self, model, method, *args, **kwargs):
+            if method == "search_read":
+                self.calls.append((model, method, args, kwargs))
+                started.set()
+                assert release.wait(timeout=2)
+                return self.search_read_rows
+            return super().execute_method(model, method, *args, **kwargs)
+
+    fake = SlowOdoo([
+        {"method_path": "sale.order.action_confirm", "description": "Confirm."},
+    ])
+    _patch_client(monkeypatch, fake)
+    result = []
+    worker = threading.Thread(target=lambda: result.append(allowlist_module.methods()))
+    worker.start()
+    assert started.wait(timeout=1)
+
+    before = time.monotonic()
+    assert allowlist_module.methods() == frozenset()
+    assert time.monotonic() - before < 0.2
+    release.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert result == [frozenset({"sale.order.action_confirm"})]
+    assert len([call for call in fake.calls if call[1] == "search_read"]) == 1

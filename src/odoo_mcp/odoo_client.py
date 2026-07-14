@@ -717,37 +717,13 @@ def load_config() -> dict[str, str]:
     )
 
 
-def get_odoo_client() -> OdooClient:
+def get_service_odoo_client() -> OdooClient:
+    """Build the configured process service-account Odoo client directly.
+
+    Infrastructure tasks such as refreshing the global method allowlist must
+    use this explicit factory. They must never inherit request credentials,
+    because one human request may not redefine process-wide security policy.
     """
-    Get a configured Odoo client instance.
-
-    Per-user (NESA Patch 2): when the incoming streamable-http request
-    carried ``X-Odoo-User`` + ``X-Odoo-Api-Key`` headers,
-    :mod:`._nesa_per_user_auth` will have pinned them onto a ContextVar.
-    In that case we return a cached per-user OdooClient instead of the
-    env-based service-account fallback so that ir.rule, multi-company
-    and field-ACL evaluate against the real human user. When no header
-    was present (or per-user is disabled) the function falls back to
-    the env-based client, preserving the upstream behaviour.
-
-    Returns:
-        OdooClient: A configured Odoo client instance
-    """
-    # Per-user path — short-circuit when a request-scoped context exists.
-    # Strict mode raises PermissionError if headers were required but
-    # missing; the ASGI middleware translates that to HTTP 401 before we
-    # ever reach this function, so a raise here is genuine misconfig.
-    try:
-        from ._nesa_per_user_auth import get_per_user_client
-
-        per_user = get_per_user_client()
-        if per_user is not None:
-            return per_user
-    except PermissionError:
-        raise
-    except Exception:  # noqa: BLE001 — fallback to env, do not crash startup
-        pass
-
     config = load_config()
 
     # Get additional options from environment variables
@@ -791,6 +767,24 @@ def get_odoo_client() -> OdooClient:
         json2_database_header=json2_database_header,
         lang=lang,
     )
+
+
+def get_odoo_client() -> OdooClient:
+    """Return the request user client, or the explicit legacy service client.
+
+    Per-user (NESA Patch 2): when the incoming streamable-http request carried
+    ``X-Odoo-User`` + ``X-Odoo-Api-Key``, the middleware pinned those
+    credentials onto a ContextVar. Only an explicit ``None`` (no request
+    credentials in lenient mode) may use the service account. Authentication,
+    connection, import, and configuration errors propagate unchanged so an
+    invalid user key can never become a service-account privilege escalation.
+    """
+    from ._nesa_per_user_auth import get_per_user_client
+
+    per_user = get_per_user_client()
+    if per_user is not None:
+        return per_user
+    return get_service_odoo_client()
 
 
 def parse_bool(value: str) -> bool:

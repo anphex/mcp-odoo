@@ -31,6 +31,12 @@ def test_cli_applies_streamable_http_runtime_settings(monkeypatch):
     # uvicorn.run + skipping mcp.streamable_http_app construction.
     import uvicorn
 
+    monkeypatch.delenv("MCP_SESSION_IDLE_TIMEOUT", raising=False)
+    fake_session_manager = type(
+        "FakeSessionManager", (), {"session_idle_timeout": None},
+    )()
+    monkeypatch.setattr(cli.mcp, "_session_manager", fake_session_manager)
+
     monkeypatch.setattr(
         cli.mcp, "streamable_http_app", lambda: object(), raising=False,
     )
@@ -75,6 +81,7 @@ def test_cli_applies_streamable_http_runtime_settings(monkeypatch):
     assert cli.mcp.settings.transport_security.allowed_origins == [
         "https://agent.example.test"
     ]
+    assert cli.mcp.session_manager.session_idle_timeout == 1800.0
 
 
 def test_cli_rejects_remote_http_bind_without_explicit_opt_in():
@@ -89,6 +96,28 @@ def test_cli_rejects_remote_http_bind_without_explicit_opt_in():
         assert "local hosts only" in str(exc)
     else:
         raise AssertionError("remote HTTP bind should require explicit opt-in")
+
+
+def test_cli_rejects_sse_when_per_user_auth_is_strict(monkeypatch):
+    cli = importlib.import_module("odoo_mcp.__main__")
+    monkeypatch.delenv("ODOO_MCP_REQUIRE_PER_USER", raising=False)
+    args = cli.parse_args(["--transport", "sse"])
+
+    try:
+        cli.configure_mcp_runtime(args)
+    except ValueError as exc:
+        assert "cannot enforce NESA per-user authentication" in str(exc)
+    else:
+        raise AssertionError("strict per-user authentication must reject SSE")
+
+
+def test_cli_allows_explicit_legacy_sse_opt_out(monkeypatch):
+    cli = importlib.import_module("odoo_mcp.__main__")
+    monkeypatch.setenv("ODOO_MCP_REQUIRE_PER_USER", "0")
+    args = cli.parse_args(["--transport", "sse"])
+
+    cli.configure_mcp_runtime(args)
+    assert args.transport == "sse"
 
 
 def test_cli_health_prints_non_secret_runtime_json(monkeypatch, capsys):
@@ -306,6 +335,10 @@ def test_main_logs_streamable_http_bind_and_path(monkeypatch, capsys):
 
     import uvicorn
 
+    fake_session_manager = type(
+        "FakeSessionManager", (), {"session_idle_timeout": None},
+    )()
+    monkeypatch.setattr(cli.mcp, "_session_manager", fake_session_manager)
     monkeypatch.setattr(cli.mcp, "streamable_http_app", lambda: object(), raising=False)
     monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: None)
     monkeypatch.setattr(

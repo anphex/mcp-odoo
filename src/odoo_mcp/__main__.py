@@ -203,6 +203,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def configure_mcp_runtime(args: argparse.Namespace) -> None:
     """Apply CLI/env runtime settings to the FastMCP instance."""
+    # Make the parsed CLI value authoritative for dynamic security checks.
+    from ._nesa_per_user_auth import set_runtime_transport, strict_mode_enabled
+
+    set_runtime_transport(args.transport)
+    if args.transport == "sse":
+        if strict_mode_enabled():
+            raise ValueError(
+                "SSE transport cannot enforce NESA per-user authentication. "
+                "Use streamable-http, or explicitly disable strict mode only "
+                "for a trusted legacy deployment."
+            )
     if (
         args.transport in {"streamable-http", "sse"}
         and args.host not in LOCAL_HTTP_HOSTS
@@ -290,9 +301,16 @@ def main() -> int:
             # env-based service account.
             import uvicorn
 
-            from ._nesa_per_user_auth import NesaPerUserAuthMiddleware
+            from ._nesa_per_user_auth import (
+                NesaPerUserAuthMiddleware,
+                session_idle_timeout_seconds,
+            )
 
-            wrapped_app = NesaPerUserAuthMiddleware(mcp.streamable_http_app())
+            streamable_app = mcp.streamable_http_app()
+            # Keep SDK session state and credential bindings on the same
+            # bounded sliding idle lifetime.
+            mcp.session_manager.session_idle_timeout = session_idle_timeout_seconds()
+            wrapped_app = NesaPerUserAuthMiddleware(streamable_app)
             uvicorn.run(
                 wrapped_app,
                 host=mcp.settings.host,

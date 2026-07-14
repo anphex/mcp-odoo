@@ -7,9 +7,10 @@ Covers:
   when headers are missing and lets the request through when present.
 - Lifespan / websocket scopes pass through untouched.
 - ``get_per_user_client`` returns ``None`` when no context, raises
-  PermissionError in strict mode, and caches per-login clients within TTL.
+  PermissionError in strict mode, and caches per-credential clients within TTL.
 - ``get_odoo_client`` integration: per-user wins when context is set,
-  env-fallback wins otherwise.
+  env-fallback wins only when credentials are absent.
+- Stateful MCP sessions cannot be reused with another credential fingerprint.
 """
 from __future__ import annotations
 
@@ -29,6 +30,9 @@ def _clean_env(monkeypatch):
         "ODOO_MCP_REQUIRE_PER_USER",
         "ODOO_MCP_PER_USER_CACHE_TTL",
         "ODOO_MCP_PER_USER_CACHE_MAX",
+        "ODOO_MCP_SESSION_BINDING_MAX",
+        "MCP_SESSION_IDLE_TIMEOUT",
+        "MCP_TRANSPORT",
     ):
         monkeypatch.delenv(var, raising=False)
     import odoo_mcp._nesa_per_user_auth as mod
@@ -123,6 +127,16 @@ def test_middleware_strict_mode_blocks_missing_headers(per_user_module, monkeypa
     assert b"required" in body["body"].lower()
 
 
+def test_network_transport_defaults_to_fail_closed(per_user_module, monkeypatch):
+    monkeypatch.delenv("ODOO_MCP_REQUIRE_PER_USER", raising=False)
+    monkeypatch.setenv("MCP_TRANSPORT", "streamable-http")
+    importlib.reload(per_user_module)
+
+    assert per_user_module.strict_mode_enabled() is True
+    with pytest.raises(PermissionError):
+        per_user_module.get_per_user_client()
+
+
 def test_middleware_strict_mode_allows_headers_present(per_user_module, monkeypatch):
     monkeypatch.setenv("ODOO_MCP_REQUIRE_PER_USER", "1")
     importlib.reload(per_user_module)
@@ -140,6 +154,45 @@ def test_middleware_strict_mode_allows_headers_present(per_user_module, monkeypa
         (b"x-odoo-api-key", b"k2"),
     ]))
     assert captured["ctx"] == ("bob", "k2")
+
+
+def test_middleware_rejects_partial_headers_even_when_lenient(per_user_module):
+    async def inner(scope, receive, send):
+        raise AssertionError("partial credentials must never reach the app")
+
+    mw = per_user_module.NesaPerUserAuthMiddleware(inner)
+    sent = _drive(mw, _scope([(b"x-odoo-user", b"bob")]))
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    assert start["status"] == 401
+
+
+def test_middleware_rejects_duplicate_auth_headers(per_user_module):
+    async def inner(scope, receive, send):
+        raise AssertionError("ambiguous credentials must never reach the app")
+
+    mw = per_user_module.NesaPerUserAuthMiddleware(inner)
+    sent = _drive(mw, _scope([
+        (b"x-odoo-user", b"bob"),
+        (b"x-odoo-user", b"alice"),
+        (b"x-odoo-api-key", b"k2"),
+    ]))
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    assert start["status"] == 400
+
+
+def test_middleware_rejects_duplicate_session_headers(per_user_module):
+    async def inner(scope, receive, send):
+        raise AssertionError("ambiguous session must never reach the app")
+
+    mw = per_user_module.NesaPerUserAuthMiddleware(inner)
+    sent = _drive(mw, _scope([
+        (b"x-odoo-user", b"bob"),
+        (b"x-odoo-api-key", b"k2"),
+        (b"mcp-session-id", b"one"),
+        (b"mcp-session-id", b"two"),
+    ]))
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    assert start["status"] == 400
 
 
 def test_middleware_passes_lifespan_scope_untouched(per_user_module):
@@ -213,8 +266,11 @@ def test_get_per_user_client_refreshes_after_ttl(per_user_module, monkeypatch):
             per_user_module.get_per_user_client()
             # Simulate TTL expiry by editing the cache entry's expiry time.
             with per_user_module._lock:
-                client, _expires = per_user_module._client_cache["alice"]
-                per_user_module._client_cache["alice"] = (client, time.time() - 1)
+                identity = per_user_module._credential_identity("alice", "k1")
+                client, _expires = per_user_module._client_cache[identity]
+                per_user_module._client_cache[identity] = (
+                    client, time.monotonic() - 1,
+                )
             per_user_module.get_per_user_client()
         finally:
             per_user_module.reset_user_context(token)
@@ -240,6 +296,51 @@ def test_cache_eviction_when_max_entries_exceeded(per_user_module, monkeypatch):
 
     with per_user_module._lock:
         assert len(per_user_module._client_cache) <= 8
+
+
+def test_same_login_with_different_key_never_reuses_client(per_user_module):
+    fake_clients: list[Any] = []
+
+    def fake_build(login, key):
+        instance = MagicMock(name=f"OdooClient({login},{len(fake_clients)})")
+        fake_clients.append(instance)
+        return instance
+
+    with patch.object(per_user_module, "_build_per_user_client", side_effect=fake_build):
+        first_token = per_user_module.set_user_context("alice", "valid-key")
+        try:
+            first = per_user_module.get_per_user_client()
+        finally:
+            per_user_module.reset_user_context(first_token)
+
+        second_token = per_user_module.set_user_context("alice", "wrong-key")
+        try:
+            second = per_user_module.get_per_user_client()
+        finally:
+            per_user_module.reset_user_context(second_token)
+
+    assert first is not second
+    assert len(fake_clients) == 2
+
+
+def test_client_build_does_not_hold_global_cache_lock(per_user_module):
+    lock_was_free: list[bool] = []
+
+    def fake_build(login, key):
+        acquired = per_user_module._lock.acquire(blocking=False)
+        lock_was_free.append(acquired)
+        if acquired:
+            per_user_module._lock.release()
+        return MagicMock(uid=42)
+
+    with patch.object(per_user_module, "_build_per_user_client", side_effect=fake_build):
+        token = per_user_module.set_user_context("alice", "k1")
+        try:
+            per_user_module.get_per_user_client()
+        finally:
+            per_user_module.reset_user_context(token)
+
+    assert lock_was_free == [True]
 
 
 def test_get_odoo_client_prefers_per_user_when_context_set(per_user_module):
@@ -272,6 +373,29 @@ def test_get_odoo_client_falls_back_to_env_when_no_context(per_user_module, monk
     assert kwargs["password"] == "svc-key"
 
 
+def test_service_client_factory_ignores_request_credentials(
+    per_user_module, monkeypatch,
+):
+    import odoo_mcp.odoo_client as oc
+
+    monkeypatch.setenv("ODOO_URL", "http://example.com")
+    monkeypatch.setenv("ODOO_DB", "db")
+    monkeypatch.setenv("ODOO_USERNAME", "service")
+    monkeypatch.setenv("ODOO_PASSWORD", "svc-key")
+    service_client = MagicMock(name="ServiceClient")
+
+    token = per_user_module.set_user_context("alice", "alice-key")
+    try:
+        with patch.object(oc, "OdooClient", return_value=service_client) as ctor:
+            result = oc.get_service_odoo_client()
+    finally:
+        per_user_module.reset_user_context(token)
+
+    assert result is service_client
+    assert ctor.call_args.kwargs["username"] == "service"
+    assert ctor.call_args.kwargs["password"] == "svc-key"
+
+
 def test_get_odoo_client_propagates_strict_mode_permissionerror(per_user_module, monkeypatch):
     """When strict mode is on and headers missing, the error bubbles up."""
     import odoo_mcp.odoo_client as oc
@@ -281,3 +405,159 @@ def test_get_odoo_client_propagates_strict_mode_permissionerror(per_user_module,
 
     with pytest.raises(PermissionError):
         oc.get_odoo_client()
+
+
+@pytest.mark.parametrize("failure", [ValueError("bad key"), ConnectionError("down")])
+def test_get_odoo_client_never_falls_back_after_per_user_failure(
+    per_user_module, monkeypatch, failure,
+):
+    import odoo_mcp.odoo_client as oc
+
+    monkeypatch.setenv("ODOO_URL", "http://example.com")
+    monkeypatch.setenv("ODOO_DB", "db")
+    monkeypatch.setenv("ODOO_USERNAME", "service")
+    monkeypatch.setenv("ODOO_PASSWORD", "svc-key")
+
+    with patch.object(
+        per_user_module, "get_per_user_client", side_effect=failure,
+    ), patch.object(oc, "OdooClient") as env_ctor:
+        with pytest.raises(type(failure), match=str(failure)):
+            oc.get_odoo_client()
+    env_ctor.assert_not_called()
+
+
+def test_mcp_session_is_bound_to_credential_fingerprint(per_user_module):
+    reached = 0
+
+    async def inner(scope, receive, send):
+        nonlocal reached
+        reached += 1
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"mcp-session-id", b"session-1")],
+        })
+        await send({"type": "http.response.body", "body": b""})
+
+    mw = per_user_module.NesaPerUserAuthMiddleware(inner)
+    first_headers = [
+        (b"x-odoo-user", b"alice"),
+        (b"x-odoo-api-key", b"key-a"),
+    ]
+    _drive(mw, _scope(first_headers))
+
+    same_headers = first_headers + [(b"mcp-session-id", b"session-1")]
+    same_sent = _drive(mw, _scope(same_headers))
+    assert next(
+        m for m in same_sent if m["type"] == "http.response.start"
+    )["status"] == 200
+
+    other_headers = [
+        (b"x-odoo-user", b"alice"),
+        (b"x-odoo-api-key", b"key-b"),
+        (b"mcp-session-id", b"session-1"),
+    ]
+    other_sent = _drive(mw, _scope(other_headers))
+    assert next(
+        m for m in other_sent if m["type"] == "http.response.start"
+    )["status"] == 403
+    assert reached == 2
+
+
+def test_unknown_mcp_session_is_rejected(per_user_module):
+    async def inner(scope, receive, send):
+        raise AssertionError("unbound session must never reach the app")
+
+    mw = per_user_module.NesaPerUserAuthMiddleware(inner)
+    sent = _drive(mw, _scope([
+        (b"x-odoo-user", b"alice"),
+        (b"x-odoo-api-key", b"key-a"),
+        (b"mcp-session-id", b"unknown"),
+    ]))
+    assert next(
+        m for m in sent if m["type"] == "http.response.start"
+    )["status"] == 403
+
+
+def test_service_session_cannot_be_reused_with_user_credentials(per_user_module):
+    async def inner(scope, receive, send):
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"mcp-session-id", b"service-session")],
+        })
+        await send({"type": "http.response.body", "body": b""})
+
+    mw = per_user_module.NesaPerUserAuthMiddleware(inner)
+    _drive(mw, _scope([]))
+
+    sent = _drive(mw, _scope([
+        (b"x-odoo-user", b"alice"),
+        (b"x-odoo-api-key", b"key-a"),
+        (b"mcp-session-id", b"service-session"),
+    ]))
+    assert next(
+        m for m in sent if m["type"] == "http.response.start"
+    )["status"] == 403
+
+
+def test_successful_delete_removes_session_binding(per_user_module):
+    async def inner(scope, receive, send):
+        response_headers = []
+        if scope.get("method") == "POST":
+            response_headers = [(b"mcp-session-id", b"delete-me")]
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": response_headers,
+        })
+        await send({"type": "http.response.body", "body": b""})
+
+    mw = per_user_module.NesaPerUserAuthMiddleware(inner)
+    auth_headers = [
+        (b"x-odoo-user", b"alice"),
+        (b"x-odoo-api-key", b"key-a"),
+    ]
+    _drive(mw, _scope(auth_headers))
+    assert "delete-me" in per_user_module._session_bindings
+
+    delete_scope = _scope(auth_headers + [(b"mcp-session-id", b"delete-me")])
+    delete_scope["method"] = "DELETE"
+    _drive(mw, delete_scope)
+
+    assert "delete-me" not in per_user_module._session_bindings
+
+
+def test_session_bindings_are_bounded(per_user_module, monkeypatch):
+    monkeypatch.setenv("ODOO_MCP_SESSION_BINDING_MAX", "16")
+    identity = per_user_module._credential_identity("alice", "key-a")
+
+    for index in range(17):
+        per_user_module.NesaPerUserAuthMiddleware._bind_session(
+            f"session-{index}", identity,
+        )
+
+    assert len(per_user_module._session_bindings) == 16
+    assert "session-0" not in per_user_module._session_bindings
+
+
+def test_expired_session_binding_is_removed(per_user_module):
+    identity = per_user_module._credential_identity("alice", "key-a")
+    per_user_module._session_bindings["expired"] = (identity, time.monotonic() - 1)
+
+    assert per_user_module.NesaPerUserAuthMiddleware._session_matches(
+        "expired", identity,
+    ) is False
+    assert "expired" not in per_user_module._session_bindings
+
+
+def test_describe_state_reports_non_secret_security_posture(
+    per_user_module, monkeypatch,
+):
+    monkeypatch.setenv("MCP_TRANSPORT", "streamable-http")
+    state = per_user_module.describe_state()
+
+    assert state["strict_mode"] is True
+    assert state["credential_cache_entry_count"] == 0
+    assert state["session_binding_count"] == 0
+    assert "api_key" not in str(state).lower()

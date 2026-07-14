@@ -1741,6 +1741,20 @@ def test_runtime_security_report_surfaces_chatter_direct(monkeypatch):
     assert server.runtime_security_report()["chatter_direct_enabled"] is True
 
 
+def test_runtime_security_report_surfaces_per_user_auth_without_secrets(monkeypatch):
+    server = importlib.import_module("odoo_mcp.server")
+    monkeypatch.setenv("ODOO_MCP_REQUIRE_PER_USER", "1")
+    monkeypatch.setenv("ODOO_API_KEY", "must-not-appear")
+
+    report = server.runtime_security_report()
+    auth = report["nesa_per_user_auth"]
+
+    assert auth["strict_mode"] is True
+    assert auth["credential_cache_entry_count"] >= 0
+    assert auth["session_binding_count"] >= 0
+    assert "must-not-appear" not in str(report)
+
+
 # ----- AppContext / Resources / Pydantic helpers (low-line-count branches) ----
 
 
