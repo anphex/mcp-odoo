@@ -3,6 +3,7 @@
 Covers:
 - ASGI middleware extracts X-Odoo-User / X-Odoo-Api-Key headers from scope.
 - ContextVar is set during the inner call and reset on exit.
+- Non-MCP paths return a direct 404 before authentication.
 - Strict mode (ODOO_MCP_REQUIRE_PER_USER=1) short-circuits with HTTP 401
   when headers are missing and lets the request through when present.
 - Lifespan / websocket scopes pass through untouched.
@@ -50,11 +51,15 @@ def per_user_module():
     return mod
 
 
-def _scope(headers: list[tuple[bytes, bytes]] | None = None, scope_type: str = "http") -> dict:
+def _scope(
+    headers: list[tuple[bytes, bytes]] | None = None,
+    scope_type: str = "http",
+    path: str = "/mcp",
+) -> dict:
     return {
         "type": scope_type,
         "method": "POST",
-        "path": "/mcp",
+        "path": path,
         "headers": headers or [],
     }
 
@@ -82,7 +87,7 @@ def test_middleware_extracts_headers_and_sets_context(per_user_module):
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await send({"type": "http.response.body", "body": b""})
 
-    mw = per_user_module.NesaPerUserAuthMiddleware(inner)
+    mw = per_user_module.NesaPerUserAuthMiddleware(inner, mcp_path="/mcp")
     scope = _scope([
         (b"x-odoo-user", b"alice"),
         (b"x-odoo-api-key", b"secret-key"),
@@ -103,7 +108,7 @@ def test_middleware_lenient_passes_through_when_headers_missing(per_user_module)
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await send({"type": "http.response.body", "body": b""})
 
-    mw = per_user_module.NesaPerUserAuthMiddleware(inner)
+    mw = per_user_module.NesaPerUserAuthMiddleware(inner, mcp_path="/mcp")
     _drive(mw, _scope([]))
     assert captured.get("reached") is True
     assert captured["ctx"] is None
@@ -116,7 +121,7 @@ def test_middleware_strict_mode_blocks_missing_headers(per_user_module, monkeypa
     async def inner(scope, receive, send):
         raise AssertionError("inner must not be called in strict mode without headers")
 
-    mw = per_user_module.NesaPerUserAuthMiddleware(inner)
+    mw = per_user_module.NesaPerUserAuthMiddleware(inner, mcp_path="/mcp")
     sent = _drive(mw, _scope([]))
 
     start = next(m for m in sent if m["type"] == "http.response.start")
@@ -125,6 +130,65 @@ def test_middleware_strict_mode_blocks_missing_headers(per_user_module, monkeypa
     headers = dict(start["headers"])
     assert headers.get(b"www-authenticate", b"").startswith(b"Bearer")
     assert b"required" in body["body"].lower()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/mcp/",
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/mcp",
+        "/.well-known/oauth-authorization-server",
+        "/.well-known/openid-configuration",
+        "/oauth/authorize",
+        "/oauth/token",
+        "/register",
+        "/not-an-mcp-route",
+    ],
+)
+def test_middleware_rejects_non_mcp_paths_before_auth(
+    per_user_module, monkeypatch, path,
+):
+    monkeypatch.setenv("ODOO_MCP_REQUIRE_PER_USER", "1")
+
+    async def inner(scope, receive, send):
+        raise AssertionError("non-MCP paths must never reach authentication or routing")
+
+    mw = per_user_module.NesaPerUserAuthMiddleware(inner, mcp_path="/mcp")
+    sent = _drive(mw, _scope([], path=path))
+
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    body = next(m for m in sent if m["type"] == "http.response.body")
+    headers = dict(start["headers"])
+    assert start["status"] == 404
+    assert headers.get(b"location") is None
+    assert headers.get(b"www-authenticate") is None
+    assert body["body"] == b"Not Found."
+
+
+def test_middleware_uses_configured_mcp_path(per_user_module, monkeypatch):
+    monkeypatch.setenv("ODOO_MCP_REQUIRE_PER_USER", "1")
+
+    async def inner(scope, receive, send):
+        raise AssertionError("strict auth must run for the configured MCP path")
+
+    mw = per_user_module.NesaPerUserAuthMiddleware(
+        inner,
+        mcp_path="/custom-mcp",
+    )
+    sent = _drive(mw, _scope([], path="/custom-mcp"))
+
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    assert start["status"] == 401
+    assert dict(start["headers"])[b"www-authenticate"].startswith(b"Bearer")
+
+
+def test_middleware_requires_absolute_mcp_path(per_user_module):
+    with pytest.raises(ValueError, match="absolute HTTP path"):
+        per_user_module.NesaPerUserAuthMiddleware(
+            lambda scope, receive, send: None,
+            mcp_path="relative",
+        )
 
 
 def test_network_transport_defaults_to_fail_closed(per_user_module, monkeypatch):
@@ -148,7 +212,7 @@ def test_middleware_strict_mode_allows_headers_present(per_user_module, monkeypa
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await send({"type": "http.response.body", "body": b""})
 
-    mw = per_user_module.NesaPerUserAuthMiddleware(inner)
+    mw = per_user_module.NesaPerUserAuthMiddleware(inner, mcp_path="/mcp")
     _drive(mw, _scope([
         (b"x-odoo-user", b"bob"),
         (b"x-odoo-api-key", b"k2"),
@@ -160,7 +224,7 @@ def test_middleware_rejects_partial_headers_even_when_lenient(per_user_module):
     async def inner(scope, receive, send):
         raise AssertionError("partial credentials must never reach the app")
 
-    mw = per_user_module.NesaPerUserAuthMiddleware(inner)
+    mw = per_user_module.NesaPerUserAuthMiddleware(inner, mcp_path="/mcp")
     sent = _drive(mw, _scope([(b"x-odoo-user", b"bob")]))
     start = next(m for m in sent if m["type"] == "http.response.start")
     assert start["status"] == 401
@@ -170,7 +234,7 @@ def test_middleware_rejects_duplicate_auth_headers(per_user_module):
     async def inner(scope, receive, send):
         raise AssertionError("ambiguous credentials must never reach the app")
 
-    mw = per_user_module.NesaPerUserAuthMiddleware(inner)
+    mw = per_user_module.NesaPerUserAuthMiddleware(inner, mcp_path="/mcp")
     sent = _drive(mw, _scope([
         (b"x-odoo-user", b"bob"),
         (b"x-odoo-user", b"alice"),
@@ -184,7 +248,7 @@ def test_middleware_rejects_duplicate_session_headers(per_user_module):
     async def inner(scope, receive, send):
         raise AssertionError("ambiguous session must never reach the app")
 
-    mw = per_user_module.NesaPerUserAuthMiddleware(inner)
+    mw = per_user_module.NesaPerUserAuthMiddleware(inner, mcp_path="/mcp")
     sent = _drive(mw, _scope([
         (b"x-odoo-user", b"bob"),
         (b"x-odoo-api-key", b"k2"),
@@ -201,7 +265,7 @@ def test_middleware_passes_lifespan_scope_untouched(per_user_module):
     async def inner(scope, receive, send):
         reached["ok"] = scope.get("type") == "lifespan"
 
-    mw = per_user_module.NesaPerUserAuthMiddleware(inner)
+    mw = per_user_module.NesaPerUserAuthMiddleware(inner, mcp_path="/mcp")
 
     async def receive():
         return {"type": "lifespan.startup"}
@@ -439,7 +503,7 @@ def test_mcp_session_is_bound_to_credential_fingerprint(per_user_module):
         })
         await send({"type": "http.response.body", "body": b""})
 
-    mw = per_user_module.NesaPerUserAuthMiddleware(inner)
+    mw = per_user_module.NesaPerUserAuthMiddleware(inner, mcp_path="/mcp")
     first_headers = [
         (b"x-odoo-user", b"alice"),
         (b"x-odoo-api-key", b"key-a"),
@@ -468,7 +532,7 @@ def test_unknown_mcp_session_is_rejected(per_user_module):
     async def inner(scope, receive, send):
         raise AssertionError("unbound session must never reach the app")
 
-    mw = per_user_module.NesaPerUserAuthMiddleware(inner)
+    mw = per_user_module.NesaPerUserAuthMiddleware(inner, mcp_path="/mcp")
     sent = _drive(mw, _scope([
         (b"x-odoo-user", b"alice"),
         (b"x-odoo-api-key", b"key-a"),
@@ -488,7 +552,7 @@ def test_service_session_cannot_be_reused_with_user_credentials(per_user_module)
         })
         await send({"type": "http.response.body", "body": b""})
 
-    mw = per_user_module.NesaPerUserAuthMiddleware(inner)
+    mw = per_user_module.NesaPerUserAuthMiddleware(inner, mcp_path="/mcp")
     _drive(mw, _scope([]))
 
     sent = _drive(mw, _scope([
@@ -513,7 +577,7 @@ def test_successful_delete_removes_session_binding(per_user_module):
         })
         await send({"type": "http.response.body", "body": b""})
 
-    mw = per_user_module.NesaPerUserAuthMiddleware(inner)
+    mw = per_user_module.NesaPerUserAuthMiddleware(inner, mcp_path="/mcp")
     auth_headers = [
         (b"x-odoo-user", b"alice"),
         (b"x-odoo-api-key", b"key-a"),

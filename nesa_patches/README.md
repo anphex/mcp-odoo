@@ -4,7 +4,7 @@ Diese Patches transformieren den Upstream `tuanle96/mcp-odoo` Server zu
 einem NESA-konformen MCP-Endpoint. Inkrementelle Applikation — nicht alle
 Patches sind bereits gelandet.
 
-## Status (Stand 2026-07-14)
+## Status (Stand 2026-07-23)
 
 | # | Patch | Status | Commit |
 | - | ----- | ------ | ------ |
@@ -50,6 +50,15 @@ Voraussetzungen zulässig:
 - Alle übrigen `/mcp`- und `/mcp/…`-Pfade liefern ohne Redirect exakt HTTP 404.
   Für Capability-Pfade sind Access- und Error-Logging deaktiviert, damit das
   Token weder im Request- noch im Redirect-Log landet.
+- OAuth-/OIDC-Discovery und übliche OAuth-Endpunkte liefern auf HTTP und HTTPS
+  direkt HTTP 404, ohne `Location` und ohne `WWW-Authenticate`. Die gemeinsame
+  nginx-Quelle liegt in
+  `nesa_patches/nginx/mcp-negative-routes.conf` und wird root-owned nach
+  `/etc/nginx/snippets/mcp-negative-routes.conf` installiert.
+- Der Sidecar authentifiziert ausschließlich seinen konfigurierten
+  Streamable-HTTP-Pfad. Jeder andere Loopback-Pfad liefert bereits vor dem
+  Per-User-Auth-Wrapper HTTP 404; insbesondere signalisiert ein OAuth-Probe
+  damit nie fälschlich OAuth-Unterstützung.
 - Netzwerk-Units setzen `ODOO_MCP_REQUIRE_PER_USER=1` explizit. Der API-Key ist
   ein dedizierter, einzeln widerrufbarer Odoo-RPC-Key des gebundenen Benutzers.
 

@@ -312,15 +312,32 @@ class NesaPerUserAuthMiddleware:
     Strict mode: if ``ODOO_MCP_REQUIRE_PER_USER=1`` and the headers are
     missing on a non-lifespan request, the middleware short-circuits with
     HTTP 401 before the request reaches FastMCP's session manager.
+
+    Only the configured Streamable HTTP endpoint reaches authentication.
+    Every other HTTP path returns a plain 404 first. This prevents clients
+    from mistaking the per-user 401 challenge for OAuth support while also
+    suppressing Starlette's automatic trailing-slash redirects.
     """
 
-    def __init__(self, app: Callable[..., Awaitable[None]]) -> None:
+    def __init__(
+        self,
+        app: Callable[..., Awaitable[None]],
+        *,
+        mcp_path: str,
+    ) -> None:
+        if not mcp_path.startswith("/"):
+            raise ValueError("mcp_path must be an absolute HTTP path")
         self.app = app
+        self.mcp_path = mcp_path
 
     async def __call__(self, scope: dict, receive: Callable, send: Callable) -> None:
         if scope.get("type") != "http":
             # lifespan, websocket — pass through untouched.
             await self.app(scope, receive, send)
+            return
+
+        if scope.get("path") != self.mcp_path:
+            await self._send_error(send, 404, "Not Found.")
             return
 
         try:

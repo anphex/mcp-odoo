@@ -310,7 +310,10 @@ def main() -> int:
             # Keep SDK session state and credential bindings on the same
             # bounded sliding idle lifetime.
             mcp.session_manager.session_idle_timeout = session_idle_timeout_seconds()
-            wrapped_app = NesaPerUserAuthMiddleware(streamable_app)
+            wrapped_app = NesaPerUserAuthMiddleware(
+                streamable_app,
+                mcp_path=mcp.settings.streamable_http_path,
+            )
             uvicorn.run(
                 wrapped_app,
                 host=mcp.settings.host,

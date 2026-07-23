@@ -82,6 +82,7 @@ def test_cli_applies_streamable_http_runtime_settings(monkeypatch):
         "https://agent.example.test"
     ]
     assert cli.mcp.session_manager.session_idle_timeout == 1800.0
+    assert uvicorn_calls[0][0][0].mcp_path == "/mcp-test"
 
 
 def test_cli_rejects_remote_http_bind_without_explicit_opt_in():
