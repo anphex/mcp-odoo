@@ -2375,6 +2375,46 @@ def aggregate_records(
         return {"success": False, "error": str(e)}
 
 
+def _message_post_returning_id(odoo, model: str, record_id: int, kwargs: Dict[str, Any]) -> int:
+    """Run message_post and return the created mail.message id as int.
+
+    Odoo 18's message_post returns a mail.message recordset, which the RPC
+    layer cannot serialize; the transaction is already committed when the
+    response marshaling fails (Fault "cannot marshal"). Swallow exactly that
+    fault and resolve the persisted id via a follow-up search. Raise when no
+    new message exists (call genuinely failed / rolled back).
+    """
+    baseline = odoo.execute_method(
+        "mail.message", "search",
+        [["model", "=", model], ["res_id", "=", int(record_id)]],
+        limit=1, order="id desc",
+    )
+    baseline_id = int(baseline[0]) if baseline else 0
+    try:
+        result = odoo.execute_method(model, "message_post", [record_id], **kwargs)
+        if isinstance(result, int) and result > 0:
+            return result
+        if isinstance(result, dict) and isinstance(result.get("id"), int):
+            return result["id"]
+    except Exception as exc:
+        if "cannot marshal" not in str(exc) and "marshal" not in str(exc).lower():
+            raise
+    created = odoo.execute_method(
+        "mail.message", "search",
+        [
+            ["model", "=", model],
+            ["res_id", "=", int(record_id)],
+            ["id", ">", baseline_id],
+        ],
+        limit=1, order="id desc",
+    )
+    if created:
+        return int(created[0])
+    raise RuntimeError(
+        "message_post persisted no new mail.message (rolled back?)"
+    )
+
+
 def _build_chatter_payload(
     *,
     model: str,
@@ -2463,11 +2503,8 @@ def chatter_post(
         direct_mode = chatter_direct_enabled()
         if direct_mode:
             audit_odoo_execution("chatter_post", model, "message_post")
-            result = odoo.execute_method(
-                model,
-                "message_post",
-                [record_id],
-                **canonical["kwargs"],
+            message_id = _message_post_returning_id(
+                odoo, model, record_id, canonical["kwargs"],
             )
             return {
                 "success": True,
@@ -2475,7 +2512,7 @@ def chatter_post(
                 "model": model,
                 "record_id": record_id,
                 "approval_required": False,
-                "result": result,
+                "result": message_id,
             }
 
         if approval is None:
@@ -2502,11 +2539,8 @@ def chatter_post(
             )
 
         audit_odoo_execution("chatter_post", model, "message_post")
-        result = odoo.execute_method(
-            model,
-            "message_post",
-            [record_id],
-            **canonical["kwargs"],
+        message_id = _message_post_returning_id(
+            odoo, model, record_id, canonical["kwargs"],
         )
         return {
             "success": True,
@@ -2514,7 +2548,7 @@ def chatter_post(
             "model": model,
             "record_id": record_id,
             "approval_required": True,
-            "result": result,
+            "result": message_id,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
