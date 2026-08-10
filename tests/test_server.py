@@ -3,6 +3,7 @@ import importlib
 import json
 from pathlib import Path
 
+import pytest
 from mcp.server.fastmcp import FastMCP
 from mcp.types import TextContent
 
@@ -513,6 +514,7 @@ def test_execute_method_blocks_direct_writes_and_unknown_methods(monkeypatch):
             raise AssertionError("blocked methods must fail before client call")
 
     monkeypatch.delenv("ODOO_MCP_ALLOW_UNKNOWN_METHODS", raising=False)
+    monkeypatch.delenv("ODOO_MCP_NATIVE_ACL_PARITY", raising=False)
 
     blocked_write = server.execute_method(
         FakeCtx(FakeClient()),
@@ -532,6 +534,73 @@ def test_execute_method_blocks_direct_writes_and_unknown_methods(monkeypatch):
     assert blocked_unknown["success"] is False
     assert "blocked by default" in blocked_unknown["error"]
     assert blocked_unknown["classification"]["safety"] == "side_effect"
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "web_save",
+        "name_create",
+        "copy",
+        "copy_data",
+        "copy_multi",
+        "create_multi",
+        "load",
+        "import_data",
+        "update_field_translations",
+        "web_override_translations",
+    ],
+)
+def test_execute_method_blocks_write_equivalent_aliases_in_native_parity(
+    monkeypatch, method,
+):
+    server = importlib.import_module("odoo_mcp.server")
+
+    class FakeClient:
+        def execute_method(self, *_args, **_kwargs):
+            raise AssertionError("write aliases must fail before the Odoo call")
+
+    monkeypatch.setenv("ODOO_MCP_NATIVE_ACL_PARITY", "1")
+    monkeypatch.setenv("ODOO_MCP_REQUIRE_PER_USER", "1")
+
+    result = server.execute_method(
+        FakeCtx(FakeClient()), "res.partner", method, args=[]
+    )
+
+    assert result["success"] is False
+    assert "write-equivalent aliases" in result["error"]
+
+
+@pytest.mark.parametrize(
+    ("model", "method"),
+    [
+        ("nesa.mcp.approval.token", "mcp_register_approval"),
+        ("nesa.mcp.allowed_method", "create_allowlist_entry"),
+        ("nesa.mcp.audit_log", "clear_log"),
+        ("nesa.mcp.shadow.compare", "action_apply"),
+        ("nesa.agent.definition", "action_activate"),
+        ("nesa.agent.pending.action", "action_approve"),
+    ],
+)
+def test_control_plane_hard_deny_is_not_configurable(
+    monkeypatch, model, method,
+):
+    server = importlib.import_module("odoo_mcp.server")
+
+    class FakeClient:
+        def execute_method(self, *_args, **_kwargs):
+            raise AssertionError("control-plane calls must fail before Odoo")
+
+    monkeypatch.delenv("ODOO_MCP_DENIED_METHOD_PREFIXES", raising=False)
+    monkeypatch.setenv("ODOO_MCP_NATIVE_ACL_PARITY", "1")
+    monkeypatch.setenv("ODOO_MCP_REQUIRE_PER_USER", "1")
+
+    result = server.execute_method(
+        FakeCtx(FakeClient()), model, method, args=[]
+    )
+
+    assert result["success"] is False
+    assert "hard-deny" in result["error"]
 
 
 def test_execute_method_can_opt_into_unknown_methods(monkeypatch):
@@ -554,6 +623,182 @@ def test_execute_method_can_opt_into_unknown_methods(monkeypatch):
 
     assert result["success"] is True
     assert calls == [(("sale.order", "action_confirm", [7]), {})]
+
+
+def test_execute_method_native_acl_parity_requires_strict_per_user(monkeypatch):
+    server = importlib.import_module("odoo_mcp.server")
+    calls = []
+
+    class FakeClient:
+        def execute_method(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return {"ok": True}
+
+    monkeypatch.delenv("ODOO_MCP_ALLOW_UNKNOWN_METHODS", raising=False)
+    monkeypatch.setenv("ODOO_MCP_NATIVE_ACL_PARITY", "1")
+    monkeypatch.setenv("ODOO_MCP_REQUIRE_PER_USER", "0")
+
+    blocked = server.execute_method(
+        FakeCtx(FakeClient()),
+        "hr.leave",
+        "action_approve",
+        args=[[500]],
+    )
+    assert blocked["success"] is False
+    assert calls == []
+
+    monkeypatch.setenv("ODOO_MCP_REQUIRE_PER_USER", "1")
+
+    def fail_if_allowlist_is_consulted(*_args, **_kwargs):
+        raise AssertionError("native ACL parity must not consult a positive list")
+
+    monkeypatch.setattr(
+        server, "side_effect_method_allowed", fail_if_allowlist_is_consulted,
+    )
+    allowed = server.execute_method(
+        FakeCtx(FakeClient()),
+        "hr.leave",
+        "action_approve",
+        args=[[500]],
+    )
+
+    assert allowed["success"] is True
+    assert calls == [(("hr.leave", "action_approve", [500]), {})]
+
+
+def test_native_acl_parity_default_stdio_remains_disabled(monkeypatch):
+    server = importlib.import_module("odoo_mcp.server")
+    monkeypatch.setenv("ODOO_MCP_NATIVE_ACL_PARITY", "1")
+    monkeypatch.delenv("ODOO_MCP_REQUIRE_PER_USER", raising=False)
+    monkeypatch.delenv("MCP_TRANSPORT", raising=False)
+
+    assert server.native_acl_parity_requested() is True
+    assert server.native_acl_parity_enabled() is False
+
+
+def test_execute_method_native_acl_parity_preserves_odoo_denial(monkeypatch):
+    server = importlib.import_module("odoo_mcp.server")
+
+    class DeniedClient:
+        def execute_method(self, *_args, **_kwargs):
+            raise RuntimeError("AccessError: native Odoo record rule denied write")
+
+    monkeypatch.delenv("ODOO_MCP_ALLOW_UNKNOWN_METHODS", raising=False)
+    monkeypatch.setenv("ODOO_MCP_NATIVE_ACL_PARITY", "1")
+    monkeypatch.setenv("ODOO_MCP_REQUIRE_PER_USER", "1")
+
+    result = server.execute_method(
+        FakeCtx(DeniedClient()),
+        "hr.leave",
+        "action_approve",
+        args=[[500]],
+    )
+
+    assert result["success"] is False
+    assert "AccessError" in result["error"]
+    assert "record rule denied write" in result["error"]
+
+
+def test_execute_method_audits_login_target_and_strips_suppression_context(
+    monkeypatch, caplog,
+):
+    server = importlib.import_module("odoo_mcp.server")
+    per_user = importlib.import_module("odoo_mcp._nesa_per_user_auth")
+    calls = []
+
+    class FakeClient:
+        def execute_method(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return True
+
+    monkeypatch.setenv("ODOO_MCP_NATIVE_ACL_PARITY", "1")
+    monkeypatch.setenv("ODOO_MCP_REQUIRE_PER_USER", "1")
+    token = per_user.set_user_context("monteur@example.com", "secret-api-key")
+    try:
+        with caplog.at_level("INFO", logger="odoo_mcp.server"):
+            result = server.execute_method(
+                FakeCtx(FakeClient()),
+                "hr.leave",
+                "action_approve",
+                args=[[500]],
+                kwargs={
+                    "context": {
+                        "lang": "de_DE",
+                        "tracking_disable": True,
+                        "mail_notrack": True,
+                        "mail_create_nolog": True,
+                    }
+                },
+            )
+    finally:
+        per_user.reset_user_context(token)
+
+    assert result["success"] is True
+    assert calls[0][1] == {"context": {"lang": "de_DE"}}
+    assert "Removed audit-suppression context keys" in result["warnings"][0]
+    assert "login=monteur@example.com" in caplog.text
+    assert "model=hr.leave" in caplog.text
+    assert "method=action_approve" in caplog.text
+    assert "secret-api-key" not in caplog.text
+
+
+def test_execute_method_native_acl_parity_never_calls_private_methods(monkeypatch):
+    server = importlib.import_module("odoo_mcp.server")
+
+    class FakeClient:
+        def execute_method(self, *_args, **_kwargs):
+            raise AssertionError("private methods must fail before Odoo call")
+
+    monkeypatch.setenv("ODOO_MCP_NATIVE_ACL_PARITY", "1")
+    monkeypatch.setenv("ODOO_MCP_REQUIRE_PER_USER", "1")
+
+    result = server.execute_method(
+        FakeCtx(FakeClient()),
+        "hr.leave",
+        "_action_validate",
+        args=[[500]],
+    )
+
+    assert result["success"] is False
+    assert "Private underscore methods" in result["error"]
+
+
+@pytest.mark.parametrize(
+    ("mode_env", "mode_value"),
+    [
+        ("ODOO_MCP_NATIVE_ACL_PARITY", "1"),
+        ("ODOO_MCP_ALLOW_UNKNOWN_METHODS", "1"),
+        ("ODOO_MCP_ALLOWED_SIDE_EFFECT_METHODS", "account.move.action_post"),
+    ],
+)
+def test_execute_method_hard_deny_precedes_every_execution_mode(
+    monkeypatch, mode_env, mode_value,
+):
+    server = importlib.import_module("odoo_mcp.server")
+
+    class FakeClient:
+        def execute_method(self, *_args, **_kwargs):
+            raise AssertionError("hard-denied methods must fail before Odoo call")
+
+    for env_name in (
+        "ODOO_MCP_NATIVE_ACL_PARITY",
+        "ODOO_MCP_ALLOW_UNKNOWN_METHODS",
+        "ODOO_MCP_ALLOWED_SIDE_EFFECT_METHODS",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setenv("ODOO_MCP_REQUIRE_PER_USER", "1")
+    monkeypatch.setenv("ODOO_MCP_DENIED_METHOD_PREFIXES", " account.move. , HR.PAYSLIP. ")
+    monkeypatch.setenv(mode_env, mode_value)
+
+    result = server.execute_method(
+        FakeCtx(FakeClient()),
+        "account.move",
+        "action_post",
+        args=[[42]],
+    )
+
+    assert result["success"] is False
+    assert "hard-deny policy (account.move.)" in result["error"]
 
 
 def test_execute_method_allows_exact_side_effect_allowlist(monkeypatch):
@@ -692,6 +937,121 @@ def test_execute_approved_write_runs_only_after_all_gates(monkeypatch):
             {"context": {"lang": "en_US"}},
         )
     ]
+
+
+def test_execute_approved_write_audits_and_strips_suppression_context(
+    monkeypatch, caplog,
+):
+    server = importlib.import_module("odoo_mcp.server")
+    per_user = importlib.import_module("odoo_mcp._nesa_per_user_auth")
+    calls = []
+
+    class FakeClient:
+        def get_model_fields(self, _model):
+            return {"name": {"type": "char", "readonly": False}}
+
+        def execute_method(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return True
+
+    ctx = FakeCtx(FakeClient())
+    validation = server.validate_write(
+        ctx,
+        "res.partner",
+        "write",
+        values={"name": "Ada"},
+        record_ids=[7],
+        context={"lang": "de_DE", "tracking_disable": True},
+    )
+    monkeypatch.setenv("ODOO_MCP_ENABLE_WRITES", "1")
+    token = per_user.set_user_context("office@example.com", "another-secret")
+    try:
+        with caplog.at_level("INFO", logger="odoo_mcp.server"):
+            result = server.execute_approved_write(
+                ctx, validation["approval"], confirm=True
+            )
+    finally:
+        per_user.reset_user_context(token)
+
+    business_call = next(
+        call for call in calls if call[0][:2] == ("res.partner", "write")
+    )
+    assert business_call[1] == {"context": {"lang": "de_DE"}}
+    assert result["success"] is True
+    assert result["warnings"]
+    assert "login=office@example.com" in caplog.text
+    assert "another-secret" not in caplog.text
+
+
+def test_hard_deny_applies_to_every_approved_write_stage(monkeypatch):
+    server = importlib.import_module("odoo_mcp.server")
+    calls = []
+
+    class FakeClient:
+        def get_model_fields(self, model):
+            return {"name": {"type": "char", "readonly": False}}
+
+        def execute_method(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return True
+
+    ctx = FakeCtx(FakeClient())
+    monkeypatch.delenv("ODOO_MCP_DENIED_METHOD_PREFIXES", raising=False)
+    validation = server.validate_write(
+        ctx,
+        "account.move",
+        "write",
+        values={"name": "blocked"},
+        record_ids=[42],
+    )
+    assert validation["success"] is True
+    assert validation["approval_status"]["stored"] is True
+
+    monkeypatch.setenv("ODOO_MCP_DENIED_METHOD_PREFIXES", "account.move.")
+    preview = server.preview_write(
+        "account.move", "write", values={"name": "blocked"}, record_ids=[42],
+    )
+    revalidation = server.validate_write(
+        ctx,
+        "account.move",
+        "write",
+        values={"name": "blocked"},
+        record_ids=[42],
+    )
+    monkeypatch.setenv("ODOO_MCP_ENABLE_WRITES", "1")
+    execution = server.execute_approved_write(
+        ctx, validation["approval"], confirm=True,
+    )
+
+    for result in (preview, revalidation, execution):
+        assert result["success"] is False
+        assert "hard-deny policy (account.move.)" in result["error"]
+    assert calls == []
+
+
+def test_datev_export_method_uses_real_model_method_prefix(monkeypatch):
+    server = importlib.import_module("odoo_mcp.server")
+
+    class FakeClient:
+        def execute_method(self, *_args, **_kwargs):
+            raise AssertionError("DATEV export must fail before Odoo call")
+
+    monkeypatch.setenv("ODOO_MCP_NATIVE_ACL_PARITY", "1")
+    monkeypatch.setenv("ODOO_MCP_REQUIRE_PER_USER", "1")
+    monkeypatch.setenv(
+        "ODOO_MCP_DENIED_METHOD_PREFIXES",
+        "account.general.ledger.report.handler.l10n_de_datev",
+    )
+
+    result = server.execute_method(
+        FakeCtx(FakeClient()),
+        "account.general.ledger.report.handler",
+        "l10n_de_datev_export_to_zip_and_attach",
+        args=[{}],
+    )
+
+    assert result["success"] is False
+    assert "hard-deny policy" in result["error"]
 
 
 def test_schema_catalog_caches_and_business_pack_uses_live_metadata():
@@ -1387,6 +1747,45 @@ def test_chatter_post_direct_mode_posts_immediately(monkeypatch):
     assert client.calls[0][1] == "message_post"
 
 
+def test_chatter_post_hard_deny_precedes_preview_and_direct_mode(monkeypatch):
+    server = importlib.import_module("odoo_mcp.server")
+    client = _ChatterClient()
+    monkeypatch.delenv("ODOO_MCP_DENIED_METHOD_PREFIXES", raising=False)
+    monkeypatch.setenv("MCP_CHATTER_DIRECT", "1")
+
+    result = server.chatter_post(
+        FakeCtx(client),
+        model="nesa.mcp.audit_log",
+        record_id=7,
+        body="erase evidence",
+    )
+
+    assert result["success"] is False
+    assert "hard-deny" in result["error"]
+    assert client.calls == []
+
+
+def test_chatter_post_audits_acting_login_without_api_key(monkeypatch, caplog):
+    server = importlib.import_module("odoo_mcp.server")
+    per_user = importlib.import_module("odoo_mcp._nesa_per_user_auth")
+    client = _ChatterClient()
+    monkeypatch.setenv("MCP_CHATTER_DIRECT", "1")
+    token = per_user.set_user_context("office@example.com", "chatter-secret")
+    try:
+        with caplog.at_level("INFO", logger="odoo_mcp.server"):
+            result = server.chatter_post(
+                FakeCtx(client), model="res.partner", record_id=7, body="Hi"
+            )
+    finally:
+        per_user.reset_user_context(token)
+
+    assert result["success"] is True
+    assert "login=office@example.com" in caplog.text
+    assert "model=res.partner" in caplog.text
+    assert "method=message_post" in caplog.text
+    assert "chatter-secret" not in caplog.text
+
+
 def test_chatter_post_validates_inputs(monkeypatch):
     server = importlib.import_module("odoo_mcp.server")
     monkeypatch.delenv("MCP_CHATTER_DIRECT", raising=False)
@@ -1753,6 +2152,79 @@ def test_runtime_security_report_surfaces_per_user_auth_without_secrets(monkeypa
     assert auth["credential_cache_entry_count"] >= 0
     assert auth["session_binding_count"] >= 0
     assert "must-not-appear" not in str(report)
+
+
+def test_runtime_security_report_surfaces_native_acl_parity(monkeypatch):
+    server = importlib.import_module("odoo_mcp.server")
+    monkeypatch.setenv("ODOO_MCP_NATIVE_ACL_PARITY", "1")
+    monkeypatch.setenv("ODOO_MCP_REQUIRE_PER_USER", "0")
+
+    disabled = server.runtime_security_report()["native_acl_parity"]
+    assert disabled == {
+        "requested": True,
+        "enabled": False,
+        "requires_strict_per_user": True,
+        "positive_authorizer": "exact_method_allowlist",
+    }
+
+    monkeypatch.setenv("ODOO_MCP_REQUIRE_PER_USER", "1")
+    enabled = server.runtime_security_report()["native_acl_parity"]
+    assert enabled["requested"] is True
+    assert enabled["enabled"] is True
+    assert enabled["positive_authorizer"] == (
+        "odoo_acl_record_rules_and_business_validation"
+    )
+
+
+def test_runtime_security_report_surfaces_hard_deny_prefixes(monkeypatch):
+    server = importlib.import_module("odoo_mcp.server")
+    monkeypatch.setenv(
+        "ODOO_MCP_DENIED_METHOD_PREFIXES",
+        "account.move., nesa.agent., HR.PAYSLIP.",
+    )
+
+    report = server.runtime_security_report()
+
+    assert {
+        "account.move.",
+        "nesa.agent.",
+        "hr.payslip.",
+    }.issubset(report["denied_method_prefixes"])
+    assert "nesa.mcp.approval.token." in report["denied_method_prefixes"]
+
+
+def test_runtime_security_report_uses_runtime_transport_and_broad_authorizer(
+    monkeypatch,
+):
+    server = importlib.import_module("odoo_mcp.server")
+    per_user = importlib.import_module("odoo_mcp._nesa_per_user_auth")
+    monkeypatch.setenv("MCP_TRANSPORT", "stdio")
+    monkeypatch.setenv("ODOO_MCP_ALLOW_UNKNOWN_METHODS", "1")
+    per_user.set_runtime_transport("streamable-http")
+
+    report = server.runtime_security_report()
+
+    assert report["transport"] == "streamable-http"
+    assert report["native_acl_parity"]["positive_authorizer"] == (
+        "broad_unreviewed_method_mode"
+    )
+
+
+def test_runtime_security_report_redacts_db_allowlist_error(monkeypatch):
+    server = importlib.import_module("odoo_mcp.server")
+    allowlist = importlib.import_module("odoo_mcp._nesa_db_allowlist")
+    monkeypatch.setattr(
+        allowlist,
+        "describe_state",
+        lambda: {"enabled": True, "last_error": "https://user:key@private/db"},
+    )
+
+    report = server.runtime_security_report()
+
+    assert report["nesa_db_allowlist"]["last_error"] == (
+        "[redacted: refresh failed]"
+    )
+    assert "private" not in str(report)
 
 
 # ----- AppContext / Resources / Pydantic helpers (low-line-count branches) ----

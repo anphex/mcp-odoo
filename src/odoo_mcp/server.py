@@ -50,6 +50,45 @@ METHOD_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 MAX_SEARCH_LIMIT = 100
 WRITE_APPROVAL_TTL_SECONDS = 10 * 60
 
+# Public ORM aliases that create or update records without spelling the
+# operation as create/write.  They must use the same preview/validation path
+# as direct CRUD instead of slipping through execute_method in parity mode.
+WRITE_EQUIVALENT_METHODS = frozenset({
+    "copy",
+    "copy_data",
+    "copy_multi",
+    "create_multi",
+    "import_data",
+    "load",
+    "name_create",
+    "update_field_translations",
+    "web_override_translations",
+    "web_save",
+})
+
+# These prefixes protect the bridge's own authorization, approval, audit and
+# orchestration control plane.  They are deliberately code-owned so a missing
+# or malformed deployment env var cannot make the agent self-authorizing.
+NON_DELEGABLE_METHOD_PREFIXES = frozenset({
+    "nesa.agent.definition.",
+    "nesa.agent.mcp.server.",
+    "nesa.agent.pending.action.",
+    "nesa.agent.run.",
+    "nesa.agent.runner.",
+    "nesa.agent.skill.",
+    "nesa.agent.tool.",
+    "nesa.mcp.allowed_method.",
+    "nesa.mcp.approval.token.",
+    "nesa.mcp.audit_log.",
+    "nesa.mcp.shadow.",
+})
+
+AUDIT_SUPPRESSION_CONTEXT_KEYS = frozenset({
+    "mail_create_nolog",
+    "mail_notrack",
+    "tracking_disable",
+})
+
 
 @dataclass
 class AppContext:
@@ -508,6 +547,99 @@ def allowed_side_effect_methods() -> List[str]:
     return [item.strip() for item in raw_value.split(",") if item.strip()]
 
 
+def denied_method_prefixes() -> List[str]:
+    """Return model/method prefixes that no execution mode may bypass.
+
+    This is a negative policy, not a second positive allowlist. Deployments can
+    keep a very small set of non-delegable boundaries while native ACL parity
+    lets Odoo decide every other positive authorization question.
+    """
+    raw_value = os.environ.get("ODOO_MCP_DENIED_METHOD_PREFIXES", "")
+    configured = {
+        item.strip().casefold()
+        for item in raw_value.split(",")
+        if item.strip()
+    }
+    return sorted(configured | NON_DELEGABLE_METHOD_PREFIXES)
+
+
+def denied_method_prefix(model: str, method: str) -> Optional[str]:
+    """Return the matching hard-deny prefix, if one is configured."""
+    target = f"{model}.{method}".casefold()
+    return next(
+        (prefix for prefix in denied_method_prefixes() if target.startswith(prefix)),
+        None,
+    )
+
+
+def hard_deny_result(tool: str, model: str, operation: str) -> Optional[Dict[str, Any]]:
+    """Return a uniform refusal for a non-delegable mutation target."""
+    deny_prefix = denied_method_prefix(model, operation)
+    if not deny_prefix:
+        return None
+    return {
+        "success": False,
+        "tool": tool,
+        "error": (
+            "Mutation is blocked by the deployment's hard-deny policy "
+            f"({deny_prefix}). This cannot be bypassed by native ACL parity, "
+            "an exact allowlist, broad mode, or the approved-write flow."
+        ),
+    }
+
+
+def sanitized_execution_kwargs(
+    kwargs: Optional[Dict[str, Any]],
+) -> tuple[Dict[str, Any], List[str]]:
+    """Remove caller context flags that suppress Odoo's normal audit trail."""
+    sanitized = dict(kwargs or {})
+    context = sanitized.get("context")
+    removed: List[str] = []
+    if isinstance(context, dict):
+        clean_context = dict(context)
+        for key in sorted(AUDIT_SUPPRESSION_CONTEXT_KEYS):
+            if key in clean_context:
+                removed.append(key)
+                clean_context.pop(key, None)
+        sanitized["context"] = clean_context
+    return sanitized, removed
+
+
+def audit_odoo_execution(tool: str, model: str, method: str) -> None:
+    """Log the acting login and target without ever logging its API key."""
+    from ._nesa_per_user_auth import current_user_context
+
+    user_context = current_user_context()
+    login = user_context[0] if user_context else "<service-account>"
+    logger.info(
+        "[odoo_execution] tool=%s login=%s model=%s method=%s native_acl_parity=%s",
+        tool,
+        login,
+        model,
+        method,
+        native_acl_parity_enabled(),
+    )
+
+
+def native_acl_parity_requested() -> bool:
+    """Return whether the deployment requests Odoo-native authorization.
+
+    This is intentionally separate from ``ODOO_MCP_ALLOW_UNKNOWN_METHODS``:
+    parity mode is only valid with strict per-user authentication, while the
+    older broad switch can also run with a service credential.
+    """
+    return truthy_env("ODOO_MCP_NATIVE_ACL_PARITY")
+
+
+def native_acl_parity_enabled() -> bool:
+    """Trust native Odoo ACLs only when every request has a user identity."""
+    if not native_acl_parity_requested():
+        return False
+    from ._nesa_per_user_auth import strict_mode_enabled
+
+    return strict_mode_enabled()
+
+
 def side_effect_method_allowed(model: str, method: str) -> bool:
     """Check exact side-effect allowlist entries.
 
@@ -534,26 +666,31 @@ def runtime_security_report() -> Dict[str, Any]:
     """Expose MCP runtime safety posture without including secrets."""
     security = getattr(mcp.settings, "transport_security", None)
     broad_unknown_enabled = truthy_env("ODOO_MCP_ALLOW_UNKNOWN_METHODS")
+    native_parity_requested = native_acl_parity_requested()
+    native_parity_enabled = native_acl_parity_enabled()
+    db_allowlist_state = __import__(
+        "odoo_mcp._nesa_db_allowlist", fromlist=["describe_state"],
+    ).describe_state()
+    if db_allowlist_state.get("last_error"):
+        db_allowlist_state["last_error"] = "[redacted: refresh failed]"
+    per_user_auth_state = __import__(
+        "odoo_mcp._nesa_per_user_auth", fromlist=["describe_state"],
+    ).describe_state()
     return {
-        "transport": os.environ.get("MCP_TRANSPORT", "stdio"),
+        "transport": per_user_auth_state["runtime_transport"],
         "host": getattr(mcp.settings, "host", None),
         "port": getattr(mcp.settings, "port", None),
         "streamable_http_path": getattr(mcp.settings, "streamable_http_path", None),
         "remote_http_allowed": truthy_env("MCP_ALLOW_REMOTE_HTTP"),
         "write_execution_enabled": writes_enabled(),
-        "unknown_execute_method_enabled": broad_unknown_enabled,
+        "unknown_execute_method_enabled": (
+            broad_unknown_enabled or native_parity_enabled
+        ),
         "chatter_direct_enabled": chatter_direct_enabled(),
         "allowed_side_effect_methods": allowed_side_effect_methods(),
-        "nesa_db_allowlist": (
-            __import__(
-                "odoo_mcp._nesa_db_allowlist", fromlist=["describe_state"],
-            ).describe_state()
-        ),
-        "nesa_per_user_auth": (
-            __import__(
-                "odoo_mcp._nesa_per_user_auth", fromlist=["describe_state"],
-            ).describe_state()
-        ),
+        "denied_method_prefixes": denied_method_prefixes(),
+        "nesa_db_allowlist": db_allowlist_state,
+        "nesa_per_user_auth": per_user_auth_state,
         "broad_unknown_method_mode": {
             "enabled": broad_unknown_enabled,
             "risk": ("broad" if broad_unknown_enabled else "off"),
@@ -562,12 +699,27 @@ def runtime_security_report() -> Dict[str, Any]:
                 "ODOO_MCP_ALLOW_UNKNOWN_METHODS=1."
             ),
         },
+        "native_acl_parity": {
+            "requested": native_parity_requested,
+            "enabled": native_parity_enabled,
+            "requires_strict_per_user": True,
+            "positive_authorizer": (
+                "odoo_acl_record_rules_and_business_validation"
+                if native_parity_enabled
+                else (
+                    "broad_unreviewed_method_mode"
+                    if broad_unknown_enabled
+                    else "exact_method_allowlist"
+                )
+            ),
+        },
         "allowed_hosts": getattr(security, "allowed_hosts", None),
         "allowed_origins": getattr(security, "allowed_origins", None),
         "notes": [
             "HTTP transports are local-only by default in the CLI entry point.",
             "execute_approved_write requires ODOO_MCP_ENABLE_WRITES and confirm=true.",
-            "execute_method blocks standard destructive methods and unreviewed side-effect methods by default.",
+            "execute_method blocks direct CRUD and write-equivalent aliases in every mode.",
+            "Native ACL parity requires strict per-user authentication and never grants sudo access.",
         ],
     }
 
@@ -1551,6 +1703,9 @@ def preview_write(
     """Build a canonical approval token for a later approved write."""
     try:
         validate_model_name(model)
+        denied = hard_deny_result("preview_write", model, operation)
+        if denied:
+            return denied
         return build_write_preview_report(
             model=model,
             operation=operation,
@@ -1580,6 +1735,9 @@ def validate_write(
     """Validate write shape and return an approval payload when safe."""
     try:
         validate_model_name(model)
+        denied = hard_deny_result("validate_write", model, operation)
+        if denied:
+            return denied
         metadata_source = "input" if fields_metadata is not None else "none"
         if fields_metadata is None and use_live_metadata:
             metadata_source = "server"
@@ -1662,6 +1820,14 @@ def execute_approved_write(
                 "error": "approval token does not match the canonical payload",
                 "expected_token": expected_token,
             }
+        model = str(approval.get("model", ""))
+        operation = str(approval.get("operation", "")).strip().lower()
+        validate_model_name(model)
+        if operation not in {"create", "write", "unlink"}:
+            raise ValueError("operation must be one of create, write, or unlink")
+        denied = hard_deny_result("execute_approved_write", model, operation)
+        if denied:
+            return denied
         app_context = ctx.request_context.lifespan_context
         validation_record = require_validated_write_approval(app_context, approval)
         if validation_record is None:
@@ -1696,16 +1862,13 @@ def execute_approved_write(
                 "error": "write execution disabled; set ODOO_MCP_ENABLE_WRITES=1 to enable",
             }
 
-        model = str(approval.get("model", ""))
-        operation = str(approval.get("operation", "")).strip().lower()
-        validate_model_name(model)
-        if operation not in {"create", "write", "unlink"}:
-            raise ValueError("operation must be one of create, write, or unlink")
-
         values = dict(approval.get("values") or {})
         record_ids = [int(record_id) for record_id in approval.get("record_ids") or []]
         context = dict(approval.get("context") or {})
-        kwargs = {"context": context} if context else {}
+        sanitized_kwargs, removed_context_keys = sanitized_execution_kwargs(
+            {"context": context} if context else {}
+        )
+        kwargs = sanitized_kwargs
         if operation == "create":
             args: List[Any] = [values]
         elif operation == "write":
@@ -1713,16 +1876,23 @@ def execute_approved_write(
         else:
             args = [record_ids]
 
+        audit_odoo_execution("execute_approved_write", model, operation)
         result = app_context.odoo.execute_method(model, operation, *args, **kwargs)
         # NESA Patch 3 — DB-backed token revocation (replaces in-memory pop).
         revoke_write_approval(app_context, str(approval.get("token", "")))
-        return {
+        response = {
             "success": True,
             "tool": "execute_approved_write",
             "model": model,
             "operation": operation,
             "result": result,
         }
+        if removed_context_keys:
+            response["warnings"] = [
+                "Removed audit-suppression context keys: "
+                + ", ".join(removed_context_keys)
+            ]
+        return response
     except Exception as e:
         return {"success": False, "tool": "execute_approved_write", "error": str(e)}
 
@@ -1856,17 +2026,36 @@ def execute_method(
         validate_model_name(model)
         validate_method_name(method)
         safety = classify_method_safety(method)
-        if method in DESTRUCTIVE_METHODS:
+        if method.startswith("_"):
+            return {
+                "success": False,
+                "error": "Private underscore methods cannot be called via execute_method.",
+                "classification": safety,
+            }
+        if method in DESTRUCTIVE_METHODS or method in WRITE_EQUIVALENT_METHODS:
             return {
                 "success": False,
                 "error": (
-                    "Direct execute_method blocks create/write/unlink. Use "
+                    "Direct execute_method blocks CRUD and write-equivalent "
+                    "aliases. Use "
                     "preview_write -> validate_write -> execute_approved_write."
                 ),
+            }
+        deny_prefix = denied_method_prefix(model, method)
+        if deny_prefix:
+            return {
+                "success": False,
+                "error": (
+                    "Method execution is blocked by the deployment's hard-deny "
+                    f"policy ({deny_prefix}). This cannot be bypassed by native "
+                    "ACL parity, an exact allowlist, or broad mode."
+                ),
+                "classification": safety,
             }
         review_required = safety["safety"] in {"side_effect", "unknown"}
         if (
             review_required
+            and not native_acl_parity_enabled()
             and not side_effect_method_allowed(model, method)
             and not truthy_env("ODOO_MCP_ALLOW_UNKNOWN_METHODS")
         ):
@@ -1876,12 +2065,13 @@ def execute_method(
                     "Unreviewed side-effect methods are blocked by default. Review "
                     "custom source and allow exact methods through "
                     "ODOO_MCP_ALLOWED_SIDE_EFFECT_METHODS=model.method, or set "
-                    "ODOO_MCP_ALLOW_UNKNOWN_METHODS=1 only for trusted deployments."
+                    "ODOO_MCP_NATIVE_ACL_PARITY=1 with strict per-user "
+                    "authentication so native Odoo permissions decide."
                 ),
                 "classification": safety,
             }
         args = args or []
-        kwargs = kwargs or {}
+        kwargs, removed_context_keys = sanitized_execution_kwargs(kwargs)
 
         # Special handling for search methods like search, search_count, search_read
         search_methods = ["search", "search_count", "search_read"]
@@ -1897,8 +2087,15 @@ def execute_method(
                 args = normalized_args
 
         odoo = ctx.request_context.lifespan_context.odoo
+        audit_odoo_execution("execute_method", model, method)
         result = odoo.execute_method(model, method, *args, **kwargs)
-        return {"success": True, "result": result}
+        response = {"success": True, "result": result}
+        if removed_context_keys:
+            response["warnings"] = [
+                "Removed audit-suppression context keys: "
+                + ", ".join(removed_context_keys)
+            ]
+        return response
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -2239,6 +2436,9 @@ def chatter_post(
     odoo = ctx.request_context.lifespan_context.odoo
     try:
         validate_model_name(model)
+        denied = hard_deny_result("chatter_post", model, "message_post")
+        if denied:
+            return denied
         if record_id < 1:
             raise ValueError("record_id must be greater than 0")
         body_text = (body or "").strip()
@@ -2262,6 +2462,7 @@ def chatter_post(
 
         direct_mode = chatter_direct_enabled()
         if direct_mode:
+            audit_odoo_execution("chatter_post", model, "message_post")
             result = odoo.execute_method(
                 model,
                 "message_post",
@@ -2300,6 +2501,7 @@ def chatter_post(
                 "confirm=true is required to execute an approved chatter post."
             )
 
+        audit_odoo_execution("chatter_post", model, "message_post")
         result = odoo.execute_method(
             model,
             "message_post",

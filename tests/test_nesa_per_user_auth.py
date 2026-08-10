@@ -201,6 +201,40 @@ def test_network_transport_defaults_to_fail_closed(per_user_module, monkeypatch)
         per_user_module.get_per_user_client()
 
 
+@pytest.mark.parametrize("configured", ["", "maybe", "TRUE-ish"])
+def test_malformed_strict_mode_env_uses_network_fail_closed_default(
+    per_user_module, monkeypatch, caplog, configured,
+):
+    monkeypatch.setenv("MCP_TRANSPORT", "streamable-http")
+    monkeypatch.setenv("ODOO_MCP_REQUIRE_PER_USER", configured)
+
+    with caplog.at_level("ERROR"):
+        assert per_user_module.strict_mode_enabled() is True
+
+    assert "invalid ODOO_MCP_REQUIRE_PER_USER" in caplog.text
+
+
+def test_explicit_false_strict_mode_override_stays_supported(
+    per_user_module, monkeypatch,
+):
+    monkeypatch.setenv("MCP_TRANSPORT", "streamable-http")
+    monkeypatch.setenv("ODOO_MCP_REQUIRE_PER_USER", "false")
+
+    assert per_user_module.strict_mode_enabled() is False
+
+
+def test_describe_state_prefers_parsed_runtime_transport(
+    per_user_module, monkeypatch,
+):
+    monkeypatch.setenv("MCP_TRANSPORT", "stdio")
+    per_user_module.set_runtime_transport("streamable-http")
+
+    state = per_user_module.describe_state()
+
+    assert state["runtime_transport"] == "streamable-http"
+    assert state["strict_mode"] is True
+
+
 def test_middleware_strict_mode_allows_headers_present(per_user_module, monkeypatch):
     monkeypatch.setenv("ODOO_MCP_REQUIRE_PER_USER", "1")
     importlib.reload(per_user_module)

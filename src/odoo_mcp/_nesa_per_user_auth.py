@@ -141,16 +141,28 @@ def set_runtime_transport(transport: str) -> None:
 
 
 def strict_mode_enabled() -> bool:
+    transport = _runtime_transport or os.environ.get("MCP_TRANSPORT", "stdio")
+    transport_default = transport.strip().lower() in {
+        "streamable-http",
+        "sse",
+    }
     configured = os.environ.get(_REQUIRE_ENV)
     if configured is None:
         # Network transports default fail-closed. Stdio keeps upstream's
         # explicit env/service-account behavior unless the operator opts in.
-        transport = _runtime_transport or os.environ.get("MCP_TRANSPORT", "stdio")
-        return transport.strip().lower() in {
-            "streamable-http",
-            "sse",
-        }
-    return configured.strip().lower() in {"1", "true", "yes", "on"}
+        return transport_default
+    normalized = configured.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    _logger.error(
+        "[per_user] invalid %s=%r; using fail-closed transport default for %s",
+        _REQUIRE_ENV,
+        configured,
+        transport,
+    )
+    return transport_default
 
 
 def set_user_context(login: Optional[str], api_key: Optional[str]) -> Any:
@@ -502,6 +514,9 @@ def describe_state() -> dict[str, Any]:
         session_binding_count = len(_session_bindings)
     return {
         "strict_mode": strict_mode_enabled(),
+        "runtime_transport": (
+            _runtime_transport or os.environ.get("MCP_TRANSPORT", "stdio")
+        ).strip().lower(),
         "credential_cache_ttl_seconds": _cache_ttl_seconds(),
         "credential_cache_max_entries": _cache_max_entries(),
         "credential_cache_entry_count": cached_client_count,

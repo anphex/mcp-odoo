@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Added
+- Added native Odoo ACL parity for strict per-user deployments through
+  `ODOO_MCP_NATIVE_ACL_PARITY=1`, removing the extra positive method list for
+  public business methods while preserving each caller's native Odoo rights.
+- Added deployment hard-deny prefixes through
+  `ODOO_MCP_DENIED_METHOD_PREFIXES`; they precede native parity, exact and
+  broad method modes, and all three approved-write stages.
+
+### Changed
+- Private underscore methods remain unreachable through `execute_method`, and
+  runtime health now reports parity, broad mode, exact metadata, and hard-deny
+  posture separately.
+- Closed public CRUD-helper bypasses (`web_save`, `name_create`, `copy`, `load`,
+  translation updates, and related variants), made MCP/agent control-plane denies non-configurable,
+  applied hard denies to chatter, added per-mutation actor/target audit logs,
+  stripped audit-suppression context flags, and made malformed strict-auth
+  configuration fail closed on network transports.
+
 ## [0.3.0] - 2026-05-04
 
 ### Added

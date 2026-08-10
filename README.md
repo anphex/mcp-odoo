@@ -42,7 +42,7 @@ Once configured (see [Install](#install) and [Configure](#configure)), ask your 
 | Chatter integration | `chatter_post` adds messages to any `mail.thread` record under the same approval-token gate as writes — or directly via `MCP_CHATTER_DIRECT=1`. |
 | Locale plumbing | `ODOO_LOCALE` injects `context.lang` automatically on every Odoo call (caller can override). |
 | Structured logging | JSON formatter and rotating file handler via `ODOO_MCP_LOG_LEVEL`, `ODOO_MCP_LOG_JSON`, `ODOO_MCP_LOG_FILE`. |
-| Safe writes | Direct `create`, `write`, and `unlink` are blocked; approved writes require live metadata, a same-session token, explicit confirmation, and an env gate. |
+| Safe writes | Direct CRUD and generic write helpers are blocked; approved writes require live metadata, a same-session token, explicit confirmation, and an env gate. |
 | Real smoke tests | Docker Compose validation boots disposable Odoo 16.0, 17.0, 18.0, and 19.0 stacks, including restricted users, custom record rules, and packaged addon XML install/update. |
 
 ## Why Odoo MCP
@@ -120,7 +120,9 @@ Optional environment variables:
 | `ODOO_MCP_LOG_FILE` | unset | Path → enable rotating file handler (10MB × 3 backups). |
 | `ODOO_MCP_ENABLE_WRITES` | `0` | Required for `execute_approved_write`. |
 | `ODOO_MCP_ALLOWED_SIDE_EFFECT_METHODS` | empty | Exact `model.method` allowlist (e.g. `sale.order.action_confirm`). |
+| `ODOO_MCP_DENIED_METHOD_PREFIXES` | empty | Additional CSV mutation hard-deny prefixes checked by `execute_method`, approved writes, and chatter (e.g. `account.move.,hr.payslip.`). Built-in MCP/agent control-plane denies cannot be removed. Read visibility remains governed by Odoo ACLs. |
 | `ODOO_MCP_ALLOW_UNKNOWN_METHODS` | `0` | Broad mode for `execute_method`. Prefer the exact allowlist above. |
+| `ODOO_MCP_NATIVE_ACL_PARITY` | `0` | Allow public business methods only when strict per-user authentication is active; native Odoo ACLs, record rules, and method validation decide. |
 | `MCP_CHATTER_DIRECT` | `0` | Truthy → `chatter_post` skips the approval token gate and posts immediately. |
 | `MCP_ALLOW_REMOTE_HTTP` | `0` | Truthy → permit non-local HTTP binds (still requires external auth/TLS). |
 | `MCP_ALLOWED_HOSTS` / `MCP_ALLOWED_ORIGINS` | local | CSV allowlists for HTTP transports. |
@@ -190,7 +192,7 @@ odoo-mcp --health
 | `preview_write` | Produce a non-executing approval payload for `create`, `write`, or `unlink`. |
 | `validate_write` | Validate a write payload against trusted live `fields_get` metadata. |
 | `execute_approved_write` | Execute only a same-session, live-validated, confirmed write when `ODOO_MCP_ENABLE_WRITES=1`. |
-| `execute_method` | Execute a reviewed model method. Direct `create`, `write`, and `unlink` are blocked. Side-effect methods require an exact allowlist or `ODOO_MCP_ALLOW_UNKNOWN_METHODS=1`. |
+| `execute_method` | Execute a public business method. Direct CRUD and generic write helpers such as `web_save`, `name_create`, `copy`, `load`, and translation updates use the validated write path instead. Other side-effect methods require an exact allowlist, broad mode, or native ACL parity with strict per-user authentication. |
 | `chatter_post` | Post a chatter message on a `mail.thread` record. Default mode requires the approval-token preview/execute flow. |
 
 ### Diagnose (3)
@@ -263,9 +265,23 @@ one by one:
 export ODOO_MCP_ALLOWED_SIDE_EFFECT_METHODS="sale.order.action_confirm,res.partner.message_post"
 ```
 
-`ODOO_MCP_ALLOW_UNKNOWN_METHODS=1` is still supported for trusted deployments,
-but `health_check` reports it as broad mode. Prefer exact allowlist entries when
-you only need a small number of reviewed methods.
+For a per-user deployment that must mirror the user's Odoo Web permissions,
+set `ODOO_MCP_NATIVE_ACL_PARITY=1` together with strict per-user authentication.
+This removes the extra positive method list for public business methods while
+still running every call with the user's own Odoo credential. Direct CRUD and
+generic write helpers such as `web_save`, `name_create`, `copy`, `load`, and
+translation updates remain on the validated three-stage write path. A
+deployment can retain a small, explicit negative policy with
+`ODOO_MCP_DENIED_METHOD_PREFIXES`; those prefixes are checked before parity,
+exact allowlists, broad mode, every stage of the approved-write flow, and
+chatter execution. Built-in MCP/agent control-plane denies are always active.
+This is a mutation boundary, not a read permission system: reads still use the
+current user's native Odoo ACLs and record rules.
+Private underscore methods remain blocked.
+
+`ODOO_MCP_ALLOW_UNKNOWN_METHODS=1` remains available as the older broad mode,
+including service-credential deployments. `health_check` reports both modes
+separately; prefer native ACL parity for user-facing enterprise deployments.
 
 ## Client Setup
 
@@ -377,6 +393,16 @@ The smoke harness boots disposable Docker Compose stacks, validates direct Odoo 
 ## Compatibility
 
 XML-RPC remains the default transport for broad compatibility. Odoo 19 supports External JSON-2 through `ODOO_TRANSPORT=json2`. Odoo has documented XML-RPC and JSON-RPC deprecation for Odoo 20, so new integrations should plan for JSON-2.
+
+## Review backlog
+
+- Synchronous Odoo network calls currently run in the MCP event loop. Move
+  them to a context-preserving worker thread before a high-concurrency rollout.
+- Reject `stdio` plus `ODOO_MCP_REQUIRE_PER_USER=1` during startup with a clear
+  configuration error; the current behavior is fail-closed but unhelpful.
+- Re-audit `WRITE_EQUIVALENT_METHODS` when upgrading Odoo or installing modules
+  that expose new generic write helpers. Native Odoo authorization still
+  applies, but new aliases must not bypass the validated write workflow.
 
 ## Contributing
 

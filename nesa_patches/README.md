@@ -4,7 +4,7 @@ Diese Patches transformieren den Upstream `tuanle96/mcp-odoo` Server zu
 einem NESA-konformen MCP-Endpoint. Inkrementelle Applikation — nicht alle
 Patches sind bereits gelandet.
 
-## Status (Stand 2026-07-23)
+## Status (Stand 2026-08-10)
 
 | # | Patch | Status | Commit |
 | - | ----- | ------ | ------ |
@@ -12,6 +12,7 @@ Patches sind bereits gelandet.
 | 2 | Per-User-XML-RPC-Passthrough (X-Odoo-Api-Key) | **APPLIED + hardened** | `12a0eeb` + aktueller Security-Fix |
 | 3 | DATEV/Payroll-Block (Constraint-Seite, Odoo) | applied in `nesa_mcp_bridge` (`nesa.mcp.allowed_method._check_datev_blocklist`) | — |
 | 4 | `doc/`-Endpoint via `nesa.mcp.doc.helper` | partial — Helper-Model existiert in `nesa_mcp_bridge`, Fork-Seite nicht verdrahtet | — |
+| 5 | Native Odoo-ACL-Parität für Per-User-Calls | **APPLIED** | Feature-Branch `feature/mcp-ui-parity` |
 
 ## Patch-Beschreibungen
 
@@ -31,6 +32,20 @@ Patches sind bereits gelandet.
    `Mcp-Session-Id` ist an denselben Credential-Fingerprint gebunden. Für
    Netzwerktransporte ist strict per Default aktiv; produktive Units setzen
    `ODOO_MCP_REQUIRE_PER_USER=1` zusätzlich explizit und prüfbar.
+
+5. **Native ACL-Parität** — mit `ODOO_MCP_NATIVE_ACL_PARITY=1` entfällt die
+   zweite positive Methodenliste für öffentliche Odoo-Business-Methoden. Der
+   Modus wird nur aktiv, wenn strikte Per-User-Authentifizierung aktiv ist;
+   jeder Call läuft damit weiterhin unter den ACLs, Record Rules und
+   Business-Validierungen des konkreten Odoo-Users. Direkte CRUD-Calls und
+   generische Schreibhelfer wie `web_save`, `name_create`, `copy`, `load` und
+   Übersetzungsupdates bleiben auf dem validierten Drei-Stufen-Write-Pfad.
+   Wenige nicht delegierbare Grenzen werden als
+   negative Policy via `ODOO_MCP_DENIED_METHOD_PREFIXES` vor allen Modi
+   geprüft; MCP-/Agent-Kontrollmodelle sind zusätzlich fest im Code gesperrt.
+   Diese Mutation-Policy ist keine zweite positive Berechtigungsschicht und
+   verändert keine Leserechte. Jeder ausgeführte Mutationscall schreibt einen
+   Audit-Logeintrag mit Login, Model und Methode, niemals mit dem API-Key.
 
 ### Verbindlicher Reverse-Proxy-Sicherheitsvertrag
 
@@ -105,6 +120,8 @@ bash /var/odoo/_Skripte/mcp_fork_setup.sh
 
 # 4) systemd-Unit konfigurieren
 #    Environment=ODOO_MCP_REQUIRE_PER_USER=1
+#    Environment=ODOO_MCP_NATIVE_ACL_PARITY=1
+#    Environment=ODOO_MCP_DENIED_METHOD_PREFIXES=account.move.,account.payment.,hr.payslip.,hr.payroll.,account.general.ledger.report.handler.l10n_de_datev,account.general.ledger.report.handler.l10_de_datev,nesa.datev.lohnreport.,ir.config_parameter.,ir.cron.,ir.actions.server.,nesa.agent.definition.,nesa.agent.tool.,nesa.mcp.approval.token.,nesa.mcp.allowed_method.
 #    Environment=ODOO_MCP_METHOD_ALLOWLIST_MODEL=nesa.mcp.allowed_method
 #    Environment=ODOO_MCP_METHOD_ALLOWLIST_TTL=60  (optional)
 #    Environment=MCP_SESSION_IDLE_TIMEOUT=1800  (optional)

@@ -56,10 +56,17 @@ uv run python -m twine check dist/*
 
 Write execution is intentionally gated. Do not loosen these gates without a dedicated security discussion:
 
-- direct `create`, `write`, and `unlink` remain blocked in `execute_method`,
+- direct CRUD and write-equivalent aliases (`web_save`, `name_create`, `copy`,
+  `load`, translation updates, and related variants) remain blocked in
+  `execute_method`,
+- deployment hard-deny prefixes precede every `execute_method` execution mode
+  and every approved-write or chatter stage; built-in control-plane prefixes
+  cannot be removed by deployment configuration,
+- native ACL parity only activates together with strict per-user authentication,
 - standard writes go through `preview_write`, `validate_write`, and `execute_approved_write`,
 - executable approval requires trusted live metadata,
 - `ODOO_MCP_ENABLE_WRITES=1` is required for execution.
+- audit-suppression context flags are stripped before mutation execution.
 
 ## Style
 
