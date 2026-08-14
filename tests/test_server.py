@@ -1633,6 +1633,10 @@ class _ChatterClient:
         self.calls: list[tuple[str, str, tuple, dict]] = []
 
     def execute_method(self, model, method, *args, **kwargs):
+        if model == "mail.message" and method == "search":
+            # Baseline/follow-up lookups from _message_post_returning_id.
+            # Keep them out of self.calls so message_post stays calls[0].
+            return []
         self.calls.append((model, method, args, kwargs))
         return self.post_result
 
@@ -1744,6 +1748,36 @@ def test_chatter_post_direct_mode_posts_immediately(monkeypatch):
     assert result["mode"] == "direct"
     assert result["approval_required"] is False
     assert result["result"] == 999
+    assert client.calls[0][1] == "message_post"
+
+
+def test_chatter_post_direct_mode_resolves_id_when_marshal_fails(monkeypatch):
+    """Odoo 18 message_post returns a recordset the RPC layer cannot marshal;
+    the note is already committed when serialization fails. The tool must
+    swallow exactly that fault and resolve the persisted id via the
+    baseline + follow-up mail.message search (commit 250eace)."""
+    server = importlib.import_module("odoo_mcp.server")
+    monkeypatch.setenv("MCP_CHATTER_DIRECT", "1")
+
+    class _MarshalFaultClient(_ChatterClient):
+        def execute_method(self, model, method, *args, **kwargs):
+            if model == "mail.message" and method == "search":
+                domain = args[0]
+                is_followup = any(
+                    isinstance(clause, (list, tuple)) and clause[0] == "id"
+                    for clause in domain
+                )
+                return [321] if is_followup else [300]
+            self.calls.append((model, method, args, kwargs))
+            raise Exception("<Fault 1: cannot marshal objects>")
+
+    client = _MarshalFaultClient()
+    result = server.chatter_post(
+        FakeCtx(client), model="res.partner", record_id=7, body="hi"
+    )
+
+    assert result["success"] is True
+    assert result["result"] == 321
     assert client.calls[0][1] == "message_post"
 
 
