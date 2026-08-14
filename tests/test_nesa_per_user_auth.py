@@ -562,7 +562,13 @@ def test_mcp_session_is_bound_to_credential_fingerprint(per_user_module):
     assert reached == 2
 
 
-def test_unknown_mcp_session_is_rejected(per_user_module):
+def test_unknown_mcp_session_returns_404_for_reinitialize(per_user_module):
+    """Expired/evicted/restart-lost sessions must yield 404, not 403.
+
+    Per the streamable-http spec a 404 tells the client to transparently
+    start a new session; a 403 makes clients like claude.ai flag the
+    connector as a permission problem ("reconnect with appropriate access").
+    """
     async def inner(scope, receive, send):
         raise AssertionError("unbound session must never reach the app")
 
@@ -574,7 +580,7 @@ def test_unknown_mcp_session_is_rejected(per_user_module):
     ]))
     assert next(
         m for m in sent if m["type"] == "http.response.start"
-    )["status"] == 403
+    )["status"] == 404
 
 
 def test_service_session_cannot_be_reused_with_user_credentials(per_user_module):
@@ -643,9 +649,9 @@ def test_expired_session_binding_is_removed(per_user_module):
     identity = per_user_module._credential_identity("alice", "key-a")
     per_user_module._session_bindings["expired"] = (identity, time.monotonic() - 1)
 
-    assert per_user_module.NesaPerUserAuthMiddleware._session_matches(
+    assert per_user_module.NesaPerUserAuthMiddleware._session_binding_state(
         "expired", identity,
-    ) is False
+    ) == "unknown"
     assert "expired" not in per_user_module._session_bindings
 
 

@@ -379,11 +379,23 @@ class NesaPerUserAuthMiddleware:
             if login and api_key
             else _SERVICE_ACCOUNT_IDENTITY
         )
-        if session_id and not self._session_matches(session_id, identity):
-            await self._send_error(
-                send, 403, "MCP session is not bound to these credentials.",
-            )
-            return
+        if session_id:
+            binding_state = self._session_binding_state(session_id, identity)
+            if binding_state == "unknown":
+                # Binding expired, was evicted, or predates a process restart.
+                # The streamable-http spec requires 404 here so the client
+                # transparently starts a new session instead of treating the
+                # failure as a permission problem (claude.ai shows a
+                # "reconnect the connector" error on 403).
+                await self._send_error(
+                    send, 404, "MCP session not found. Re-initialize to start a new session.",
+                )
+                return
+            if binding_state == "mismatch":
+                await self._send_error(
+                    send, 403, "MCP session is not bound to these credentials.",
+                )
+                return
 
         token = set_user_context(login, api_key)
         response_status = 0
@@ -441,19 +453,29 @@ class NesaPerUserAuthMiddleware:
         return values[0] or None
 
     @staticmethod
-    def _session_matches(
+    def _session_binding_state(
         session_id: str, identity: CredentialIdentity,
-    ) -> bool:
+    ) -> str:
+        """Classify a presented session ID against the binding table.
+
+        Returns ``"match"`` (binding exists for these credentials, sliding
+        expiry refreshed), ``"mismatch"`` (binding exists but belongs to other
+        credentials — a genuine cross-credential reuse attempt, HTTP 403), or
+        ``"unknown"`` (no live binding: expired, evicted, or lost to a process
+        restart — HTTP 404 per streamable-http spec so clients re-initialize).
+        """
         now = time.monotonic()
         with _session_lock:
             NesaPerUserAuthMiddleware._evict_expired_sessions(now)
             binding = _session_bindings.get(session_id)
-            if binding is None or not _identities_match(binding[0], identity):
-                return False
+            if binding is None:
+                return "unknown"
+            if not _identities_match(binding[0], identity):
+                return "mismatch"
             _session_bindings[session_id] = (
                 binding[0], now + session_idle_timeout_seconds(),
             )
-            return True
+            return "match"
 
     @staticmethod
     def _bind_session(
