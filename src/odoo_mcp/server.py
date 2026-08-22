@@ -554,10 +554,54 @@ _MUTATING_X2MANY_COMMANDS = frozenset({0, 1, 2, 3})
 _X2MANY_TYPES = frozenset({"one2many", "many2many"})
 
 
+def collect_write_values(
+    method: str, args: Optional[List[Any]], kwargs: Optional[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Return every values dict a create/write call would apply.
+
+    RPC offers more than one shape for the same call and a guard that only
+    knows the common one is not a guard:
+
+    * ``write`` takes its values positionally *or* as ``vals=`` keyword —
+      Odoo passes keywords straight through to the method.
+    * ``create`` accepts a single dict *or* a list of dicts (batch create).
+
+    All of them are collected here so the caller can inspect them uniformly.
+    """
+    positional = list(args or [])
+    keyword = dict(kwargs or {})
+    raw: List[Any] = []
+    if method == "create":
+        if positional:
+            raw.append(positional[0])
+        for key in ("vals", "vals_list", "values"):
+            if key in keyword:
+                raw.append(keyword[key])
+    elif method == "write":
+        if len(positional) > 1:
+            raw.append(positional[1])
+        for key in ("vals", "values"):
+            if key in keyword:
+                raw.append(keyword[key])
+
+    collected: List[Dict[str, Any]] = []
+    for entry in raw:
+        if isinstance(entry, dict):
+            collected.append(entry)
+        elif isinstance(entry, (list, tuple)):
+            collected.extend(item for item in entry if isinstance(item, dict))
+    return collected
+
+
 def x2many_commands_are_inert(
-    app_context: AppContext, odoo: OdooClient, model: str, values: Any
+    app_context: AppContext,
+    odoo: OdooClient,
+    model: str,
+    method: str,
+    args: Optional[List[Any]],
+    kwargs: Optional[Dict[str, Any]],
 ) -> Optional[str]:
-    """Return a reason when ``values`` would write through a relation.
+    """Return a reason when the call would write through a relation.
 
     Even a wizard that never overrides ``create``/``write`` can reach
     persistent data: ``base.language.install`` carries a
@@ -566,23 +610,35 @@ def x2many_commands_are_inert(
 
     Returns ``None`` when nothing objectionable was found.
     """
-    if not isinstance(values, dict) or not values:
+    values_list = collect_write_values(method, args, kwargs)
+    if not values_list:
         return None
     metadata = _cached_fields_metadata(app_context, odoo, model)
-    for field_name, value in values.items():
-        field_type = (metadata.get(field_name) or {}).get("type")
-        if field_type not in _X2MANY_TYPES or not isinstance(value, (list, tuple)):
-            continue
-        for command in value:
-            if not isinstance(command, (list, tuple)) or not command:
+    if not metadata:
+        # Without field types this function cannot tell a Char from a
+        # Many2many, so it cannot promise anything. Refuse the fast path
+        # rather than wave the call through.
+        return (
+            f"field metadata for {model} is unavailable, so the relation "
+            "commands in this call cannot be checked."
+        )
+    for values in values_list:
+        for field_name, value in values.items():
+            field_type = (metadata.get(field_name) or {}).get("type")
+            if field_type not in _X2MANY_TYPES:
                 continue
-            if command[0] in _MUTATING_X2MANY_COMMANDS:
-                return (
-                    f"{field_name} carries x2many command {command[0]}, which "
-                    "creates, updates or deletes records on the other side of "
-                    "the relation. Only linking commands (4/5/6) run without "
-                    "the approval chain."
-                )
+            if not isinstance(value, (list, tuple)):
+                continue
+            for command in value:
+                if not isinstance(command, (list, tuple)) or not command:
+                    continue
+                if command[0] in _MUTATING_X2MANY_COMMANDS:
+                    return (
+                        f"{field_name} carries x2many command {command[0]}, "
+                        "which creates, updates or deletes records on the "
+                        "other side of the relation. Only linking commands "
+                        "(4/5/6) run without the approval chain."
+                    )
     return None
 
 
@@ -2912,13 +2968,8 @@ def execute_method(
             if exempt:
                 # Defense in depth: even a reviewed wizard must not be used as
                 # a pipe into a persistent comodel via x2many commands.
-                candidate_values = None
-                if method == "create" and args:
-                    candidate_values = args[0]
-                elif method == "write" and len(args or []) > 1:
-                    candidate_values = args[1]
                 relation_reason = x2many_commands_are_inert(
-                    app_context, app_context.odoo, model, candidate_values,
+                    app_context, app_context.odoo, model, method, args, kwargs,
                 )
                 if relation_reason:
                     exempt = False
@@ -4187,7 +4238,8 @@ def list_allowed_methods(
             positive_policy = (
                 "Native Odoo ACL parity is active: every public, non-underscore "
                 "method runs if and only if the acting Odoo user is allowed to "
-                "run it. No separate method allowlist applies."
+                "run it. CRUD and its write-equivalent aliases are the "
+                "exception — they stay on the approved-write chain regardless."
             )
         elif truthy_env("ODOO_MCP_ALLOW_UNKNOWN_METHODS"):
             positive_policy = (
@@ -4219,12 +4271,19 @@ def list_allowed_methods(
                 "write_equivalent_aliases": sorted(WRITE_EQUIVALENT_METHODS),
                 "hard_deny_prefixes": model_deny,
                 "note": (
-                    "create/write are allowed directly on transient (wizard) "
-                    "models; unlink and the aliases never are."
+                    "create/write run directly only on a transient model that "
+                    "is BOTH named on the reviewed exemption list AND reported "
+                    "inert by Odoo (no create/write override, no inverse "
+                    "fields); x2many commands 0/1/2/3 are refused even then. "
+                    "unlink and the aliases never run directly."
                 ),
             },
             "db_allowlist_entries": db_entries,
             "env_allowlist_entries": env_entries,
+            "transient_exempt_models": sorted(
+                entry for entry in TRANSIENT_EXEMPT_MODELS
+                if not model or entry == model
+            ),
             "write_path": (
                 "validate_write -> execute_approved_write(confirm=true); the "
                 f"approval token lives {WRITE_APPROVAL_TTL_SECONDS} seconds."

@@ -899,3 +899,73 @@ def test_a1_linking_commands_stay_allowed(server):
         args=[[1], {"lang_ids": [[6, 0, [1, 2]]]}],
     )
     assert allowed["success"] is True
+
+
+def test_a1_keyword_vals_are_checked_too(server):
+    """RPC allows write(vals=...) as a keyword — the guard must see it."""
+
+    class _RelationClient(_WizardClient):
+        def get_model_fields(self, model):
+            return {
+                "id": {"type": "integer"},
+                "lang_ids": {"type": "many2many", "relation": "res.lang"},
+            }
+
+    client = _RelationClient()
+    blocked = server.execute_method(
+        _Ctx(client),
+        "nesa.shk.product.match.wizard",
+        "write",
+        args=[[1]],
+        kwargs={"vals": {"lang_ids": [[2, 7, 0]]}},
+    )
+    assert blocked["success"] is False
+    assert "x2many command" in blocked["error"]
+    assert "write" not in {call[1] for call in client.calls}
+
+
+def test_a1_batch_create_is_checked_per_dict(server):
+    """create() also takes a list of dicts."""
+
+    class _RelationClient(_WizardClient):
+        def get_model_fields(self, model):
+            return {
+                "id": {"type": "integer"},
+                "lang_ids": {"type": "many2many", "relation": "res.lang"},
+            }
+
+    client = _RelationClient()
+    blocked = server.execute_method(
+        _Ctx(client),
+        "nesa.shk.product.match.wizard",
+        "create",
+        args=[[{"search_term": "a"}, {"lang_ids": [[0, 0, {"name": "x"}]]}]],
+    )
+    assert blocked["success"] is False
+    assert "x2many command" in blocked["error"]
+    assert "create" not in {call[1] for call in client.calls}
+
+
+def test_a1_missing_field_metadata_refuses_the_fast_path(server):
+    """Without field types the guard cannot tell Char from Many2many."""
+
+    class _NoMeta(_WizardClient):
+        def get_model_fields(self, model):
+            return {}
+
+    client = _NoMeta()
+    blocked = server.execute_method(
+        _Ctx(client), "nesa.shk.product.match.wizard", "write",
+        args=[[1], {"search_term": "Grohe"}],
+    )
+    assert blocked["success"] is False
+    assert "metadata" in blocked["error"]
+
+
+def test_b5_policy_report_matches_the_narrowed_exemption(server):
+    """The published policy must describe the guard that actually runs."""
+    report = server.list_allowed_methods(_Ctx(_DocClient()))
+    note = report["always_blocked"]["note"]
+    assert "reviewed exemption list" in note
+    assert "inert" in note
+    assert "nesa.shk.product.match.wizard" in report["transient_exempt_models"]

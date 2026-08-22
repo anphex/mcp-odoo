@@ -187,7 +187,31 @@ Der Review fand am ersten Stand 3 BLOCKER und 4 MAJOR. Alle sind geschlossen:
 | MINOR: Token wurde vor den Gates `confirm`/`ODOO_MCP_ENABLE_WRITES` verbraucht. | Beide Gates laufen jetzt davor. |
 | MINOR: `id desc` ist deterministisch, aber nicht snapshot-sicher. | In Tool-Beschreibung und Code benannt, mit Keyset-Hinweis. |
 
+Runde 2 und 3 desselben Reviews fanden weitere Befunde — die meisten davon in
+den Fixes aus Runde 1:
+
+| Befund | Fix |
+| ------ | --- |
+| BLOCKER: Das Transient-Profil war der positive Autorisierer. Eine Heuristik kann „folgenlos“ nicht beweisen — `base.language.install` überschreibt nichts und hat keine Inverse, trägt aber ein `Many2many('res.lang')`, auf dem ein `(2, id)`-Command eine Sprache löscht. | Positiver Autorisierer ist jetzt die geprüfte Allowlist (`TRANSIENT_EXEMPT_MODELS` bzw. exakter Side-Effect-Eintrag); das Profil kann die Freistellung nur noch entziehen. Zusätzlich lehnt der freigestellte Pfad x2many-Commands 0/1/2/3 ab. |
+| BLOCKER: `mcp_price_preview` führte nach dem Runde-1-Fix die Inverse **jedes** übergebenen Feldes aus — `account.move.line.no_followup` schreibt darin den persistenten `account.move`. | Nur noch `_inverse_nesa_multi_material` und `_inverse_nesa_multi_labor`; alles andere landet in `inverses_skipped`. |
+| MAJOR: Die x2many-Sperre las nur `args[0]`/`args[1]`. `write(vals=…)` als Keyword und Batch-`create([{…}, {…}])` liefen daran vorbei; fehlende Feld-Metadaten galten als „nichts gefunden“. | `collect_write_values()` normalisiert Positions- und Keyword-Argumente sowie Batch-Listen; fehlende Metadaten verweigern den Fast-Path. |
+| MAJOR: „Einmal abrufbar“ war ein Read-Modify-Write ohne Lock. | Ein `UPDATE … WHERE download_count < max_downloads RETURNING`, mit vorherigem `flush_all()`. |
+| MAJOR: Werkzeug protokollierte jeden Token im Klartext. | Logging-Filter, der genau diese Route redigiert — statt das Access-Log global hochzusetzen und jede HTTP-Zeile zu verlieren. |
+| MAJOR: Werkzeug leitet `HEAD` auf die `GET`-Route; der Einmal-Token wurde dabei verbraucht. | `HEAD` bekommt 405, ohne den Token anzufassen. |
+| MAJOR: `image_process()` lief ohne `verify_resolution=True`, das 50-Megapixel-Limit griff also nie. | Aktiviert. |
+| MAJOR: Das nginx-Snippet referenzierte einen Upstream und eine Zone, die es auf diesem Host nicht gibt. | Echte Zone-Datei plus je ein Snippet für Staging (3014) und Production (3012). |
+
 ### Review-Backlog (Zukunft)
+
+* Der Atomaritaets-Test des Download-Tokens ruft `_consume()` zweimal
+  nacheinander im selben Cursor auf. Er belegt die Semantik, aber keine echte
+  Konkurrenz — dafuer braeuchte es zwei unabhaengige Transaktionen. Die
+  Implementierung selbst ist ein einzelnes `UPDATE ... RETURNING` und damit
+  atomar; der Test bleibt der schwaechere Teil.
+* Statt einer Sperrliste von Mutator-Methoden waere langfristig eine
+  Positivliste generischer Lesemethoden robuster: eine Deny-Liste ist per
+  Konstruktion immer unvollstaendig, sobald Odoo eine neue oeffentliche
+  Methode bekommt.
 
 * MINOR aus demselben Review: `server.py` ist auf ~4.300 Zeilen gewachsen.
   Fehlerpolicy, Approval-Kette, Dokument-Tools und Diagnostik gehören ohne
