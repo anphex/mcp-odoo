@@ -535,8 +535,12 @@ class OdooClient:
             result = self._execute(model_name, "search_read", domain, **kwargs)
             return cast(list[dict[str, Any]], result)
         except Exception as e:
+            # NESA A6: this used to swallow the failure and return [], which an
+            # agent cannot tell apart from "no records match". A transport
+            # error or an AccessError must never be reported as an empty
+            # result set — re-raise so the caller can classify it.
             print(f"Error in search_read: {str(e)}", file=sys.stderr)
-            return []
+            raise
 
     def read_records(
         self, model_name: str, ids: list[int], fields: list[str] | None = None
@@ -566,8 +570,10 @@ class OdooClient:
             result = self._execute(model_name, "read", ids, **kwargs)
             return cast(list[dict[str, Any]], result)
         except Exception as e:
+            # NESA A6: see search_read — a failed read must not masquerade as
+            # "record does not exist".
             print(f"Error reading records: {str(e)}", file=sys.stderr)
-            return []
+            raise
 
 
 class RedirectTransport(xmlrpc.client.Transport):

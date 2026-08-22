@@ -994,28 +994,32 @@ def test_get_model_fields_handles_execute_failure(monkeypatch, odoo_client_modul
     assert "rpc" in result["error"]
 
 
-def test_search_read_handles_execute_failure_returns_empty_list(
+def test_search_read_reraises_execute_failure_instead_of_empty_list(
     monkeypatch, odoo_client_module
 ):
+    """NESA A6: a failed search must never look like "no records match"."""
     client, _ = build_client(monkeypatch, odoo_client_module)
 
     def boom(*args):
         raise RuntimeError("rpc")
 
     client._models.execute_kw = boom  # type: ignore[attr-defined]
-    assert client.search_read("res.partner", [], offset=1) == []
+    with pytest.raises(RuntimeError, match="rpc"):
+        client.search_read("res.partner", [], offset=1)
 
 
-def test_read_records_handles_execute_failure_returns_empty_list(
+def test_read_records_reraises_execute_failure_instead_of_empty_list(
     monkeypatch, odoo_client_module
 ):
+    """NESA A6: a failed read must never look like "record does not exist"."""
     client, _ = build_client(monkeypatch, odoo_client_module)
 
     def boom(*args):
         raise RuntimeError("rpc")
 
     client._models.execute_kw = boom  # type: ignore[attr-defined]
-    assert client.read_records("res.partner", [1]) == []
+    with pytest.raises(RuntimeError, match="rpc"):
+        client.read_records("res.partner", [1])
 
 
 def test_json2_get_server_version_falls_back_to_web_version_on_error(

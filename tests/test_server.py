@@ -34,6 +34,9 @@ class FakeLife:
     def __init__(self, odoo):
         self.odoo = odoo
         self.schema_cache = {}
+        # NESA A1: mirrors AppContext.transient_cache used by the wizard
+        # exemption in execute_method.
+        self.transient_cache = {}
 
 
 # ---------------------------------------------------------------------------
@@ -173,9 +176,19 @@ def test_server_registers_expected_tools_and_resources_without_lifespan():
         "health_check",
         "aggregate_records",
         "chatter_post",
+        # NESA backlog part B — document, report and pricing surface.
+        "read_records",
+        "get_document_text",
+        "read_attachment",
+        "create_attachment_download",
+        "render_report",
+        "list_allowed_methods",
+        "chatter_read",
+        "get_record_url",
+        "price_preview",
     }
     assert expected_tools <= tools
-    assert len(tools) == 24
+    assert len(tools) == 33
     assert "odoo://models" in resources
     assert {
         "odoo://model/{model_name}",
@@ -444,8 +457,13 @@ def test_safe_write_preview_validate_and_execute_gates(monkeypatch):
         },
     )
 
+    # NESA A2: preview_write is a dry run and must not hand out a token that
+    # execute_approved_write would then reject.
     assert preview["success"] is True
-    assert preview["approval"]["token"].startswith("odoo-write:")
+    assert "approval" not in preview
+    assert preview["approval_token_issued"] is False
+    assert "validate_write" in preview["next_step"]
+    assert preview["payload"]["record_ids"] == [7]
 
     class FakeClient:
         def get_model_fields(self, model):
@@ -462,14 +480,15 @@ def test_safe_write_preview_validate_and_execute_gates(monkeypatch):
         record_ids=[7],
     )
     assert validation["success"] is True
-    assert validation["approval"]["token"] == preview["approval"]["token"]
+    assert validation["approval"]["token"].startswith("odoo-write:")
 
     monkeypatch.delenv("ODOO_MCP_ENABLE_WRITES", raising=False)
+    untokenized = dict(preview["payload"])
     preview_only_blocked = server.execute_approved_write(
-        FakeCtx(FakeClient()), preview["approval"], confirm=True
+        FakeCtx(FakeClient()), untokenized, confirm=True
     )
     assert preview_only_blocked["success"] is False
-    assert "validated" in preview_only_blocked["error"]
+    assert "token" in preview_only_blocked["error"]
 
     ctx = FakeCtx(FakeClient())
     validation = server.validate_write(
@@ -480,13 +499,13 @@ def test_safe_write_preview_validate_and_execute_gates(monkeypatch):
         record_ids=[7],
     )
     assert validation["success"] is True
-    assert validation["approval"]["token"] == preview["approval"]["token"]
+    assert validation["approval"]["token"].startswith("odoo-write:")
 
     blocked = server.execute_approved_write(ctx, validation["approval"], confirm=True)
     assert blocked["success"] is False
     assert "disabled" in blocked["error"]
 
-    bad = dict(preview["approval"])
+    bad = dict(validation["approval"])
     bad["values"] = {"name": "Grace"}
     rejected = server.execute_approved_write(ctx, bad, confirm=True)
     assert rejected["success"] is False
@@ -523,7 +542,8 @@ def test_execute_method_blocks_direct_writes_and_unknown_methods(monkeypatch):
         args=[[7], {"name": "Ada"}],
     )
     assert blocked_write["success"] is False
-    assert "preview_write" in blocked_write["error"]
+    assert "validate_write" in blocked_write["error"]
+    assert blocked_write["transient_model"] is False
 
     blocked_unknown = server.execute_method(
         FakeCtx(FakeClient()),
@@ -899,9 +919,9 @@ def test_validate_write_rejects_empty_live_metadata_for_unlink(monkeypatch):
 
     monkeypatch.setenv("ODOO_MCP_ENABLE_WRITES", "1")
     preview = server.preview_write("res.partner", "unlink", record_ids=[7])
-    blocked = server.execute_approved_write(ctx, preview["approval"], confirm=True)
+    blocked = server.execute_approved_write(ctx, preview["payload"], confirm=True)
     assert blocked["success"] is False
-    assert "validated" in blocked["error"]
+    assert "token" in blocked["error"]
 
 
 def test_execute_approved_write_runs_only_after_all_gates(monkeypatch):
@@ -1189,7 +1209,7 @@ def test_profile_health_and_prompts_are_available():
 
     health = call_tool_json(server, "health_check", {})
     assert health["success"] is True
-    assert health["server"]["tool_count"] == 24
+    assert health["server"]["tool_count"] == 33
     assert health["runtime"]["chatter_direct_enabled"] is False
     assert health["runtime"]["broad_unknown_method_mode"]["enabled"] is False
 
@@ -1271,6 +1291,7 @@ def test_diagnose_access_reports_acl_rules_and_count_mismatch():
         "res.partner",
         "read",
         expected_count=2,
+        verbose=True,
     )
 
     codes = {item["code"] for item in report["diagnosis"]["codes"]}
@@ -1280,6 +1301,24 @@ def test_diagnose_access_reports_acl_rules_and_count_mismatch():
     assert report["access"]["granting_count"] == 1
     assert report["rules"]["group_bound"][0]["name"] == "own contacts"
     assert "record_rule_filter_likely" in codes
+
+
+def test_diagnose_access_default_omits_full_acl_and_rule_dumps():
+    """NESA A9: the compact answer keeps counts, not every row."""
+    server = importlib.import_module("odoo_mcp.server")
+
+    report = server.diagnose_access(
+        FakeCtx(AccessDiagnosticClient(count=1)),
+        "res.partner",
+        "read",
+        expected_count=2,
+    )
+
+    assert report["access"]["rows"] is None
+    assert report["access"]["row_count"] >= 1
+    assert report["rules"]["group_bound"] is None
+    assert report["rules"]["group_bound_count"] == 1
+    assert report["rules"]["applicable_count"] >= 0
 
 
 def test_diagnose_access_uses_odoo19_group_ids_field():
@@ -1301,10 +1340,14 @@ def test_diagnose_access_uses_odoo19_group_ids_field():
                     {
                         "id": 7,
                         "name": "Demo",
+                        "login": "demo",
                         "group_ids": [3],
                         "all_group_ids": [3, 9],
                     }
                 ]
+            if model == "res.groups" and method == "read":
+                # NESA A9: decisive groups are resolved to readable names.
+                return [{"id": 3, "display_name": "Sales / User"}]
             return super().execute_method(model, method, *args, **kwargs)
 
     report = server.diagnose_access(
@@ -1316,11 +1359,23 @@ def test_diagnose_access_uses_odoo19_group_ids_field():
 
     assert report["success"] is True
     assert report["metadata_errors"] == []
-    assert report["current_user"]["group_field"] == "group_ids"
-    assert report["current_user"]["all_group_field"] == "all_group_ids"
-    assert report["current_user"]["direct_group_ids"] == [3]
-    assert report["current_user"]["group_ids"] == [3, 9]
+    # NESA A9: the compact default no longer dumps raw membership lists.
+    assert report["verbose"] is False
+    assert "direct_group_ids" not in report["current_user"]
+    assert report["current_user"]["group_count"] == 2
     assert report["access"]["granting_count"] == 1
+
+    verbose_report = server.diagnose_access(
+        FakeCtx(Odoo19AccessDiagnosticClient(count=1)),
+        "res.partner",
+        "read",
+        expected_count=1,
+        verbose=True,
+    )
+    assert verbose_report["current_user"]["group_field"] == "group_ids"
+    assert verbose_report["current_user"]["all_group_field"] == "all_group_ids"
+    assert verbose_report["current_user"]["direct_group_ids"] == [3]
+    assert verbose_report["current_user"]["all_group_ids"] == [3, 9]
 
 
 def test_diagnose_access_reports_missing_permission_metadata():
@@ -1392,6 +1447,15 @@ class _SmartFieldsClient:
         self.read_calls.append({"model": model_name, "ids": ids, "fields": fields})
         return list(self.records)
 
+    def execute_method(self, model, method, *args, **kwargs):
+        # search_records asks for the real total (NESA A3); ir.model lookups
+        # come from the transient check (NESA A1).
+        if method == "search_count":
+            return len(self.records)
+        if model == "ir.model" and method == "search_read":
+            return [{"id": 1, "transient": False}]
+        raise AssertionError(f"unexpected call {model}.{method}")
+
 
 def test_search_records_applies_smart_fields_when_caller_omits_fields():
     server = importlib.import_module("odoo_mcp.server")
@@ -1409,7 +1473,8 @@ def test_search_records_applies_smart_fields_when_caller_omits_fields():
     assert client.search_read_calls[0]["fields"] == used
 
 
-def test_search_records_star_fields_disables_filtering():
+def test_search_records_star_fields_expand_without_binary_payloads():
+    """NESA A10: fields=['*'] must not drag base64 blobs into the answer."""
     server = importlib.import_module("odoo_mcp.server")
     client = _SmartFieldsClient()
 
@@ -1417,8 +1482,29 @@ def test_search_records_star_fields_disables_filtering():
 
     assert result["success"] is True
     assert result["smart_fields_applied"] is False
-    assert result["fields_used"] is None
-    assert client.search_read_calls[0]["fields"] is None
+    assert result["expanded_wildcard"] is True
+    assert result["excluded_binary_fields"] == ["avatar_128"]
+    assert "avatar_128" not in result["fields_used"]
+    assert "name" in result["fields_used"]
+    assert "avatar_128" not in client.search_read_calls[0]["fields"]
+
+
+def test_search_records_reports_total_count_and_paging_hints():
+    """NESA A3/A4: count is the page size, total_count is the truth."""
+    server = importlib.import_module("odoo_mcp.server")
+    client = _SmartFieldsClient(
+        records=[{"id": index, "name": f"P{index}"} for index in range(1, 6)]
+    )
+
+    result = server.search_records(FakeCtx(client), "res.partner", limit=5)
+
+    assert result["count"] == 5
+    assert result["total_count"] == 5
+    assert result["has_more"] is False
+    assert result["next_offset"] is None
+    assert result["order_used"] == "id desc"
+    assert result["order_defaulted"] is True
+    assert client.search_read_calls[0]["order"] == "id desc"
 
 
 def test_search_records_explicit_fields_pass_through():
@@ -1855,11 +1941,12 @@ def test_resolve_read_fields_returns_none_when_metadata_unavailable():
             return {"error": "Access denied"}
 
     app_context = FakeLife(FailingClient())
-    resolved = server.resolve_read_fields(
+    resolved, notes = server.resolve_read_fields(
         app_context, app_context.odoo, "res.partner", None
     )
     # No metadata → fall back to "all fields" (None) so the search still works
     assert resolved is None
+    assert notes["fields_metadata_available"] is False
 
 
 def test_resolve_read_fields_treats_empty_metadata_as_no_smart():
@@ -1870,7 +1957,7 @@ def test_resolve_read_fields_treats_empty_metadata_as_no_smart():
             return {}
 
     app_context = FakeLife(EmptyClient())
-    resolved = server.resolve_read_fields(
+    resolved, _notes = server.resolve_read_fields(
         app_context, app_context.odoo, "res.partner", None
     )
     assert resolved is None
@@ -1884,7 +1971,7 @@ def test_resolve_read_fields_passes_explicit_fields_through():
             raise AssertionError("should not call fields_get when caller specifies fields")
 
     app_context = FakeLife(ExplodingClient())
-    resolved = server.resolve_read_fields(
+    resolved, _notes = server.resolve_read_fields(
         app_context, app_context.odoo, "res.partner", ["name", "email"]
     )
     assert resolved == ["name", "email"]
@@ -2082,7 +2169,7 @@ def test_max_smart_fields_invalid_env_falls_back_to_default(monkeypatch):
 def test_mcp_surface_counts_reports_v030_totals():
     server = importlib.import_module("odoo_mcp.server")
     counts = server.mcp_surface_counts()
-    assert counts["tool_count"] == 24
+    assert counts["tool_count"] == 33
     assert counts["prompt_count"] == 5
     # 1 fixed resource + 3 templates = 4
     assert counts["resource_count"] == 4
@@ -2550,9 +2637,31 @@ def test_require_validated_write_approval_returns_none_when_token_missing():
             raise AssertionError("non-token methods should not be called")
 
     ctx = FakeCtx(_DummyClient())
-    assert server.require_validated_write_approval(
+    rejection = server.require_validated_write_approval(
         ctx.request_context.lifespan_context, {"token": "ghost"}
-    ) is None
+    )
+    assert rejection["ok"] is False
+    # NESA A2: the reason is now explicit instead of one catch-all sentence.
+    assert rejection["reason_code"] in {"token_unknown", "token_rejected"}
+
+
+def test_require_validated_write_approval_reports_missing_token():
+    """NESA A2: no token at all is its own, distinguishable reason."""
+    server = importlib.import_module("odoo_mcp.server")
+
+    class _DummyClient:
+        def get_model_fields(self, model):
+            return {}
+
+        def execute_method(self, *args, **kwargs):
+            raise AssertionError("token store must not be called without a token")
+
+    ctx = FakeCtx(_DummyClient())
+    rejection = server.require_validated_write_approval(
+        ctx.request_context.lifespan_context, {}
+    )
+    assert rejection["ok"] is False
+    assert rejection["reason_code"] == "token_missing"
 
 
 def test_require_validated_write_approval_clears_expired_records():
@@ -2580,9 +2689,11 @@ def test_require_validated_write_approval_clears_expired_records():
         "validated_at": 0,
         "expires_at": 0,  # already expired
     }
-    assert server.require_validated_write_approval(
+    rejection = server.require_validated_write_approval(
         life, {"token": "odoo-write:expired"}
-    ) is None
+    )
+    assert rejection["ok"] is False
+    assert rejection["reason_code"] == "token_expired"
     # Bridge-side eviction: store should drop the expired record after consume.
     assert "odoo-write:expired" not in life.odoo.approval_store
 
@@ -2688,6 +2799,7 @@ def test_available_user_read_fields_returns_base_when_metadata_missing():
     assert server._available_user_read_fields(set()) == [
         "id",
         "name",
+        "login",
         "company_id",
         "company_ids",
     ]
@@ -2934,7 +3046,7 @@ def test_diagnose_access_skips_inactive_or_unrelated_permission_rules():
             raise AssertionError(f"unexpected: {model}.{method}")
 
     report = server.diagnose_access(
-        FakeCtx(_Client()), "res.partner", "read", expected_count=1
+        FakeCtx(_Client()), "res.partner", "read", expected_count=1, verbose=True
     )
     assert report["success"] is True
     assert report["rules"]["active"] == []
@@ -2973,7 +3085,7 @@ def test_diagnose_access_rules_branch_with_global_rule_no_groups():
             raise AssertionError(f"unexpected: {model}.{method}")
 
     report = server.diagnose_access(
-        FakeCtx(_Client()), "res.partner", "read", expected_count=5
+        FakeCtx(_Client()), "res.partner", "read", expected_count=5, verbose=True
     )
     assert report["success"] is True
     assert len(report["rules"]["global"]) == 1
@@ -3842,7 +3954,7 @@ def test_diagnose_access_skips_non_dict_rule_entries():
             raise AssertionError(f"unexpected: {model}.{method}")
 
     report = server.diagnose_access(
-        FakeCtx(_Client()), "res.partner", "read"
+        FakeCtx(_Client()), "res.partner", "read", verbose=True
     )
     assert len(report["rules"]["active"]) == 1
 

@@ -135,14 +135,27 @@ def build_write_preview_report(
         "values": normalized_values,
         "context": dict(context or {}),
     }
-    approval_token = build_approval_token(canonical_payload)
 
+    # NESA A2: this report deliberately carries NO approval token.  It used to
+    # emit one that looked complete but was never registered server-side, so
+    # execute_approved_write rejected it and every first-time caller burned a
+    # failed attempt.  Only validate_write mints a usable token, because only
+    # validate_write checks the payload against live fields_get metadata —
+    # that check is the substance of the approval chain and must not be
+    # skippable.  preview_write stays a pure read-only dry run.
     return {
         "success": not any(issue["severity"] == "error" for issue in issues),
         "tool": "preview_write",
         "model": model,
         "operation": normalized_operation,
-        "approval": {**canonical_payload, "token": approval_token},
+        "payload": canonical_payload,
+        "approval_token_issued": False,
+        "next_step": (
+            "preview_write is a read-only dry run and issues no approval token. "
+            "Call validate_write with the same arguments to obtain a token, then "
+            "execute_approved_write(approval=<validate_write result approval>, "
+            "confirm=true)."
+        ),
         "execute_method": _write_execute_method_args(canonical_payload),
         "issues": issues,
         "warnings": [
@@ -150,7 +163,8 @@ def build_write_preview_report(
                 "code": "destructive_operation",
                 "message": (
                     "This preview does not execute. execute_approved_write is "
-                    "destructive and requires the matching approval token plus confirm=true."
+                    "destructive and requires the approval token returned by "
+                    "validate_write plus confirm=true."
                 ),
             }
         ],
@@ -247,6 +261,16 @@ def validate_write_report(
                     )
 
     success = not any(issue["severity"] == "error" for issue in issues)
+    # NESA A2: validate_write is the only place that mints an approval token,
+    # because it is the only place that checked the payload against live
+    # fields_get metadata.  preview_write returns the same canonical payload
+    # without a token.
+    canonical_payload = preview["payload"]
+    approval = (
+        {**canonical_payload, "token": build_approval_token(canonical_payload)}
+        if success
+        else None
+    )
     return {
         "success": success,
         "tool": "validate_write",
@@ -254,7 +278,7 @@ def validate_write_report(
         "operation": operation,
         "issues": issues,
         "field_hints": field_hints,
-        "approval": preview["approval"] if success else None,
+        "approval": approval,
         "metadata_used": {
             "fields_get": fields_metadata is not None,
             "source": metadata_source,

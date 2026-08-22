@@ -13,6 +13,7 @@ Patches sind bereits gelandet.
 | 3 | DATEV/Payroll-Block (Constraint-Seite, Odoo) | applied in `nesa_mcp_bridge` (`nesa.mcp.allowed_method._check_datev_blocklist`) | — |
 | 4 | `doc/`-Endpoint via `nesa.mcp.doc.helper` | partial — Helper-Model existiert in `nesa_mcp_bridge`, Fork-Seite nicht verdrahtet | — |
 | 5 | Native Odoo-ACL-Parität für Per-User-Calls | **APPLIED** | Feature-Branch `feature/mcp-ui-parity` |
+| 6 | Agenten-Backlog 2026-08-22 (A1–A10, B1–B9) | **APPLIED** | siehe unten |
 
 ## Patch-Beschreibungen
 
@@ -134,6 +135,51 @@ systemctl start nesa-mcp.service
 #    Prüfe: runtime_security_report().nesa_per_user_auth.strict_mode=true
 #    Prüfe: runtime_security_report().nesa_db_allowlist.enabled=true
 ```
+
+## Patch 6 — Agenten-Backlog 2026-08-22 (APPLIED)
+
+Umsetzung des Befund-Backlogs aus der Agenten-Session vom 2026-08-21. Zwei
+Leitgedanken: (1) Der Server darf nie eine Aussage über die Bridge als Aussage
+über die Geschäftsdaten formulieren, (2) jede Antwort, die der Agent nicht
+interpretieren kann, ist Kontextverschwendung.
+
+### Reibungsabbau (Teil A)
+
+| # | Änderung | Ort |
+| - | -------- | --- |
+| A1 | `create`/`write` laufen auf **transienten** Modellen direkt durch `execute_method`; erkannt über `ir.model.transient` (nicht über Namensmuster), Ergebnis pro Lifespan gecacht. `unlink` und alle write-äquivalenten Aliase bleiben auf der Approval-Kette — auch auf transienten Modellen. Hard-Deny wird jetzt **vor** allen anderen Gates geprüft. | `server.py execute_method`, `model_is_transient` |
+| A2 | `preview_write` gibt **keinen** Token mehr aus (`approval` → `payload`, plus `next_step`). Nur `validate_write` prägt Tokens, weil nur dort gegen live `fields_get` validiert wird. Ablehnungen tragen `reason_code` + `remedy` (`token_missing`, `token_unknown`, `token_expired`, `token_already_consumed`, `token_foreign_user`, `payload_mismatch`, `token_store_unreachable`). | `agent_tools.build_write_preview_report`, `server.py execute_approved_write` |
+| A3 | `search_records` liefert zusätzlich `total_count` (echtes `search_count`), `has_more`, `next_offset`. `count` bleibt die Seitengröße. Schlägt der Zähl-Query fehl, ist `total_count=null` und `has_more` nie fälschlich `false`. | `server.py search_records` |
+| A4 | Ohne `order` wird `id desc` erzwungen und als `order_used`/`order_defaulted` zurückgemeldet. | `server.py search_records` |
+| A5 | `scan_addons_source` antwortet `success:false` mit `error_type=not_configured` bzw. `not_readable` statt eines leeren Erfolgs. Setzt `ODOO_ADDONS_PATHS` in den Units voraus. | `server.py scan_addons_source` |
+| A6 | `OdooClient.search_read`/`read_records` verschlucken Fehler nicht mehr (vorher: leere Liste = „keine Treffer“). Fehlerantworten tragen `error_type` (`transport`/`odoo_error`/`request`) und `retryable`; Transportfehler werden genau einmal wiederholt, fachliche nie. Odoo-Tracebacks werden auf ihre Ursachenzeile eingedampft. | `odoo_client.py`, `server.py classify_call_error`/`call_with_transport_retry`/`compact_error_message` |
+| A8 | Gibt eine Methode ein `act_window` auf **denselben** Datensatz zurück, werden dessen x2many-Felder gezählt und als `result_counts` angehängt. | `server.py _act_window_result_counts` |
+| A9 | `diagnose_access` liefert standardmäßig nur die entscheidungsrelevanten Gruppen mit Klarnamen (`decisive_groups`) plus Zähler; die vollen ACL-/Rule-/Gruppen-Dumps stehen hinter `verbose=true`. Messung Staging: 9676 → 2813 Zeichen. | `server.py diagnose_access` |
+| A10 | `fields=["*"]` liefert alle Felder **außer** Binärfeldern und meldet die Ausnahme in `excluded_binary_fields`. Explizit benannte Binärfelder funktionieren weiter. Die Smart-Auswahl schloss Binärfelder schon vorher aus. | `server.py resolve_read_fields` |
+
+### Neue Fähigkeiten (Teil B)
+
+`get_document_text`, `read_attachment`, `create_attachment_download`,
+`render_report`, `list_allowed_methods`, `chatter_read`, `get_record_url`,
+`read_records`, `price_preview`.
+
+Vier davon brauchen eine Odoo-Gegenseite, weil sie Pillow/wkhtmltopdf oder
+private ORM-Einstiegspunkte benötigen, die RPC nicht ausliefert:
+`nesa.mcp.doc.helper` und `nesa.mcp.download.token` im Modul
+`nesa_mcp_bridge` (ab 18.0.1.5.0), inklusive Controller
+`/nesa/mcp/download/<token>` und GC-Cron. Beide Modelle stehen in
+`NON_DELEGABLE_METHOD_PREFIXES`, damit ein Agent die Obergrenzen der Tools
+(TTL, Kantenlänge, Textfenster) nicht per `execute_method` umgehen kann.
+
+### Zusätzlich benötigte Unit-Umgebung
+
+```
+Environment=ODOO_ADDONS_PATHS=/var/odoo/<instanz>/extra-addons/<repo>/Nesa
+```
+
+Der Service-User `mcp` braucht dafür Lesezugriff auf dieses Verzeichnis
+(POSIX-ACL, nur `r-x`). Ohne die Variable bleibt `scan_addons_source`
+abgeschaltet und sagt das auch.
 
 ## Sync mit Upstream
 

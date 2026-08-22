@@ -4,6 +4,7 @@ MCP server for Odoo integration
 Provides MCP tools and resources for interacting with Odoo ERP systems
 """
 
+import base64
 import hashlib
 import json
 import logging
@@ -16,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
 
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp import Context, FastMCP, Image
 from mcp.types import Annotations, ToolAnnotations
 from pydantic import BaseModel, Field
 
@@ -50,6 +51,25 @@ METHOD_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 MAX_SEARCH_LIMIT = 100
 WRITE_APPROVAL_TTL_SECONDS = 10 * 60
 
+# NESA A4: search_records without an explicit order used to inherit whatever
+# order Postgres happened to return, which makes offset paging silently lossy
+# (rows can repeat or disappear between pages).  Fall back to a total order.
+DEFAULT_SEARCH_ORDER = "id desc"
+
+# NESA A1: transient (wizard) records are scratch space that ir.autovacuum
+# deletes; setting a search term on a wizard is not a business write.  Only
+# these two ORM entry points are exempted — unlink and every write-equivalent
+# alias stay on the approval chain even for transient models.
+TRANSIENT_EXEMPT_METHODS = frozenset({"create", "write"})
+
+# NESA B1/B2: bounded text windows so a single OCR read cannot flood context.
+DOC_TEXT_WINDOW_DEFAULT = 8000
+DOC_TEXT_WINDOW_MAX = 40_000
+
+# NESA B2/B3/B4: Odoo-side helper model (nesa_mcp_bridge).  Kept in one
+# constant so a rename only has to happen here.
+NESA_DOC_HELPER_MODEL = "nesa.mcp.doc.helper"
+
 # Public ORM aliases that create or update records without spelling the
 # operation as create/write.  They must use the same preview/validation path
 # as direct CRUD instead of slipping through execute_method in parity mode.
@@ -80,6 +100,8 @@ NON_DELEGABLE_METHOD_PREFIXES = frozenset({
     "nesa.mcp.allowed_method.",
     "nesa.mcp.approval.token.",
     "nesa.mcp.audit_log.",
+    "nesa.mcp.doc.helper.",
+    "nesa.mcp.download.token.",
     "nesa.mcp.shadow.",
 })
 
@@ -113,6 +135,10 @@ class AppContext:
     )
     _odoo: OdooClient | None = None
     schema_cache: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # NESA A1: ir.model.transient lookups per model name.  Cheap, but one
+    # XML-RPC roundtrip per wizard call would defeat the point of the
+    # exemption, so the answer is memoized for the lifespan.
+    transient_cache: Dict[str, bool] = field(default_factory=dict)
 
     @property
     def odoo(self) -> OdooClient:
@@ -376,6 +402,270 @@ def _cached_fields_metadata(
     return {}
 
 
+def model_is_transient(
+    app_context: AppContext, odoo: OdooClient, model: str
+) -> Optional[bool]:
+    """Return True when ``model`` is an Odoo TransientModel.
+
+    Resolved through ``ir.model.transient`` because the MCP process only ever
+    talks RPC and cannot inspect ``env[model]._transient`` directly.  A name
+    pattern such as ``*.wizard`` is deliberately not used: persistent models
+    are free to carry that suffix.
+
+    Returns ``None`` when the metadata could not be read — callers must treat
+    "unknown" like "not transient" so an unreadable lookup can never widen the
+    write guard.
+    """
+    cached = app_context.transient_cache.get(model)
+    if cached is not None:
+        return cached
+    try:
+        rows = odoo.execute_method(
+            "ir.model",
+            "search_read",
+            [["model", "=", model]],
+            fields=["transient"],
+            limit=1,
+        )
+    except Exception:  # noqa: BLE001 — metadata lookup must never mask the call
+        logger.warning("[transient] ir.model lookup failed for model=%s", model)
+        return None
+    if not isinstance(rows, list) or not rows:
+        return None
+    is_transient = bool(rows[0].get("transient"))
+    app_context.transient_cache[model] = is_transient
+    return is_transient
+
+
+def _binary_field_names(metadata: Dict[str, Any]) -> List[str]:
+    """Return the binary-typed fields of a model.
+
+    NESA A10: ``fields=["*"]`` used to mean "read literally everything",
+    which pulls ``datas``/``raw``/``image_1920`` into the answer as base64 and
+    can blow a whole session's context on a single call.  Binary payloads are
+    therefore only returned when the caller names the field explicitly.
+    """
+    if not isinstance(metadata, dict):
+        return []
+    return sorted(
+        name
+        for name, meta in metadata.items()
+        if isinstance(meta, dict) and str(meta.get("type", "")) == "binary"
+    )
+
+
+# Exception types that indicate the call never reached Odoo's business logic
+# (socket/HTTP/protocol level).  Only these are retried — a wrong domain or an
+# AccessError must fail immediately and visibly.
+_TRANSPORT_ERROR_MARKERS = (
+    "connection reset",
+    "connection refused",
+    "connection aborted",
+    "broken pipe",
+    "timed out",
+    "timeout",
+    "temporary failure in name resolution",
+    "bad gateway",
+    "service unavailable",
+    "gateway timeout",
+    "remote end closed connection",
+    "eof occurred",
+)
+
+
+def classify_call_error(exc: BaseException) -> Dict[str, Any]:
+    """Classify why an Odoo call failed, and whether a retry can help.
+
+    NESA A6: the bridge used to surface transport hiccups as an anonymous
+    "Error occurred during tool execution", which an agent cannot tell apart
+    from "there is no such data".  The distinction is now explicit.
+    """
+    import socket
+    import xmlrpc.client
+
+    text = str(exc)
+    lowered = text.casefold()
+    if isinstance(exc, xmlrpc.client.Fault):
+        return {
+            "error_type": "odoo_error",
+            "retryable": False,
+            "detail": sanitize_odoo_error(text),
+        }
+    transport_types = (
+        socket.timeout,
+        socket.gaierror,
+        ConnectionError,
+        TimeoutError,
+        OSError,
+        xmlrpc.client.ProtocolError,
+    )
+    if isinstance(exc, transport_types) or any(
+        marker in lowered for marker in _TRANSPORT_ERROR_MARKERS
+    ):
+        return {"error_type": "transport", "retryable": True, "detail": {"message": text}}
+    if isinstance(exc, (ValueError, TypeError, KeyError)):
+        return {"error_type": "request", "retryable": False, "detail": {"message": text}}
+    return {
+        "error_type": "odoo_error",
+        "retryable": False,
+        "detail": sanitize_odoo_error(text),
+    }
+
+
+def call_with_transport_retry(callback: Callable[[], Any], *, label: str) -> Any:
+    """Run an Odoo call and retry it exactly once on a transport failure.
+
+    Business failures (invalid domain, AccessError, ValidationError) are never
+    retried — repeating them only doubles the cost of a deterministic error.
+    """
+    try:
+        return callback()
+    except Exception as exc:  # noqa: BLE001 — classified immediately below
+        classification = classify_call_error(exc)
+        if not classification["retryable"]:
+            raise
+        logger.warning(
+            "[retry] %s failed with a transport error, retrying once: %s", label, exc,
+        )
+        time.sleep(0.5)
+        return callback()
+
+
+_ERROR_TRACEBACK_TAIL_CHARS = 600
+# "ValueError: ...", "odoo.exceptions.AccessError: ...", "UserError: ..."
+_EXCEPTION_LINE_RE = re.compile(r"^[A-Za-z_][\w.]*(Error|Exception|Warning):\s")
+
+
+def compact_error_message(exc: BaseException) -> tuple[str, Optional[str]]:
+    """Reduce an Odoo XML-RPC fault to its actual cause.
+
+    Odoo answers a bad domain with a full server traceback. Repeating all of
+    it makes the agent pay several thousand tokens to learn one sentence, so
+    the final exception line becomes the message and the rest is offered as a
+    bounded tail for debugging.
+    """
+    text = str(exc)
+    if "Traceback (most recent call last)" not in text:
+        return text, None
+    # xmlrpc.client.Fault stringifies to a single line with literal "\n"
+    # escapes, so the traceback has to be un-escaped before it can be split.
+    unescaped = text.replace("\\n", "\n").replace('\\"', '"').replace("\\'", "'")
+    lines = [line.rstrip() for line in unescaped.splitlines() if line.strip()]
+    cause = ""
+    for line in reversed(lines):
+        stripped = line.strip().rstrip(">").rstrip("'\"").strip()
+        if not stripped or stripped.startswith(("File \"", "^", "~")):
+            continue
+        if _EXCEPTION_LINE_RE.match(stripped):
+            cause = stripped
+            break
+    if not cause:
+        cause = lines[-1].strip() if lines else text
+    return cause, unescaped[-_ERROR_TRACEBACK_TAIL_CHARS:]
+
+
+def error_response(tool: str, exc: BaseException, **extra: Any) -> Dict[str, Any]:
+    """Build a uniform, non-anonymous error payload for a failed tool call."""
+    classification = classify_call_error(exc)
+    message, traceback_tail = compact_error_message(exc)
+    response: Dict[str, Any] = {
+        "success": False,
+        "tool": tool,
+        "error": message,
+        "error_type": classification["error_type"],
+        "retryable": classification["retryable"],
+    }
+    if traceback_tail:
+        response["error_traceback_tail"] = traceback_tail
+    response.update(extra)
+    return response
+
+
+def odoo_base_url(app_context: AppContext, odoo: OdooClient) -> str:
+    """Return the Odoo ``web.base.url`` for building user-facing links.
+
+    Never hard-coded: staging and production must produce their own host.
+    Falls back to the configured RPC URL when the parameter is unreadable.
+    """
+    cached = app_context.schema_cache.get("__web_base_url__")
+    if isinstance(cached, str) and cached:
+        return cached
+    base = ""
+    try:
+        value = odoo.execute_method(
+            "ir.config_parameter", "get_param", "web.base.url",
+        )
+        if isinstance(value, str):
+            base = value.strip().rstrip("/")
+    except Exception:  # noqa: BLE001 — link building must not break the tool
+        logger.warning("[base-url] web.base.url unreadable, falling back to RPC URL")
+    if not base:
+        base = str(getattr(odoo, "url", "")).rstrip("/")
+    app_context.schema_cache["__web_base_url__"] = base  # type: ignore[assignment]
+    return base
+
+
+def _act_window_result_counts(
+    app_context: AppContext, odoo: OdooClient, model: str, result: Any
+) -> Optional[Dict[str, int]]:
+    """Count the x2many rows a wizard action produced, if it returned itself.
+
+    NESA A8: methods such as ``action_search`` only return
+    ``{"type": "ir.actions.act_window", "res_model": ..., "res_id": ...}``.
+    When that window points back at the very record the method was called on,
+    the interesting outcome sits in the record's x2many fields — count them so
+    the caller learns "13 matches" instead of having to guess and re-read.
+
+    Returns ``None`` whenever this is not that pattern, or when the follow-up
+    read fails; the primary result is never put at risk by this convenience.
+    """
+    if not isinstance(result, dict):
+        return None
+    if result.get("type") != "ir.actions.act_window":
+        return None
+    if result.get("res_model") != model:
+        return None
+    res_id = result.get("res_id")
+    if not isinstance(res_id, int) or res_id < 1:
+        return None
+    metadata = _cached_fields_metadata(app_context, odoo, model)
+    x2many_fields = sorted(
+        name
+        for name, meta in metadata.items()
+        if isinstance(meta, dict)
+        and str(meta.get("type", "")) in {"one2many", "many2many"}
+    )
+    if not x2many_fields:
+        return None
+    try:
+        rows = odoo.read_records(model, [res_id], fields=x2many_fields)
+    except Exception:  # noqa: BLE001 — best-effort enrichment only
+        logger.warning(
+            "[act-window-counts] follow-up read failed for %s#%s", model, res_id,
+        )
+        return None
+    if not rows:
+        return None
+    counts = {
+        name: len(value)
+        for name, value in rows[0].items()
+        if name != "id" and isinstance(value, list)
+    }
+    return counts or None
+
+
+def call_doc_helper(odoo: OdooClient, method: str, *args: Any, **kwargs: Any) -> Any:
+    """Call a ``nesa.mcp.doc.helper`` method under the acting user's rights.
+
+    The helper lives in ``nesa_mcp_bridge`` and exists because these operations
+    need Odoo-side libraries (Pillow, wkhtmltopdf) and private ORM entry points
+    that RPC refuses to dispatch.  It is code-owned: the model is on the
+    non-delegable deny list so an agent cannot reach it through execute_method
+    and bypass the caps enforced by the tools below.
+    """
+    return odoo.execute_method(NESA_DOC_HELPER_MODEL, method, *args, **kwargs)
+
+
 _AGGREGATION_FUNCTIONS = {
     "sum",
     "avg",
@@ -450,21 +740,48 @@ def resolve_read_fields(
     odoo: OdooClient,
     model: str,
     fields: Optional[List[str]],
-) -> Optional[List[str]]:
+) -> tuple[Optional[List[str]], Dict[str, Any]]:
     """Pick the field list for read-only tools.
 
     - ``fields=None`` → smart selection (cap via ODOO_MCP_MAX_SMART_FIELDS).
-    - ``fields=["*"]`` → caller wants every field; return None to skip filtering.
+      Binary fields are already dropped by the smart selector.
+    - ``fields=["*"]`` → every field **except binary ones** (NESA A10).  A
+      single unqualified read of ``ir.attachment`` would otherwise return
+      ``datas``/``raw`` as base64 and can exhaust the agent's context in one
+      call.  Binary payloads stay reachable by naming the field explicitly, or
+      through ``read_attachment`` / ``create_attachment_download``.
     - Otherwise return the caller list unchanged.
+
+    Returns ``(fields, notes)``; ``notes`` is surfaced to the caller so the
+    filtering is visible rather than silent.
     """
+    notes: Dict[str, Any] = {"smart_fields_applied": fields is None}
     if fields is None:
         metadata = _cached_fields_metadata(app_context, odoo, model)
         if not metadata:
-            return None
-        return select_smart_fields(metadata, max_fields=max_smart_fields())
+            notes["fields_metadata_available"] = False
+            return None, notes
+        return select_smart_fields(metadata, max_fields=max_smart_fields()), notes
     if len(fields) == 1 and fields[0] == "*":
-        return None
-    return fields
+        metadata = _cached_fields_metadata(app_context, odoo, model)
+        if not metadata:
+            notes["fields_metadata_available"] = False
+            notes["warning"] = (
+                "fields=['*'] could not be expanded because fields_get metadata "
+                "was unavailable; binary fields may be included."
+            )
+            return None, notes
+        binary_fields = _binary_field_names(metadata)
+        expanded = [name for name in metadata if name not in set(binary_fields)]
+        notes["expanded_wildcard"] = True
+        if binary_fields:
+            notes["excluded_binary_fields"] = binary_fields
+            notes["warning"] = (
+                "Binary fields were excluded from fields=['*']. Request them by "
+                "name, or use read_attachment / create_attachment_download."
+            )
+        return expanded, notes
+    return fields, notes
 
 
 def normalize_domain_input(domain: Any) -> List[Any]:
@@ -804,16 +1121,28 @@ def register_write_approval(app_context: AppContext, report: Dict[str, Any]) -> 
 
 def require_validated_write_approval(
     app_context: AppContext, approval: Dict[str, Any]
-) -> Dict[str, Any] | None:
-    """Return server-side validation record or None when missing/expired/mismatched.
+) -> Dict[str, Any]:
+    """Consume the server-side validation record for an approval token.
 
     NESA Patch 3 (2026-05-20): liest aus DB-Tabelle nesa.mcp.approval.token
     statt aus In-Memory-Dict. Payload-Hash wird ge-pruef damit der Token
     nicht fuer einen abweichenden Payload missbraucht werden kann.
+
+    NESA A2/A7: returns ``{"ok": True, ...}`` on success and
+    ``{"ok": False, "reason_code": ..., "reason": ...}`` otherwise, so the
+    caller can tell "never validated" from "expired", "already consumed" and
+    "token store unreachable" instead of printing one catch-all sentence.
     """
     token = str(approval.get("token", ""))
     if not token:
-        return None
+        return {
+            "ok": False,
+            "reason_code": "token_missing",
+            "reason": (
+                "No approval token was supplied. validate_write returns one; "
+                "preview_write deliberately does not."
+            ),
+        }
     expected_hash = _canonical_payload_hash(write_approval_payload(approval))
 
     try:
@@ -823,27 +1152,61 @@ def require_validated_write_approval(
             token,
             expected_hash,
         )
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         logger.exception("[approval-token] DB consume failed for token=%s", token)
-        return None
+        return {
+            "ok": False,
+            "reason_code": "token_store_unreachable",
+            "reason": f"The approval-token store could not be reached: {exc}",
+        }
 
     if not isinstance(result, dict) or not result.get("success"):
-        # Caller (execute_approved_write) maps None to the public error
-        # string. Reason logged for forensics.
-        if isinstance(result, dict):
-            logger.info(
-                "[approval-token] consume rejected token=%s reason=%s",
-                token, result.get("error"),
-            )
-        return None
+        reason = (
+            str(result.get("error"))
+            if isinstance(result, dict) and result.get("error")
+            else "the approval-token store returned an unexpected reply"
+        )
+        logger.info(
+            "[approval-token] consume rejected token=%s reason=%s", token, reason,
+        )
+        return {
+            "ok": False,
+            "reason_code": _approval_reason_code(reason),
+            "reason": reason,
+        }
 
     payload = result.get("payload") or {}
     return {
+        "ok": True,
         "approval": dict(approval),
         "payload": payload,
         "validated_at_iso": result.get("validated_at_iso"),
         "expires_at_iso": result.get("expires_at_iso"),
     }
+
+
+def _approval_reason_code(reason: str) -> str:
+    """Map the token store's message onto a stable machine-readable code.
+
+    NESA A2/A7: "never validated", "expired" and "already consumed" used to
+    collapse into one sentence, so a caller could not tell whether re-running
+    validate_write would help or whether the write had already landed.
+    """
+    lowered = reason.casefold()
+    # Order matters: the legacy "has not been validated ... or has expired"
+    # wording contains both markers, and "unknown token" is the more useful
+    # answer of the two because it tells the caller to validate, not to hurry.
+    if "has not been validated" in lowered or "unknown" in lowered:
+        return "token_unknown"
+    if "already consumed" in lowered:
+        return "token_already_consumed"
+    if "does not belong to this user" in lowered:
+        return "token_foreign_user"
+    if "payload does not match" in lowered:
+        return "payload_mismatch"
+    if "expired" in lowered:
+        return "token_expired"
+    return "token_rejected"
 
 
 def revoke_write_approval(app_context: AppContext, token: str) -> None:
@@ -980,7 +1343,7 @@ def _field_names(metadata: Any) -> set[str]:
 
 
 def _available_user_read_fields(available_fields: set[str]) -> list[str]:
-    base_candidates = ["id", "name", "company_id", "company_ids"]
+    base_candidates = ["id", "name", "login", "company_id", "company_ids"]
     group_candidates = ["groups_id", "group_ids", "all_group_ids"]
     if not available_fields:
         return base_candidates
@@ -1018,6 +1381,37 @@ def _rule_applies(row: Dict[str, Any], user_group_ids: set[int] | None) -> bool:
 def _record_id_domain(record_ids: Optional[List[int]]) -> List[Any]:
     ids = [int(record_id) for record_id in record_ids or [] if int(record_id) > 0]
     return [["id", "in", ids]] if ids else []
+
+
+_RULE_DOMAIN_PREVIEW_CHARS = 300
+
+
+def _compact_acl_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep the fields that decide an ACL question, drop the rest (NESA A9)."""
+    return {
+        "id": row.get("id"),
+        "name": row.get("name"),
+        "group": row.get("group_id") or "global",
+        "perm_read": row.get("perm_read"),
+        "perm_write": row.get("perm_write"),
+        "perm_create": row.get("perm_create"),
+        "perm_unlink": row.get("perm_unlink"),
+    }
+
+
+def _compact_rule_row(rule: Dict[str, Any]) -> Dict[str, Any]:
+    """Same for record rules; long domain_force strings are previewed only."""
+    domain = str(rule.get("domain_force") or "")
+    return {
+        "id": rule.get("id"),
+        "name": rule.get("name"),
+        "global": not _m2m_ids(rule.get("groups")),
+        "domain_force": (
+            domain
+            if len(domain) <= _RULE_DOMAIN_PREVIEW_CHARS
+            else domain[:_RULE_DOMAIN_PREVIEW_CHARS] + " …[truncated, use verbose=true]"
+        ),
+    }
 
 
 def _access_diagnosis_codes(
@@ -1206,7 +1600,11 @@ def inspect_model_relationships(
 
 
 @mcp.tool(
-    description="Diagnose ACL and record-rule visibility for an Odoo model",
+    description=(
+        "Diagnose ACL and record-rule visibility for an Odoo model. Returns "
+        "only the groups that matter for the decision, with names; set "
+        "verbose=true for the full group-membership dumps."
+    ),
     annotations=READ_ONLY_TOOL,
     structured_output=True,
 )
@@ -1219,12 +1617,19 @@ def diagnose_access(
     expected_count: Optional[int] = None,
     include_rules: bool = True,
     limit: int = 50,
+    verbose: bool = False,
 ) -> Dict[str, Any]:
     """
     Inspect readable ACL/rule metadata for the current Odoo credential.
 
     This tool never uses sudo, never impersonates another user, and only performs
     read-only metadata/count calls.
+
+    NESA A9: by default the answer no longer repeats the caller's ~100 raw
+    group IDs three times over (``groups_id``/``group_ids``/
+    ``direct_group_ids``). Numeric IDs without names are unreadable for an
+    agent and were pure context cost. Only the groups that actually decide the
+    ACL/rule question are returned, resolved to names.
     """
     try:
         validate_model_name(model)
@@ -1436,6 +1841,62 @@ def diagnose_access(
             for row in acl_rows
             if bool(row.get(permission_field)) and _acl_row_applies(row, user_group_ids)
         ]
+        # NESA A9: collapse the three redundant membership lists into the few
+        # groups that carry the decision, and give them readable names.
+        decisive_group_ids: set[int] = set()
+        for row in granting_acl_rows:
+            group_id = _m2o_id(row.get("group_id"))
+            if group_id is not None:
+                decisive_group_ids.add(group_id)
+        member_group_ids = user_group_ids or set()
+        for rule in applicable_rules:
+            decisive_group_ids |= _m2m_ids(rule.get("groups")) & member_group_ids
+        relevant_groups: list[Dict[str, Any]] = []
+        if decisive_group_ids:
+            group_rows, error = _safe_odoo_read(
+                "res.groups.read",
+                lambda: odoo.execute_method(
+                    "res.groups",
+                    "read",
+                    sorted(decisive_group_ids),
+                    fields=["display_name"],
+                ),
+            )
+            if error:
+                metadata_errors.append(error)
+            elif isinstance(group_rows, list):
+                relevant_groups = [
+                    {
+                        "id": row.get("id"),
+                        "name": row.get("display_name"),
+                        "member": row.get("id") in member_group_ids,
+                    }
+                    for row in group_rows
+                    if isinstance(row, dict)
+                ]
+        user_record = current_user.get("record")
+        compact_user: Dict[str, Any] = {
+            "uid": current_user.get("uid"),
+            "login": (user_record or {}).get("login"),
+            "name": (user_record or {}).get("name"),
+            "group_count": len(user_group_ids) if user_group_ids is not None else None,
+            "decisive_groups": relevant_groups,
+        }
+        if verbose:
+            compact_user["context"] = current_user.get("context")
+            compact_user["record"] = user_record
+            compact_user["all_group_ids"] = current_user.get("group_ids")
+            compact_user["direct_group_ids"] = current_user.get("direct_group_ids")
+            compact_user["group_field"] = current_user.get("group_field")
+            compact_user["all_group_field"] = current_user.get("all_group_field")
+        else:
+            context_value = current_user.get("context")
+            if isinstance(context_value, dict):
+                compact_user["context"] = {
+                    key: context_value[key]
+                    for key in ("lang", "tz", "uid", "allowed_company_ids")
+                    if key in context_value
+                }
         diagnosis_codes = _access_diagnosis_codes(
             metadata_errors=metadata_errors,
             acl_rows=acl_rows,
@@ -1457,18 +1918,32 @@ def diagnose_access(
             "expected_count": expected_count,
             "actual_count": actual_count,
             "model_metadata": {"record": model_record},
-            "current_user": current_user,
+            "current_user": compact_user,
+            "verbose": verbose,
             "access": {
-                "rows": acl_rows,
-                "granting_rows": granting_acl_rows,
+                "rows": acl_rows if verbose else None,
+                "row_count": len(acl_rows),
+                "granting_rows": (
+                    granting_acl_rows
+                    if verbose
+                    else [_compact_acl_row(row) for row in granting_acl_rows]
+                ),
                 "granting_count": len(granting_acl_rows),
             },
             "rules": {
                 "included": include_rules,
-                "active": active_rules,
-                "global": global_rules,
-                "group_bound": group_bound_rules,
-                "applicable": applicable_rules,
+                "active": active_rules if verbose else None,
+                "active_count": len(active_rules),
+                "global": global_rules if verbose else None,
+                "global_count": len(global_rules),
+                "group_bound": group_bound_rules if verbose else None,
+                "group_bound_count": len(group_bound_rules),
+                "applicable": (
+                    applicable_rules
+                    if verbose
+                    else [_compact_rule_row(rule) for rule in applicable_rules]
+                ),
+                "applicable_count": len(applicable_rules),
             },
             "diagnosis": {"codes": diagnosis_codes},
             "metadata_errors": metadata_errors,
@@ -1689,7 +2164,12 @@ def schema_catalog(
 
 
 @mcp.tool(
-    description="Preview create, write, or unlink without executing it",
+    description=(
+        "Read-only dry run for create, write, or unlink. Issues NO approval "
+        "token — validate_write mints the token and it is valid for 600 "
+        "seconds. Chain: (optional preview_write) -> validate_write -> "
+        "execute_approved_write(confirm=true)."
+    ),
     annotations=PREVIEW_TOOL,
     structured_output=True,
 )
@@ -1718,7 +2198,12 @@ def preview_write(
 
 
 @mcp.tool(
-    description="Validate a standard write payload against optional fields_get metadata",
+    description=(
+        "Validate a write payload against live fields_get metadata and mint the "
+        "approval token for execute_approved_write. The token is valid for 600 "
+        "seconds (approval_status.expires_at_iso) and is bound to this exact "
+        "payload — do not research or ask back between validate and execute."
+    ),
     annotations=READ_ONLY_TOOL,
     structured_output=True,
 )
@@ -1781,9 +2266,18 @@ def validate_write(
             stored = register_write_approval(
                 ctx.request_context.lifespan_context, report
             )
+            approval = report.get("approval")
+            expires_at = (
+                approval.get("expires_at") if isinstance(approval, dict) else None
+            )
             report["approval_status"] = {
                 "stored": stored,
                 "expires_in_seconds": WRITE_APPROVAL_TTL_SECONDS,
+                "expires_at_iso": (
+                    datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat()
+                    if isinstance(expires_at, (int, float))
+                    else None
+                ),
                 "source": metadata_source,
             }
         else:
@@ -1801,7 +2295,11 @@ def validate_write(
 
 
 @mcp.tool(
-    description="Execute a previously previewed and confirmed standard write",
+    description=(
+        "Execute a create/write/unlink that validate_write approved. Requires "
+        "the approval object from validate_write (valid 600 seconds) plus "
+        "confirm=true. On rejection the answer carries reason_code and remedy."
+    ),
     annotations=DESTRUCTIVE_TOOL,
     structured_output=True,
 )
@@ -1812,12 +2310,35 @@ def execute_approved_write(
 ) -> Dict[str, Any]:
     """Execute create/write/unlink only after token, confirm, and env gates pass."""
     try:
+        if not str((approval or {}).get("token", "")).strip():
+            # NESA A2: the most common first-timer mistake is passing the
+            # preview_write payload straight through.  Say so, instead of
+            # reporting a token mismatch for a token that was never there.
+            return {
+                "success": False,
+                "tool": "execute_approved_write",
+                "error": (
+                    "approval token rejected (token_missing): the approval "
+                    "object carries no token"
+                ),
+                "reason_code": "token_missing",
+                "remedy": (
+                    "preview_write issues no token. Call validate_write with "
+                    "the same arguments and pass its 'approval' object here."
+                ),
+                "approval_ttl_seconds": WRITE_APPROVAL_TTL_SECONDS,
+            }
         is_valid, expected_token = verify_write_approval(approval)
         if not is_valid:
             return {
                 "success": False,
                 "tool": "execute_approved_write",
                 "error": "approval token does not match the canonical payload",
+                "reason_code": "token_payload_mismatch",
+                "remedy": (
+                    "The token does not belong to these values. Re-run "
+                    "validate_write with the exact payload you intend to write."
+                ),
                 "expected_token": expected_token,
             }
         model = str(approval.get("model", ""))
@@ -1830,14 +2351,49 @@ def execute_approved_write(
             return denied
         app_context = ctx.request_context.lifespan_context
         validation_record = require_validated_write_approval(app_context, approval)
-        if validation_record is None:
+        if not validation_record.get("ok"):
+            reason_code = str(validation_record.get("reason_code", "token_rejected"))
+            remedies = {
+                "token_missing": (
+                    "Call validate_write to obtain an approval token "
+                    "(preview_write issues none)."
+                ),
+                "token_unknown": (
+                    "The token was never validated, or the MCP process restarted "
+                    "since. Re-run validate_write."
+                ),
+                "token_expired": (
+                    f"Approval tokens are valid for {WRITE_APPROVAL_TTL_SECONDS} "
+                    "seconds. Re-run validate_write directly before executing."
+                ),
+                "token_already_consumed": (
+                    "This token was already used — the write may have been "
+                    "executed. Verify the record before retrying."
+                ),
+                "token_foreign_user": (
+                    "The token belongs to a different Odoo user. Re-run "
+                    "validate_write with the current credentials."
+                ),
+                "payload_mismatch": (
+                    "The payload changed after validation. Re-run validate_write "
+                    "with the exact values you intend to write."
+                ),
+                "token_store_unreachable": (
+                    "Odoo could not be reached for token validation. Retry once; "
+                    "if it persists this is an infrastructure problem, not a "
+                    "permission problem."
+                ),
+            }
             return {
                 "success": False,
                 "tool": "execute_approved_write",
                 "error": (
-                    "approval token has not been validated in this server session "
-                    "or has expired; call validate_write first"
+                    f"approval token rejected ({reason_code}): "
+                    f"{validation_record.get('reason')}"
                 ),
+                "reason_code": reason_code,
+                "remedy": remedies.get(reason_code, "Re-run validate_write."),
+                "approval_ttl_seconds": WRITE_APPROVAL_TTL_SECONDS,
             }
         # NESA Patch 3 — payload-hash already verified inside mcp_consume_approval;
         # this extra equality check stays as defense-in-depth in case the DB store
@@ -1898,7 +2454,11 @@ def execute_approved_write(
 
 
 @mcp.tool(
-    description="Scan local Odoo addon source without importing addon code",
+    description=(
+        "Scan local Odoo addon source without importing addon code. Requires "
+        "ODOO_ADDONS_PATHS to be configured on the MCP host; fails loudly when "
+        "it is not, instead of reporting an empty scan."
+    ),
     annotations=PREVIEW_TOOL,
     structured_output=True,
 )
@@ -1907,18 +2467,60 @@ def scan_addons_source(
     max_files: int = 200,
     max_file_bytes: int = 300_000,
 ) -> Dict[str, Any]:
-    """Summarize manifests, custom models, risky methods, views, and ACL files."""
+    """Summarize manifests, custom models, risky methods, views, and ACL files.
+
+    NESA A5: an unconfigured scan used to answer ``success: true`` with zero
+    modules, which reads like "there is no addon code" rather than "I cannot
+    look".  Missing or unreadable roots are now hard errors.
+    """
     try:
         max_files = clamp_limit(max_files, maximum=1000)
         if max_file_bytes < 1:
             raise ValueError("max_file_bytes must be greater than 0")
-        return scan_addons_source_report(
-            addons_paths=restrict_addons_paths(addons_paths),
+        roots = restrict_addons_paths(addons_paths)
+        effective_roots = roots or [str(root) for root in configured_addons_roots()]
+        if not effective_roots:
+            return {
+                "success": False,
+                "tool": "scan_addons_source",
+                "error": (
+                    "No addons roots configured: ODOO_ADDONS_PATHS is unset on "
+                    "the MCP host, so source analysis is unavailable. This is "
+                    "NOT evidence that the deployment has no custom addons."
+                ),
+                "error_type": "not_configured",
+                "retryable": False,
+                "configured_addons_paths": [],
+            }
+        unreadable = [
+            root
+            for root in effective_roots
+            if not os.path.isdir(root) or not os.access(root, os.R_OK | os.X_OK)
+        ]
+        if len(unreadable) == len(effective_roots):
+            return {
+                "success": False,
+                "tool": "scan_addons_source",
+                "error": (
+                    "All configured addons roots are missing or unreadable for "
+                    "the MCP service user: " + ", ".join(unreadable)
+                ),
+                "error_type": "not_readable",
+                "retryable": False,
+                "configured_addons_paths": effective_roots,
+            }
+        report = scan_addons_source_report(
+            addons_paths=roots,
             max_files=max_files,
             max_file_bytes=max_file_bytes,
         )
+        if unreadable:
+            report.setdefault("warnings", []).append(
+                "Unreadable addons roots were skipped: " + ", ".join(unreadable)
+            )
+        return report
     except Exception as e:
-        return {"success": False, "tool": "scan_addons_source", "error": str(e)}
+        return error_response("scan_addons_source", e)
 
 
 @mcp.tool(
@@ -2022,6 +2624,7 @@ def execute_method(
         - result: Result of the method (if success)
         - error: Error message (if failure)
     """
+    app_context = ctx.request_context.lifespan_context
     try:
         validate_model_name(model)
         validate_method_name(method)
@@ -2032,15 +2635,8 @@ def execute_method(
                 "error": "Private underscore methods cannot be called via execute_method.",
                 "classification": safety,
             }
-        if method in DESTRUCTIVE_METHODS or method in WRITE_EQUIVALENT_METHODS:
-            return {
-                "success": False,
-                "error": (
-                    "Direct execute_method blocks CRUD and write-equivalent "
-                    "aliases. Use "
-                    "preview_write -> validate_write -> execute_approved_write."
-                ),
-            }
+        # Hard-deny is evaluated before every other gate so that no exemption
+        # below (including the transient one) can widen it.
         deny_prefix = denied_method_prefix(model, method)
         if deny_prefix:
             return {
@@ -2051,6 +2647,41 @@ def execute_method(
                     "ACL parity, an exact allowlist, or broad mode."
                 ),
                 "classification": safety,
+            }
+        transient_model = False
+        gated_method = (
+            method in DESTRUCTIVE_METHODS or method in WRITE_EQUIVALENT_METHODS
+        )
+        if gated_method:
+            # NESA A1: filling in a wizard is not a business write.  Transient
+            # records live in scratch tables that ir.autovacuum clears, so
+            # forcing them through preview -> validate -> execute cost four
+            # calls per wizard field and bought no safety.  unlink and the
+            # write-equivalent aliases stay on the chain regardless.
+            transient_model = bool(
+                model_is_transient(app_context, app_context.odoo, model)
+            )
+        if gated_method and not (
+            transient_model and method in TRANSIENT_EXEMPT_METHODS
+        ):
+            if transient_model:
+                reason = (
+                    f"{method!r} stays on the approved-write chain even for "
+                    "transient models — only create and write are exempt. Use "
+                    "validate_write -> execute_approved_write."
+                )
+            else:
+                reason = (
+                    "Direct execute_method blocks CRUD and write-equivalent "
+                    "aliases on persistent models. Use validate_write -> "
+                    "execute_approved_write (preview_write is an optional "
+                    "read-only dry run). Transient wizard models accept "
+                    "create/write directly."
+                )
+            return {
+                "success": False,
+                "error": reason,
+                "transient_model": transient_model,
             }
         review_required = safety["safety"] in {"side_effect", "unknown"}
         if (
@@ -2086,10 +2717,23 @@ def execute_method(
                 normalized_args[0] = normalize_domain_input(normalized_args[0])
                 args = normalized_args
 
-        odoo = ctx.request_context.lifespan_context.odoo
+        odoo = app_context.odoo
         audit_odoo_execution("execute_method", model, method)
-        result = odoo.execute_method(model, method, *args, **kwargs)
-        response = {"success": True, "result": result}
+        call_args = list(args)
+        call_kwargs = dict(kwargs)
+        result = call_with_transport_retry(
+            lambda: odoo.execute_method(model, method, *call_args, **call_kwargs),
+            label=f"{model}.{method}",
+        )
+        response: Dict[str, Any] = {"success": True, "result": result}
+        if transient_model:
+            response["transient_model"] = True
+        result_counts = _act_window_result_counts(app_context, odoo, model, result)
+        if result_counts is not None:
+            # NESA A8: a bare act_window dict tells the agent nothing about
+            # whether the action produced rows.  Count them here instead of
+            # forcing a blind follow-up read.
+            response["result_counts"] = result_counts
         if removed_context_keys:
             response["warnings"] = [
                 "Removed audit-suppression context keys: "
@@ -2097,7 +2741,7 @@ def execute_method(
             ]
         return response
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return error_response("execute_method", e, model=model, method=method)
 
 
 @mcp.tool(
@@ -2175,7 +2819,12 @@ def get_model_fields(
 
 
 @mcp.tool(
-    description="Search Odoo records with read-only search_read",
+    description=(
+        "Search Odoo records with read-only search_read. Returns the page in "
+        "'result' plus 'total_count' (all matches, not just this page), "
+        "'has_more' and 'next_offset' for paging. Without an explicit 'order' "
+        "the result is sorted by 'id desc' so paging stays stable."
+    ),
     annotations=READ_ONLY_TOOL,
     structured_output=True,
 )
@@ -2193,6 +2842,10 @@ def search_records(
 
     Domain accepts standard Odoo domain arrays, a JSON string, or
     {"conditions": [{"field": ..., "operator": ..., "value": ...}]}.
+
+    ``count`` is the size of the returned page. ``total_count`` is the real
+    number of matching records (NESA A3) — never confuse the two: a ``count``
+    equal to ``limit`` almost always means the result was truncated.
     """
     app_context = ctx.request_context.lifespan_context
     odoo = app_context.odoo
@@ -2201,24 +2854,66 @@ def search_records(
         limit = clamp_limit(limit)
         if offset < 0:
             raise ValueError("offset must be greater than or equal to 0")
-        resolved_fields = resolve_read_fields(app_context, odoo, model, fields)
-        records = odoo.search_read(
-            model_name=model,
-            domain=normalize_domain_input(domain),
-            fields=resolved_fields,
-            offset=offset,
-            limit=limit,
-            order=order,
+        resolved_fields, field_notes = resolve_read_fields(
+            app_context, odoo, model, fields
         )
-        return {
+        normalized_domain = normalize_domain_input(domain)
+        # NESA A4: an unordered search_read has no total order, so offset
+        # paging can repeat or skip rows without anybody noticing.
+        order_used = order or DEFAULT_SEARCH_ORDER
+        records = call_with_transport_retry(
+            lambda: odoo.search_read(
+                model_name=model,
+                domain=normalized_domain,
+                fields=resolved_fields,
+                offset=offset,
+                limit=limit,
+                order=order_used,
+            ),
+            label=f"search_read({model})",
+        )
+        total_count: Optional[int] = None
+        count_error: Optional[str] = None
+        try:
+            counted = call_with_transport_retry(
+                lambda: odoo.execute_method(model, "search_count", normalized_domain),
+                label=f"search_count({model})",
+            )
+            if isinstance(counted, int):
+                total_count = counted
+        except Exception as count_exc:  # noqa: BLE001 — page result is still valid
+            count_error = str(count_exc)
+            logger.warning("[search_records] search_count failed: %s", count_exc)
+
+        returned = len(records)
+        if total_count is None:
+            # Without a trustworthy total, a full page is still evidence that
+            # more rows may exist.  Say "unknown" instead of implying "no".
+            has_more: Optional[bool] = True if returned >= limit else None
+        else:
+            has_more = (offset + returned) < total_count
+        response: Dict[str, Any] = {
             "success": True,
-            "count": len(records),
+            "count": returned,
+            "total_count": total_count,
+            "has_more": has_more,
+            "next_offset": (offset + returned) if has_more else None,
+            "offset": offset,
+            "limit": limit,
+            "order_used": order_used,
+            "order_defaulted": order is None,
             "result": records,
             "smart_fields_applied": fields is None,
             "fields_used": resolved_fields,
         }
+        if count_error:
+            response["total_count_error"] = count_error
+        for key in ("excluded_binary_fields", "expanded_wildcard", "warning"):
+            if key in field_notes:
+                response[key] = field_notes[key]
+        return response
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return error_response("search_records", e, model=model)
 
 
 @mcp.tool(
@@ -2245,21 +2940,96 @@ def read_record(
         validate_model_name(model)
         if record_id < 1:
             raise ValueError("record_id must be greater than 0")
-        resolved_fields = resolve_read_fields(app_context, odoo, model, fields)
-        records = odoo.read_records(model, [record_id], fields=resolved_fields)
+        resolved_fields, field_notes = resolve_read_fields(
+            app_context, odoo, model, fields
+        )
+        records = call_with_transport_retry(
+            lambda: odoo.read_records(model, [record_id], fields=resolved_fields),
+            label=f"read({model})",
+        )
         if not records:
             return {
                 "success": False,
+                "tool": "read_record",
                 "error": f"Record not found: {model} ID {record_id}",
+                "error_type": "not_found",
+                "retryable": False,
             }
-        return {
+        response: Dict[str, Any] = {
             "success": True,
             "result": records[0],
             "smart_fields_applied": fields is None,
             "fields_used": resolved_fields,
         }
+        for key in ("excluded_binary_fields", "expanded_wildcard", "warning"):
+            if key in field_notes:
+                response[key] = field_notes[key]
+        return response
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return error_response("read_record", e, model=model, record_id=record_id)
+
+
+@mcp.tool(
+    description=(
+        "Read several Odoo records of one model in a single call. Prefer this "
+        "over repeated read_record calls or a search_records detour via "
+        "[['id','in',[...]]]."
+    ),
+    annotations=READ_ONLY_TOOL,
+    structured_output=True,
+)
+def read_records(
+    ctx: Context,
+    model: str,
+    record_ids: List[int],
+    fields: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Read many records by ID with the same field semantics as read_record.
+
+    ``fields=None`` picks a curated subset, ``fields=["*"]`` returns every
+    non-binary field. Missing IDs are reported in ``missing_ids`` instead of
+    failing the whole call — a record can be absent because it was deleted or
+    because a record rule hides it.
+    """
+    app_context = ctx.request_context.lifespan_context
+    odoo = app_context.odoo
+    try:
+        validate_model_name(model)
+        normalized_ids = [int(record_id) for record_id in record_ids or []]
+        if not normalized_ids:
+            raise ValueError("record_ids must contain at least one ID")
+        if any(record_id < 1 for record_id in normalized_ids):
+            raise ValueError("record_ids must all be greater than 0")
+        if len(normalized_ids) > MAX_SEARCH_LIMIT:
+            raise ValueError(
+                f"record_ids is limited to {MAX_SEARCH_LIMIT} entries per call"
+            )
+        resolved_fields, field_notes = resolve_read_fields(
+            app_context, odoo, model, fields
+        )
+        records = call_with_transport_retry(
+            lambda: odoo.read_records(model, normalized_ids, fields=resolved_fields),
+            label=f"read({model})",
+        )
+        found_ids = {
+            int(row["id"]) for row in records if isinstance(row, dict) and "id" in row
+        }
+        response: Dict[str, Any] = {
+            "success": True,
+            "model": model,
+            "count": len(records),
+            "requested_count": len(normalized_ids),
+            "missing_ids": [rid for rid in normalized_ids if rid not in found_ids],
+            "result": records,
+            "smart_fields_applied": fields is None,
+            "fields_used": resolved_fields,
+        }
+        for key in ("excluded_binary_fields", "expanded_wildcard", "warning"):
+            if key in field_notes:
+                response[key] = field_notes[key]
+        return response
+    except Exception as e:
+        return error_response("read_records", e, model=model)
 
 
 @mcp.tool(
@@ -2656,6 +3426,706 @@ def search_holidays(
 
     except Exception as e:
         return SearchHolidaysResponse(success=False, error=str(e))
+
+
+# ----- NESA document, report and pricing tools -----
+
+
+_ATTACHMENT_META_FIELDS = [
+    "id",
+    "name",
+    "mimetype",
+    "file_size",
+    "res_model",
+    "res_id",
+    "create_date",
+    "type",
+    "url",
+]
+
+
+def _read_attachment_meta(odoo: OdooClient, attachment_id: int) -> Dict[str, Any]:
+    """Read attachment metadata without ever touching the binary payload."""
+    rows = odoo.read_records(
+        "ir.attachment", [attachment_id], fields=_ATTACHMENT_META_FIELDS,
+    )
+    if not rows:
+        raise ValueError(
+            f"Attachment {attachment_id} not found or not visible for this user."
+        )
+    return rows[0]
+
+
+def _resolve_attachment_id(odoo: OdooClient, model: str, record_id: int) -> int:
+    """Map a document-ish record onto its ir.attachment ID."""
+    if model == "ir.attachment":
+        return record_id
+    rows = odoo.read_records(model, [record_id], fields=["attachment_id"])
+    if not rows:
+        raise ValueError(f"{model} {record_id} not found or not visible.")
+    attachment = rows[0].get("attachment_id")
+    resolved = _m2o_id(attachment)
+    if not resolved:
+        raise ValueError(f"{model} {record_id} has no attachment_id.")
+    return resolved
+
+
+def _doc_helper_missing_response(tool: str, exc: BaseException) -> Optional[Dict[str, Any]]:
+    """Turn "helper model absent" into an actionable message, not a raw fault."""
+    text = str(exc)
+    if NESA_DOC_HELPER_MODEL not in text and "doesn't exist" not in text.casefold():
+        return None
+    return {
+        "success": False,
+        "tool": tool,
+        "error": (
+            f"The Odoo-side helper model {NESA_DOC_HELPER_MODEL} is not "
+            "available. Install/upgrade the nesa_mcp_bridge module on this "
+            "database to enable attachment previews, download links, report "
+            "rendering and price previews."
+        ),
+        "error_type": "helper_unavailable",
+        "retryable": False,
+    }
+
+
+@mcp.tool(
+    description=(
+        "Read the indexed text (OCR/PDF text layer) of an attachment in bounded "
+        "windows. Use this after finding candidates via "
+        "search_records('ir.attachment', [['index_content','ilike',...]]) — "
+        "never pull index_content through a plain field read, it is unbounded."
+    ),
+    annotations=READ_ONLY_TOOL,
+    structured_output=True,
+)
+def get_document_text(
+    ctx: Context,
+    attachment_id: int,
+    offset: int = 0,
+    limit: int = DOC_TEXT_WINDOW_DEFAULT,
+    model: str = "ir.attachment",
+) -> Dict[str, Any]:
+    """Return a character window of ``ir.attachment.index_content``.
+
+    ``model`` may also be ``documents.document`` (or any model exposing an
+    ``attachment_id``); the attachment behind the record is resolved first.
+
+    Returns ``text`` plus ``total_chars``, ``has_more`` and ``next_offset`` so
+    long documents can be paged deterministically.
+    """
+    odoo = ctx.request_context.lifespan_context.odoo
+    try:
+        validate_model_name(model)
+        if attachment_id < 1:
+            raise ValueError("attachment_id must be greater than 0")
+        if offset < 0:
+            raise ValueError("offset must be greater than or equal to 0")
+        if limit < 1:
+            raise ValueError("limit must be greater than 0")
+        limit = min(limit, DOC_TEXT_WINDOW_MAX)
+        resolved_id = _resolve_attachment_id(odoo, model, attachment_id)
+        rows = call_with_transport_retry(
+            lambda: odoo.read_records(
+                "ir.attachment",
+                [resolved_id],
+                fields=_ATTACHMENT_META_FIELDS + ["index_content"],
+            ),
+            label="read(ir.attachment.index_content)",
+        )
+        if not rows:
+            return {
+                "success": False,
+                "tool": "get_document_text",
+                "error": (
+                    f"Attachment {resolved_id} not found or not visible for "
+                    "this user."
+                ),
+                "error_type": "not_found",
+                "retryable": False,
+            }
+        record = rows[0]
+        content = record.get("index_content") or ""
+        if not isinstance(content, str):
+            content = str(content)
+        total_chars = len(content)
+        window = content[offset : offset + limit]
+        end = offset + len(window)
+        response: Dict[str, Any] = {
+            "success": True,
+            "tool": "get_document_text",
+            "attachment_id": resolved_id,
+            "name": record.get("name"),
+            "mimetype": record.get("mimetype"),
+            "file_size": record.get("file_size"),
+            "offset": offset,
+            "limit": limit,
+            "returned_chars": len(window),
+            "total_chars": total_chars,
+            "has_more": end < total_chars,
+            "next_offset": end if end < total_chars else None,
+            "text": window,
+        }
+        if total_chars == 0:
+            response["note"] = (
+                "index_content is empty: the file was never text-indexed "
+                "(images without OCR, or an attachment type Odoo does not "
+                "index). Use read_attachment to look at it instead."
+            )
+        return response
+    except Exception as e:
+        return error_response("get_document_text", e, attachment_id=attachment_id)
+
+
+@mcp.tool(
+    description=(
+        "Look at an attachment: images come back as an actual image (downscaled "
+        "server-side), PDFs and text files as extracted text. Use "
+        "create_attachment_download when the untouched original file is needed."
+    ),
+    annotations=READ_ONLY_TOOL,
+    structured_output=False,
+)
+def read_attachment(
+    ctx: Context,
+    attachment_id: int,
+    max_pixels: int = 1600,
+    text_limit: int = DOC_TEXT_WINDOW_DEFAULT,
+    model: str = "ir.attachment",
+) -> Any:
+    """Return an attachment in a form the agent can actually evaluate.
+
+    Images are resized inside Odoo (Pillow lives there, not in the MCP venv)
+    so a 6 MB site photo does not arrive as 8 MB of base64. PDFs and text
+    files return their indexed text; everything else returns metadata plus a
+    pointer to ``create_attachment_download``.
+    """
+    odoo = ctx.request_context.lifespan_context.odoo
+    try:
+        validate_model_name(model)
+        if attachment_id < 1:
+            raise ValueError("attachment_id must be greater than 0")
+        if max_pixels < 64 or max_pixels > 4096:
+            raise ValueError("max_pixels must be between 64 and 4096")
+        text_limit = max(1, min(text_limit, DOC_TEXT_WINDOW_MAX))
+        resolved_id = _resolve_attachment_id(odoo, model, attachment_id)
+        meta = _read_attachment_meta(odoo, resolved_id)
+        mimetype = str(meta.get("mimetype") or "")
+
+        if mimetype.startswith("image/"):
+            try:
+                preview = call_doc_helper(
+                    odoo, "mcp_attachment_preview", resolved_id, max_pixels,
+                )
+            except Exception as exc:  # noqa: BLE001 — mapped to guidance below
+                missing = _doc_helper_missing_response("read_attachment", exc)
+                if missing:
+                    return missing
+                raise
+            if not isinstance(preview, dict) or not preview.get("success"):
+                return {
+                    "success": False,
+                    "tool": "read_attachment",
+                    "error": (
+                        (preview or {}).get("error")
+                        if isinstance(preview, dict)
+                        else "image preview failed"
+                    ),
+                    "error_type": "preview_failed",
+                    "retryable": False,
+                }
+            image_bytes = base64.b64decode(preview["data_b64"])
+            return [
+                Image(data=image_bytes, format=str(preview.get("format", "jpeg"))),
+                {
+                    "success": True,
+                    "tool": "read_attachment",
+                    "attachment_id": resolved_id,
+                    "name": meta.get("name"),
+                    "mimetype": mimetype,
+                    "original_file_size": meta.get("file_size"),
+                    "preview_bytes": len(image_bytes),
+                    "preview_width": preview.get("width"),
+                    "preview_height": preview.get("height"),
+                    "downscaled": bool(preview.get("downscaled")),
+                    "attached_to": {
+                        "model": meta.get("res_model"),
+                        "res_id": meta.get("res_id"),
+                    },
+                },
+            ]
+
+        text_rows = call_with_transport_retry(
+            lambda: odoo.read_records(
+                "ir.attachment", [resolved_id], fields=["index_content"],
+            ),
+            label="read(ir.attachment.index_content)",
+        )
+        content = (text_rows[0].get("index_content") if text_rows else "") or ""
+        if not isinstance(content, str):
+            content = str(content)
+        window = content[:text_limit]
+        payload: Dict[str, Any] = {
+            "success": True,
+            "tool": "read_attachment",
+            "attachment_id": resolved_id,
+            "name": meta.get("name"),
+            "mimetype": mimetype,
+            "file_size": meta.get("file_size"),
+            "attached_to": {
+                "model": meta.get("res_model"),
+                "res_id": meta.get("res_id"),
+            },
+            "text": window,
+            "total_chars": len(content),
+            "has_more": len(content) > len(window),
+            "next_offset": len(window) if len(content) > len(window) else None,
+        }
+        if not content:
+            payload["note"] = (
+                "No text layer available for this attachment. Use "
+                "create_attachment_download to hand out the original file."
+            )
+        elif len(content) > len(window):
+            payload["note"] = (
+                "Text truncated — continue with "
+                f"get_document_text(attachment_id={resolved_id}, offset=..)."
+            )
+        return payload
+    except Exception as e:
+        return error_response("read_attachment", e, attachment_id=attachment_id)
+
+
+@mcp.tool(
+    description=(
+        "Create a time-limited HTTPS download link for the unmodified original "
+        "file of an attachment. Use it to hand a file to a person or to attach "
+        "it to a mail draft."
+    ),
+    annotations=READ_ONLY_TOOL,
+    structured_output=True,
+)
+def create_attachment_download(
+    ctx: Context,
+    attachment_id: int,
+    ttl_seconds: int = 900,
+    model: str = "ir.attachment",
+) -> Dict[str, Any]:
+    """Mint a single-purpose, expiring download URL for one attachment.
+
+    The link is issued by ``nesa_mcp_bridge`` and only after Odoo confirmed
+    that the acting user may read the attachment. It expires on its own; no
+    permanent public access token is written onto the record.
+    """
+    odoo = ctx.request_context.lifespan_context.odoo
+    try:
+        validate_model_name(model)
+        if attachment_id < 1:
+            raise ValueError("attachment_id must be greater than 0")
+        if ttl_seconds < 60:
+            raise ValueError("ttl_seconds must be at least 60")
+        resolved_id = _resolve_attachment_id(odoo, model, attachment_id)
+        try:
+            result = call_doc_helper(
+                odoo, "mcp_create_download", resolved_id, ttl_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 — mapped to guidance below
+            missing = _doc_helper_missing_response("create_attachment_download", exc)
+            if missing:
+                return missing
+            raise
+        if not isinstance(result, dict) or not result.get("success"):
+            return {
+                "success": False,
+                "tool": "create_attachment_download",
+                "error": (
+                    (result or {}).get("error")
+                    if isinstance(result, dict)
+                    else "download link could not be created"
+                ),
+                "error_type": "link_failed",
+                "retryable": False,
+            }
+        return {"success": True, "tool": "create_attachment_download", **result}
+    except Exception as e:
+        return error_response(
+            "create_attachment_download", e, attachment_id=attachment_id
+        )
+
+
+@mcp.tool(
+    description=(
+        "Render an Odoo QWeb PDF report (invoice, quotation, delivery slip) for "
+        "one or more records and return a time-limited download link."
+    ),
+    annotations=READ_ONLY_TOOL,
+    structured_output=True,
+)
+def render_report(
+    ctx: Context,
+    model: str,
+    record_ids: List[int],
+    report_ref: str,
+    ttl_seconds: int = 900,
+    return_base64: bool = False,
+) -> Dict[str, Any]:
+    """Render a report to PDF without mutating the source records.
+
+    ``report_ref`` is the report's XML ID, e.g.
+    ``account.account_invoices``. The PDF is stored as a short-lived
+    attachment that the download token's cleanup removes again; it is never
+    attached to the business record.
+
+    ``return_base64=True`` additionally embeds the PDF in the answer — only do
+    that for small documents, a link is cheaper for the context window.
+    """
+    odoo = ctx.request_context.lifespan_context.odoo
+    try:
+        validate_model_name(model)
+        normalized_ids = [int(record_id) for record_id in record_ids or []]
+        if not normalized_ids:
+            raise ValueError("record_ids must contain at least one ID")
+        if any(record_id < 1 for record_id in normalized_ids):
+            raise ValueError("record_ids must all be greater than 0")
+        if not str(report_ref).strip():
+            raise ValueError("report_ref must be a non-empty report XML ID")
+        if ttl_seconds < 60:
+            raise ValueError("ttl_seconds must be at least 60")
+        try:
+            result = call_doc_helper(
+                odoo,
+                "mcp_render_report",
+                str(report_ref).strip(),
+                normalized_ids,
+                model,
+                ttl_seconds,
+                bool(return_base64),
+            )
+        except Exception as exc:  # noqa: BLE001 — mapped to guidance below
+            missing = _doc_helper_missing_response("render_report", exc)
+            if missing:
+                return missing
+            raise
+        if not isinstance(result, dict) or not result.get("success"):
+            return {
+                "success": False,
+                "tool": "render_report",
+                "error": (
+                    (result or {}).get("error")
+                    if isinstance(result, dict)
+                    else "report rendering failed"
+                ),
+                "error_type": "render_failed",
+                "retryable": False,
+            }
+        return {"success": True, "tool": "render_report", "model": model, **result}
+    except Exception as e:
+        return error_response("render_report", e, model=model, report_ref=report_ref)
+
+
+@mcp.tool(
+    description=(
+        "Explain which Odoo methods execute_method will run, and which are "
+        "blocked. Use this instead of probing methods on live business records."
+    ),
+    annotations=PREVIEW_TOOL,
+    structured_output=True,
+)
+def list_allowed_methods(
+    ctx: Context,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Report the effective method policy, optionally narrowed to one model.
+
+    NESA B5: trial and error is a bad discovery mechanism when a wrong guess
+    on ``account.move`` might post an invoice. This states the policy instead.
+    """
+    try:
+        if model is not None:
+            validate_model_name(model)
+        from . import _nesa_db_allowlist
+
+        db_entries = sorted(_nesa_db_allowlist.methods())
+        env_entries = sorted(allowed_side_effect_methods())
+        if model:
+            prefix = f"{model}."
+            db_entries = [entry for entry in db_entries if entry.startswith(prefix)]
+            env_entries = [entry for entry in env_entries if entry.startswith(prefix)]
+        parity = native_acl_parity_enabled()
+        deny_prefixes = denied_method_prefixes()
+        if model:
+            model_deny = [
+                prefix
+                for prefix in deny_prefixes
+                if prefix.startswith(model.casefold())
+                or f"{model}.".casefold().startswith(prefix)
+            ]
+        else:
+            model_deny = deny_prefixes
+        if parity:
+            positive_policy = (
+                "Native Odoo ACL parity is active: every public, non-underscore "
+                "method runs if and only if the acting Odoo user is allowed to "
+                "run it. No separate method allowlist applies."
+            )
+        elif truthy_env("ODOO_MCP_ALLOW_UNKNOWN_METHODS"):
+            positive_policy = (
+                "Broad unknown-method mode is active: unreviewed side-effect "
+                "methods are permitted. Prefer exact allowlist entries."
+            )
+        else:
+            positive_policy = (
+                "Exact-allowlist mode: only the listed model.method entries may "
+                "run as side effects. Read-only methods always run."
+            )
+        return {
+            "success": True,
+            "tool": "list_allowed_methods",
+            "model": model,
+            "authorization_mode": (
+                "native_acl_parity"
+                if parity
+                else (
+                    "broad_unknown_methods"
+                    if truthy_env("ODOO_MCP_ALLOW_UNKNOWN_METHODS")
+                    else "exact_allowlist"
+                )
+            ),
+            "positive_policy": positive_policy,
+            "always_blocked": {
+                "private_methods": "Any method starting with '_'.",
+                "crud_on_persistent_models": sorted(DESTRUCTIVE_METHODS),
+                "write_equivalent_aliases": sorted(WRITE_EQUIVALENT_METHODS),
+                "hard_deny_prefixes": model_deny,
+                "note": (
+                    "create/write are allowed directly on transient (wizard) "
+                    "models; unlink and the aliases never are."
+                ),
+            },
+            "db_allowlist_entries": db_entries,
+            "env_allowlist_entries": env_entries,
+            "write_path": (
+                "validate_write -> execute_approved_write(confirm=true); the "
+                f"approval token lives {WRITE_APPROVAL_TTL_SECONDS} seconds."
+            ),
+        }
+    except Exception as e:
+        return error_response("list_allowed_methods", e, model=model)
+
+
+@mcp.tool(
+    description=(
+        "Read the chatter (mail.message history) of a record: who wrote what "
+        "and when, newest first, with attachment IDs."
+    ),
+    annotations=READ_ONLY_TOOL,
+    structured_output=True,
+)
+def chatter_read(
+    ctx: Context,
+    model: str,
+    record_id: int,
+    limit: int = 20,
+    offset: int = 0,
+    body_char_limit: int = 2000,
+    message_types: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Return the message history of one record in reverse chronological order.
+
+    NESA B6: the counterpart to ``chatter_post``. Filtering ``mail.message`` by
+    hand through ``search_records`` is easy to get wrong (``model`` plus
+    ``res_id`` plus message type), and the chatter is often the only place a
+    dispute is documented.
+    """
+    app_context = ctx.request_context.lifespan_context
+    odoo = app_context.odoo
+    try:
+        validate_model_name(model)
+        if record_id < 1:
+            raise ValueError("record_id must be greater than 0")
+        limit = clamp_limit(limit)
+        if offset < 0:
+            raise ValueError("offset must be greater than or equal to 0")
+        if body_char_limit < 1:
+            raise ValueError("body_char_limit must be greater than 0")
+        domain: List[Any] = [["model", "=", model], ["res_id", "=", record_id]]
+        if message_types:
+            domain.append(["message_type", "in", list(message_types)])
+        fields = [
+            "id",
+            "date",
+            "author_id",
+            "email_from",
+            "message_type",
+            "subtype_id",
+            "subject",
+            "body",
+            "attachment_ids",
+        ]
+        messages = call_with_transport_retry(
+            lambda: odoo.search_read(
+                model_name="mail.message",
+                domain=domain,
+                fields=fields,
+                offset=offset,
+                limit=limit,
+                order="id desc",
+            ),
+            label="search_read(mail.message)",
+        )
+        total_count: Optional[int] = None
+        try:
+            counted = odoo.execute_method("mail.message", "search_count", domain)
+            if isinstance(counted, int):
+                total_count = counted
+        except Exception as count_exc:  # noqa: BLE001 — page is still valid
+            logger.warning("[chatter_read] search_count failed: %s", count_exc)
+        truncated = 0
+        for message in messages:
+            body = message.get("body")
+            if isinstance(body, str) and len(body) > body_char_limit:
+                message["body"] = body[:body_char_limit]
+                message["body_truncated"] = True
+                truncated += 1
+        returned = len(messages)
+        has_more = (
+            (offset + returned) < total_count
+            if total_count is not None
+            else (True if returned >= limit else None)
+        )
+        return {
+            "success": True,
+            "tool": "chatter_read",
+            "model": model,
+            "record_id": record_id,
+            "count": returned,
+            "total_count": total_count,
+            "has_more": has_more,
+            "next_offset": (offset + returned) if has_more else None,
+            "truncated_bodies": truncated,
+            "body_char_limit": body_char_limit,
+            "messages": messages,
+        }
+    except Exception as e:
+        return error_response("chatter_read", e, model=model, record_id=record_id)
+
+
+@mcp.tool(
+    description=(
+        "Build the web-interface URL of a record so it can be handed to a "
+        "person without guessing the link format."
+    ),
+    annotations=READ_ONLY_TOOL,
+    structured_output=True,
+)
+def get_record_url(
+    ctx: Context,
+    model: str,
+    record_id: int,
+    verify: bool = False,
+) -> Dict[str, Any]:
+    """Return the backend URL of a record, based on Odoo's own web.base_url.
+
+    ``verify=True`` additionally confirms that the record exists and is
+    visible for the acting user — cheap insurance against handing out a link
+    that opens on an error page.
+    """
+    app_context = ctx.request_context.lifespan_context
+    odoo = app_context.odoo
+    try:
+        validate_model_name(model)
+        if record_id < 1:
+            raise ValueError("record_id must be greater than 0")
+        base = odoo_base_url(app_context, odoo)
+        if not base:
+            raise ValueError(
+                "web.base_url is not configured and no RPC URL is known."
+            )
+        response: Dict[str, Any] = {
+            "success": True,
+            "tool": "get_record_url",
+            "model": model,
+            "record_id": record_id,
+            "base_url": base,
+            # Odoo 17.2+/18 canonical deep link.
+            "url": f"{base}/odoo/{model}/{record_id}",
+            # Always-supported legacy hash route, kept as a fallback for
+            # models without a resolvable action path.
+            "legacy_url": (
+                f"{base}/web#id={record_id}&model={model}&view_type=form"
+            ),
+        }
+        if verify:
+            exists = odoo.execute_method(
+                model, "search_count", [["id", "=", record_id]],
+            )
+            response["record_visible"] = bool(exists)
+            if not exists:
+                response["warning"] = (
+                    "The record does not exist or is not visible for this user; "
+                    "the link would open on an error page."
+                )
+        return response
+    except Exception as e:
+        return error_response("get_record_url", e, model=model, record_id=record_id)
+
+
+@mcp.tool(
+    description=(
+        "Preview how NESA material and labour values resolve into price_unit "
+        "before anything is written. M-EK (purchase_price), M-VK "
+        "(nesa_material_price) and M-Multi (nesa_multi_material) are the "
+        "leading fields; price_unit is derived and must not be written."
+    ),
+    annotations=PREVIEW_TOOL,
+    structured_output=True,
+)
+def price_preview(
+    ctx: Context,
+    model: str,
+    values: Dict[str, Any],
+    line_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Compute the resulting NESA line prices without touching the database.
+
+    ``model`` is a line model such as ``sale.order.line`` or
+    ``account.move.line``. ``values`` are the field values to try; when
+    ``line_id`` is given, the stored values of that line are used as the base
+    and ``values`` is applied on top.
+
+    The calculation runs inside Odoo on an in-memory record, so it uses the
+    module's own compute chain rather than a copy of the formula that could
+    drift.
+    """
+    odoo = ctx.request_context.lifespan_context.odoo
+    try:
+        validate_model_name(model)
+        if not isinstance(values, dict):
+            raise ValueError("values must be a mapping of field names to values")
+        try:
+            result = call_doc_helper(
+                odoo, "mcp_price_preview", model, values, line_id or 0,
+            )
+        except Exception as exc:  # noqa: BLE001 — mapped to guidance below
+            missing = _doc_helper_missing_response("price_preview", exc)
+            if missing:
+                return missing
+            raise
+        if not isinstance(result, dict) or not result.get("success"):
+            return {
+                "success": False,
+                "tool": "price_preview",
+                "error": (
+                    (result or {}).get("error")
+                    if isinstance(result, dict)
+                    else "price preview failed"
+                ),
+                "error_type": "preview_failed",
+                "retryable": False,
+            }
+        return {"success": True, "tool": "price_preview", "model": model, **result}
+    except Exception as e:
+        return error_response("price_preview", e, model=model)
 
 
 # ----- MCP Prompts -----
