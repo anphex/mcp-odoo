@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -54,6 +55,11 @@ WRITE_APPROVAL_TTL_SECONDS = 10 * 60
 # NESA A4: search_records without an explicit order used to inherit whatever
 # order Postgres happened to return, which makes offset paging silently lossy
 # (rows can repeat or disappear between pages).  Fall back to a total order.
+#
+# This makes paging deterministic, not transaction-safe: a record inserted or
+# deleted between two pages still shifts every following offset, and the page
+# and its total_count are read in separate RPC transactions.  For a snapshot,
+# page by keyset (``id < last_id_of_previous_page``) instead.
 DEFAULT_SEARCH_ORDER = "id desc"
 
 # NESA A1: transient (wizard) records are scratch space that ir.autovacuum
@@ -66,6 +72,11 @@ TRANSIENT_EXEMPT_METHODS = frozenset({"create", "write"})
 DOC_TEXT_WINDOW_DEFAULT = 8000
 DOC_TEXT_WINDOW_MAX = 40_000
 
+# NESA B4: mirrors the cap in nesa_mcp_bridge.  Rendering is the most
+# expensive path in the bridge — one QWeb render plus one wkhtmltopdf process
+# per record — so an unbounded record list could tie up the Odoo workers.
+MAX_REPORT_RECORDS = 20
+
 # NESA B2/B3/B4: Odoo-side helper model (nesa_mcp_bridge).  Kept in one
 # constant so a rename only has to happen here.
 NESA_DOC_HELPER_MODEL = "nesa.mcp.doc.helper"
@@ -73,14 +84,27 @@ NESA_DOC_HELPER_MODEL = "nesa.mcp.doc.helper"
 # Public ORM aliases that create or update records without spelling the
 # operation as create/write.  They must use the same preview/validation path
 # as direct CRUD instead of slipping through execute_method in parity mode.
+#
+# The list is derived from the public, RPC-reachable mutators on
+# ``odoo.models.BaseModel`` — a method is reachable unless it is name-private
+# or carries ``@api.private``.  ``update`` in particular reads like a helper
+# but assigns fields one by one, and on a persisted recordset each assignment
+# ends in ``write()``; ``toggle_active`` / ``action_archive`` /
+# ``action_unarchive`` write ``active`` directly.  Every one of them would
+# otherwise be a token-free write under native ACL parity.
 WRITE_EQUIVALENT_METHODS = frozenset({
+    "action_archive",
+    "action_unarchive",
     "copy",
     "copy_data",
     "copy_multi",
+    "copy_translations",
     "create_multi",
     "import_data",
     "load",
     "name_create",
+    "toggle_active",
+    "update",
     "update_field_translations",
     "web_override_translations",
     "web_save",
@@ -138,7 +162,7 @@ class AppContext:
     # NESA A1: ir.model.transient lookups per model name.  Cheap, but one
     # XML-RPC roundtrip per wizard call would defeat the point of the
     # exemption, so the answer is memoized for the lifespan.
-    transient_cache: Dict[str, bool] = field(default_factory=dict)
+    transient_cache: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     @property
     def odoo(self) -> OdooClient:
@@ -172,6 +196,12 @@ PREVIEW_TOOL = ToolAnnotations(
 )
 DESTRUCTIVE_TOOL = ToolAnnotations(
     readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True
+)
+# Neither read-only nor destructive: these tools leave a short-lived artefact
+# behind (a download token, a temporary PDF attachment) without touching a
+# business record.  Saying "read-only" would be a promise the tool breaks.
+SIDE_EFFECT_TOOL = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True
 )
 RESOURCE_HINT = Annotations(audience=["assistant"], priority=0.8)
 
@@ -416,25 +446,76 @@ def model_is_transient(
     "unknown" like "not transient" so an unreadable lookup can never widen the
     write guard.
     """
+    profile = transient_write_profile(app_context, odoo, model)
+    if profile is None:
+        return None
+    return bool(profile.get("transient"))
+
+
+def transient_write_profile(
+    app_context: AppContext, odoo: OdooClient, model: str
+) -> Optional[Dict[str, Any]]:
+    """Describe how harmless ``create``/``write`` on ``model`` really are.
+
+    Being transient is necessary for the exemption but not sufficient: an
+    Odoo wizard is free to override ``create``/``write`` and touch persistent
+    records from there — ``account.setup.bank.manual.config.create()`` creates
+    a ``res.bank``, ``account.financial.year.op.write()`` writes ``res.company``.
+    Exempting those from the approval chain would hand out token-free business
+    writes under the banner of "it's only a wizard".
+
+    So the decision is delegated to the Odoo side, which can actually look at
+    the class: ``nesa.mcp.doc.helper.mcp_transient_write_profile`` reports
+    whether the model overrides those methods or carries ``inverse`` fields.
+
+    Returns ``None`` when the profile could not be obtained — every caller
+    must then treat the model as persistent, so a missing bridge module or an
+    unreachable Odoo can only ever narrow the exemption, never widen it.
+    """
     cached = app_context.transient_cache.get(model)
     if cached is not None:
         return cached
     try:
-        rows = odoo.execute_method(
-            "ir.model",
-            "search_read",
-            [["model", "=", model]],
-            fields=["transient"],
-            limit=1,
-        )
+        profile = call_doc_helper(odoo, "mcp_transient_write_profile", model)
     except Exception:  # noqa: BLE001 — metadata lookup must never mask the call
-        logger.warning("[transient] ir.model lookup failed for model=%s", model)
+        logger.warning(
+            "[transient] write profile unavailable for model=%s — treating it "
+            "as persistent", model,
+        )
         return None
-    if not isinstance(rows, list) or not rows:
+    if not isinstance(profile, dict) or not profile.get("exists"):
         return None
-    is_transient = bool(rows[0].get("transient"))
-    app_context.transient_cache[model] = is_transient
-    return is_transient
+    app_context.transient_cache[model] = profile
+    return profile
+
+
+def transient_write_is_exempt(
+    app_context: AppContext, odoo: OdooClient, model: str, method: str
+) -> tuple[bool, Optional[Dict[str, Any]]]:
+    """Decide whether ``model.method`` may skip the approval chain.
+
+    Three things have to be true: the method is ``create`` or ``write``, the
+    model is transient, and that specific method is inert on it.  An explicit
+    allowlist entry (``ODOO_MCP_ALLOWED_SIDE_EFFECT_METHODS`` or the DB-side
+    allowlist) can still exempt a reviewed wizard whose override was read and
+    found harmless.
+    """
+    if method not in TRANSIENT_EXEMPT_METHODS:
+        return False, None
+    profile = transient_write_profile(app_context, odoo, model)
+    if profile is None:
+        return False, None
+    if not profile.get("transient"):
+        return False, profile
+    if profile.get(f"inert_{method}"):
+        return True, profile
+    if side_effect_method_allowed(model, method):
+        logger.info(
+            "[transient] %s.%s exempted through the reviewed allowlist despite "
+            "overrides=%s", model, method, profile.get("overrides"),
+        )
+        return True, profile
+    return False, profile
 
 
 def _binary_field_names(metadata: Dict[str, Any]) -> List[str]:
@@ -512,11 +593,58 @@ def classify_call_error(exc: BaseException) -> Dict[str, Any]:
     }
 
 
-def call_with_transport_retry(callback: Callable[[], Any], *, label: str) -> Any:
+# ORM entry points that only read.  A transport failure on one of these can
+# be retried safely; anything else may already have committed on the server.
+IDEMPOTENT_READ_METHODS = frozenset({
+    "default_get",
+    "exists",
+    "fields_get",
+    "get_views",
+    "name_get",
+    "name_search",
+    "read",
+    "read_group",
+    "search",
+    "search_count",
+    "search_fetch",
+    "search_read",
+    "web_read",
+    "web_read_group",
+    "web_search_read",
+})
+
+
+class UnknownOutcomeError(RuntimeError):
+    """A call was sent, the answer was lost, and the effect is unknown.
+
+    Odoo commits an RPC transaction *before* it writes the answer back to the
+    socket, so a timeout or a reset proves nothing about whether the work
+    happened.  Retrying a non-read method here would risk posting an invoice
+    or sending a mail twice, so the bridge stops and says so instead.
+    """
+
+    def __init__(self, label: str, cause: BaseException):
+        super().__init__(
+            f"{label} was sent to Odoo, but the answer was lost in transport. "
+            "The call may have completed on the server — it was NOT retried, "
+            "because repeating a non-read call could duplicate its effect. "
+            "Verify the record before trying again."
+        )
+        self.label = label
+        self.cause = cause
+
+
+def call_with_transport_retry(
+    callback: Callable[[], Any], *, label: str, idempotent: bool = True,
+) -> Any:
     """Run an Odoo call and retry it exactly once on a transport failure.
 
     Business failures (invalid domain, AccessError, ValidationError) are never
     retried — repeating them only doubles the cost of a deterministic error.
+
+    ``idempotent=False`` marks a call whose repetition could change the world
+    twice.  Such a call is never retried; a lost answer is reported as an
+    unknown outcome so the caller verifies instead of guessing.
     """
     try:
         return callback()
@@ -524,6 +652,12 @@ def call_with_transport_retry(callback: Callable[[], Any], *, label: str) -> Any
         classification = classify_call_error(exc)
         if not classification["retryable"]:
             raise
+        if not idempotent:
+            logger.warning(
+                "[retry] %s hit a transport error and is NOT retried "
+                "(non-idempotent): %s", label, exc,
+            )
+            raise UnknownOutcomeError(label, exc) from exc
         logger.warning(
             "[retry] %s failed with a transport error, retrying once: %s", label, exc,
         )
@@ -531,7 +665,6 @@ def call_with_transport_retry(callback: Callable[[], Any], *, label: str) -> Any
         return callback()
 
 
-_ERROR_TRACEBACK_TAIL_CHARS = 600
 # "ValueError: ...", "odoo.exceptions.AccessError: ...", "UserError: ..."
 _EXCEPTION_LINE_RE = re.compile(r"^[A-Za-z_][\w.]*(Error|Exception|Warning):\s")
 
@@ -541,8 +674,12 @@ def compact_error_message(exc: BaseException) -> tuple[str, Optional[str]]:
 
     Odoo answers a bad domain with a full server traceback. Repeating all of
     it makes the agent pay several thousand tokens to learn one sentence, so
-    the final exception line becomes the message and the rest is offered as a
-    bounded tail for debugging.
+    the final exception line becomes the message.
+
+    The second return value is the *full* un-escaped traceback, meant for the
+    server log only.  It is never part of a tool answer: an Odoo fault carries
+    absolute source paths and code lines, and the agent's answers can end up
+    in a chat transcript or a mail.
     """
     text = str(exc)
     if "Traceback (most recent call last)" not in text:
@@ -561,13 +698,18 @@ def compact_error_message(exc: BaseException) -> tuple[str, Optional[str]]:
             break
     if not cause:
         cause = lines[-1].strip() if lines else text
-    return cause, unescaped[-_ERROR_TRACEBACK_TAIL_CHARS:]
+    return cause, unescaped
 
 
 def error_response(tool: str, exc: BaseException, **extra: Any) -> Dict[str, Any]:
-    """Build a uniform, non-anonymous error payload for a failed tool call."""
+    """Build a uniform, non-anonymous error payload for a failed tool call.
+
+    The agent gets the cause line and a correlation id; the traceback stays in
+    the server log under that same id.  That keeps the answer readable and
+    keeps Odoo's internal paths out of whatever the agent quotes.
+    """
     classification = classify_call_error(exc)
-    message, traceback_tail = compact_error_message(exc)
+    message, full_traceback = compact_error_message(exc)
     response: Dict[str, Any] = {
         "success": False,
         "tool": tool,
@@ -575,8 +717,21 @@ def error_response(tool: str, exc: BaseException, **extra: Any) -> Dict[str, Any
         "error_type": classification["error_type"],
         "retryable": classification["retryable"],
     }
-    if traceback_tail:
-        response["error_traceback_tail"] = traceback_tail
+    if isinstance(exc, UnknownOutcomeError):
+        # The call was sent and the answer was lost — never presented as a
+        # clean failure, because the write may well have happened.
+        response["outcome_unknown"] = True
+        response["retryable"] = False
+        response["remedy"] = (
+            "Read the affected record back before repeating this call."
+        )
+    if full_traceback:
+        error_ref = uuid.uuid4().hex[:12]
+        response["error_ref"] = error_ref
+        logger.error(
+            "[error_ref=%s] %s failed: %s\n%s",
+            error_ref, tool, message, full_traceback,
+        )
     response.update(extra)
     return response
 
@@ -759,18 +914,27 @@ def resolve_read_fields(
     if fields is None:
         metadata = _cached_fields_metadata(app_context, odoo, model)
         if not metadata:
+            # Failing open here would mean fields=None → Odoo reads *every*
+            # field, binaries included — exactly the payload A10 exists to
+            # prevent.  Fall back to the two fields every model has.
             notes["fields_metadata_available"] = False
-            return None, notes
+            notes["warning"] = (
+                "fields_get metadata was unavailable, so the field selection "
+                "fell back to id/display_name instead of reading every field. "
+                "Name the fields you need explicitly."
+            )
+            return ["id", "display_name"], notes
         return select_smart_fields(metadata, max_fields=max_smart_fields()), notes
     if len(fields) == 1 and fields[0] == "*":
         metadata = _cached_fields_metadata(app_context, odoo, model)
         if not metadata:
-            notes["fields_metadata_available"] = False
-            notes["warning"] = (
-                "fields=['*'] could not be expanded because fields_get metadata "
-                "was unavailable; binary fields may be included."
+            # Same reasoning, but the caller explicitly asked for everything,
+            # so a silent narrowing would be a lie — refuse instead.
+            raise ValueError(
+                f"fields=['*'] cannot be expanded for {model}: fields_get "
+                "metadata is unavailable, and reading every field would "
+                "include binary payloads. Name the fields you need."
             )
-            return None, notes
         binary_fields = _binary_field_names(metadata)
         expanded = [name for name in metadata if name not in set(binary_fields)]
         notes["expanded_wildcard"] = True
@@ -2349,6 +2513,29 @@ def execute_approved_write(
         denied = hard_deny_result("execute_approved_write", model, operation)
         if denied:
             return denied
+        # Both gates below are local and cost nothing, and consuming the token
+        # is irreversible: the store deliberately does not re-arm the same
+        # deterministic token.  Checking them first means a forgotten
+        # confirm=true no longer burns a valid approval.
+        if not confirm:
+            return {
+                "success": False,
+                "tool": "execute_approved_write",
+                "error": "confirm=true is required for destructive execution",
+                "reason_code": "confirm_missing",
+                "remedy": "Repeat this call with confirm=true. The token is still valid.",
+            }
+        if not writes_enabled():
+            return {
+                "success": False,
+                "tool": "execute_approved_write",
+                "error": "write execution disabled; set ODOO_MCP_ENABLE_WRITES=1 to enable",
+                "reason_code": "writes_disabled",
+                "remedy": (
+                    "This is a deployment setting, not a permission problem. "
+                    "The token was not consumed."
+                ),
+            }
         app_context = ctx.request_context.lifespan_context
         validation_record = require_validated_write_approval(app_context, approval)
         if not validation_record.get("ok"):
@@ -2405,18 +2592,6 @@ def execute_approved_write(
                 "tool": "execute_approved_write",
                 "error": "approval payload does not match the stored validation record",
             }
-        if not confirm:
-            return {
-                "success": False,
-                "tool": "execute_approved_write",
-                "error": "confirm=true is required for destructive execution",
-            }
-        if not writes_enabled():
-            return {
-                "success": False,
-                "tool": "execute_approved_write",
-                "error": "write execution disabled; set ODOO_MCP_ENABLE_WRITES=1 to enable",
-            }
 
         values = dict(approval.get("values") or {})
         record_ids = [int(record_id) for record_id in approval.get("record_ids") or []]
@@ -2450,7 +2625,7 @@ def execute_approved_write(
             ]
         return response
     except Exception as e:
-        return {"success": False, "tool": "execute_approved_write", "error": str(e)}
+        return error_response("execute_approved_write", e)
 
 
 @mcp.tool(
@@ -2649,6 +2824,8 @@ def execute_method(
                 "classification": safety,
             }
         transient_model = False
+        transient_profile: Optional[Dict[str, Any]] = None
+        exempt = False
         gated_method = (
             method in DESTRUCTIVE_METHODS or method in WRITE_EQUIVALENT_METHODS
         )
@@ -2657,14 +2834,30 @@ def execute_method(
             # records live in scratch tables that ir.autovacuum clears, so
             # forcing them through preview -> validate -> execute cost four
             # calls per wizard field and bought no safety.  unlink and the
-            # write-equivalent aliases stay on the chain regardless.
-            transient_model = bool(
-                model_is_transient(app_context, app_context.odoo, model)
+            # write-equivalent aliases stay on the chain regardless — and so
+            # does any wizard that overrides create/write, because those
+            # overrides can and do write persistent records.
+            exempt, transient_profile = transient_write_is_exempt(
+                app_context, app_context.odoo, model, method,
             )
-        if gated_method and not (
-            transient_model and method in TRANSIENT_EXEMPT_METHODS
-        ):
-            if transient_model:
+            if transient_profile is None:
+                transient_profile = transient_write_profile(
+                    app_context, app_context.odoo, model,
+                )
+            transient_model = bool((transient_profile or {}).get("transient"))
+        if gated_method and not exempt:
+            if transient_model and method in TRANSIENT_EXEMPT_METHODS:
+                overrides = (transient_profile or {}).get("overrides") or []
+                inverse_fields = (transient_profile or {}).get("inverse_fields") or []
+                reason = (
+                    f"{model} is transient, but {method!r} is not inert on it "
+                    f"(overrides={list(overrides)}, "
+                    f"inverse_fields={list(inverse_fields)[:5]}), so it can "
+                    "write persistent records. Use validate_write -> "
+                    "execute_approved_write, or have the override reviewed and "
+                    f"add '{model}.{method}' to the side-effect allowlist."
+                )
+            elif transient_model:
                 reason = (
                     f"{method!r} stays on the approved-write chain even for "
                     "transient models — only create and write are exempt. Use "
@@ -2676,7 +2869,8 @@ def execute_method(
                     "aliases on persistent models. Use validate_write -> "
                     "execute_approved_write (preview_write is an optional "
                     "read-only dry run). Transient wizard models accept "
-                    "create/write directly."
+                    "create/write directly as long as they do not override "
+                    "those methods."
                 )
             return {
                 "success": False,
@@ -2724,6 +2918,7 @@ def execute_method(
         result = call_with_transport_retry(
             lambda: odoo.execute_method(model, method, *call_args, **call_kwargs),
             label=f"{model}.{method}",
+            idempotent=method in IDEMPOTENT_READ_METHODS,
         )
         response: Dict[str, Any] = {"success": True, "result": result}
         if transient_model:
@@ -2823,7 +3018,9 @@ def get_model_fields(
         "Search Odoo records with read-only search_read. Returns the page in "
         "'result' plus 'total_count' (all matches, not just this page), "
         "'has_more' and 'next_offset' for paging. Without an explicit 'order' "
-        "the result is sorted by 'id desc' so paging stays stable."
+        "the result is sorted by 'id desc'. That makes paging deterministic "
+        "but not snapshot-safe: records created or deleted while you page "
+        "still shift the offsets, so page by 'id < last_id' when that matters."
     ),
     annotations=READ_ONLY_TOOL,
     structured_output=True,
@@ -2882,8 +3079,13 @@ def search_records(
             if isinstance(counted, int):
                 total_count = counted
         except Exception as count_exc:  # noqa: BLE001 — page result is still valid
-            count_error = str(count_exc)
-            logger.warning("[search_records] search_count failed: %s", count_exc)
+            # Same rule as error_response: cause line to the agent, full
+            # traceback only to the log.
+            count_error, count_traceback = compact_error_message(count_exc)
+            logger.warning(
+                "[search_records] search_count failed: %s\n%s",
+                count_error, count_traceback or "",
+            )
 
         returned = len(records)
         if total_count is None:
@@ -3700,9 +3902,10 @@ def read_attachment(
     description=(
         "Create a time-limited HTTPS download link for the unmodified original "
         "file of an attachment. Use it to hand a file to a person or to attach "
-        "it to a mail draft."
+        "it to a mail draft. Issues a short-lived token, so it is not a pure "
+        "read."
     ),
-    annotations=READ_ONLY_TOOL,
+    annotations=SIDE_EFFECT_TOOL,
     structured_output=True,
 )
 def create_attachment_download(
@@ -3710,12 +3913,18 @@ def create_attachment_download(
     attachment_id: int,
     ttl_seconds: int = 900,
     model: str = "ir.attachment",
+    max_downloads: int = 1,
 ) -> Dict[str, Any]:
     """Mint a single-purpose, expiring download URL for one attachment.
 
     The link is issued by ``nesa_mcp_bridge`` and only after Odoo confirmed
     that the acting user may read the attachment. It expires on its own; no
     permanent public access token is written onto the record.
+
+    The token sits in the URL path, so it also lands in the web server's
+    access log. ``max_downloads`` therefore defaults to 1: once the recipient
+    has fetched the file, a later log reader gains nothing. Raise it only when
+    the same link genuinely has to work more than once.
     """
     odoo = ctx.request_context.lifespan_context.odoo
     try:
@@ -3724,10 +3933,15 @@ def create_attachment_download(
             raise ValueError("attachment_id must be greater than 0")
         if ttl_seconds < 60:
             raise ValueError("ttl_seconds must be at least 60")
+        if max_downloads < 0:
+            raise ValueError(
+                "max_downloads must be 0 (unlimited until expiry) or greater"
+            )
         resolved_id = _resolve_attachment_id(odoo, model, attachment_id)
         try:
             result = call_doc_helper(
                 odoo, "mcp_create_download", resolved_id, ttl_seconds,
+                max_downloads,
             )
         except Exception as exc:  # noqa: BLE001 — mapped to guidance below
             missing = _doc_helper_missing_response("create_attachment_download", exc)
@@ -3756,9 +3970,11 @@ def create_attachment_download(
 @mcp.tool(
     description=(
         "Render an Odoo QWeb PDF report (invoice, quotation, delivery slip) for "
-        "one or more records and return a time-limited download link."
+        "one or more records and return a time-limited download link. Rendering "
+        "costs a wkhtmltopdf run per record and leaves a temporary attachment, "
+        "so it is capped and not a pure read."
     ),
-    annotations=READ_ONLY_TOOL,
+    annotations=SIDE_EFFECT_TOOL,
     structured_output=True,
 )
 def render_report(
@@ -3787,6 +4003,14 @@ def render_report(
             raise ValueError("record_ids must contain at least one ID")
         if any(record_id < 1 for record_id in normalized_ids):
             raise ValueError("record_ids must all be greater than 0")
+        if len(normalized_ids) > MAX_REPORT_RECORDS:
+            # Odoo enforces the same cap; refusing here saves the roundtrip and
+            # names the number the caller has to split by.
+            raise ValueError(
+                f"record_ids is capped at {MAX_REPORT_RECORDS} per call "
+                f"({len(normalized_ids)} given) — each record costs a QWeb "
+                "render plus a wkhtmltopdf run"
+            )
         if not str(report_ref).strip():
             raise ValueError("report_ref must be a non-empty report XML ID")
         if ttl_seconds < 60:

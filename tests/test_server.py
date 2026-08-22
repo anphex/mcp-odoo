@@ -1944,9 +1944,12 @@ def test_resolve_read_fields_returns_none_when_metadata_unavailable():
     resolved, notes = server.resolve_read_fields(
         app_context, app_context.odoo, "res.partner", None
     )
-    # No metadata → fall back to "all fields" (None) so the search still works
-    assert resolved is None
+    # NESA A10: no metadata must NOT fall back to "all fields" — that is how a
+    # single read of ir.attachment returns megabytes of base64.  Fall back to
+    # the two fields every model has and say so.
+    assert resolved == ["id", "display_name"]
     assert notes["fields_metadata_available"] is False
+    assert "fell back" in notes["warning"]
 
 
 def test_resolve_read_fields_treats_empty_metadata_as_no_smart():
@@ -1960,7 +1963,7 @@ def test_resolve_read_fields_treats_empty_metadata_as_no_smart():
     resolved, _notes = server.resolve_read_fields(
         app_context, app_context.odoo, "res.partner", None
     )
-    assert resolved is None
+    assert resolved == ["id", "display_name"]
 
 
 def test_resolve_read_fields_passes_explicit_fields_through():

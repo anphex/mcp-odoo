@@ -9,6 +9,7 @@ the bridge.
 """
 
 import importlib
+import json
 
 import pytest
 
@@ -36,16 +37,35 @@ def server():
 
 
 class _WizardClient:
-    """Odoo double where ``x.wizard`` is transient and ``account.move`` is not."""
+    """Odoo double where ``x.wizard`` is transient and ``account.move`` is not.
 
-    def __init__(self):
+    ``overrides`` names the models whose create/write are overridden — those
+    are transient too, but writing them can reach persistent records, which is
+    exactly the case the exemption must not cover.
+    """
+
+    def __init__(self, overrides=(), inverse_fields=()):
         self.calls = []
+        self.overrides = dict(overrides)
+        self.inverse_fields = dict(inverse_fields)
 
     def execute_method(self, model, method, *args, **kwargs):
         self.calls.append((model, method))
-        if model == "ir.model" and method == "search_read":
-            requested = args[0][0][2]
-            return [{"id": 1, "transient": requested.endswith(".wizard")}]
+        if model == "nesa.mcp.doc.helper" and method == "mcp_transient_write_profile":
+            requested = args[0]
+            transient = requested.endswith(".wizard")
+            overrides = list(self.overrides.get(requested, []))
+            inverse_fields = list(self.inverse_fields.get(requested, []))
+            clean = not inverse_fields
+            return {
+                "model": requested,
+                "exists": True,
+                "transient": transient,
+                "inert_create": transient and clean and "create" not in overrides,
+                "inert_write": transient and clean and "write" not in overrides,
+                "overrides": overrides,
+                "inverse_fields": inverse_fields,
+            }
         if method in {"create", "write"}:
             return 42 if method == "create" else True
         raise AssertionError(f"unexpected call {model}.{method}")
@@ -116,8 +136,85 @@ def test_a1_transient_lookup_is_cached(server):
     ctx = _Ctx(client)
     server.execute_method(ctx, "x.wizard", "create", args=[{}])
     server.execute_method(ctx, "x.wizard", "create", args=[{}])
-    ir_model_calls = [call for call in client.calls if call[0] == "ir.model"]
-    assert len(ir_model_calls) == 1
+    profile_calls = [
+        call for call in client.calls if call[0] == "nesa.mcp.doc.helper"
+    ]
+    assert len(profile_calls) == 1
+
+
+@pytest.mark.parametrize("method", ["create", "write"])
+def test_a1_transient_model_with_overridden_write_stays_on_the_chain(server, method):
+    """Negative test: transient is not the same as free of side effects.
+
+    ``account.setup.bank.manual.config.create()`` creates a persistent
+    ``res.bank``; ``account.financial.year.op.write()`` writes ``res.company``.
+    Both are transient, so a blanket exemption would hand out token-free
+    business writes.
+    """
+    client = _WizardClient(overrides={"account.setup.wizard": [method]})
+    blocked = server.execute_method(
+        _Ctx(client), "account.setup.wizard", method, args=[[1], {}],
+    )
+    assert blocked["success"] is False
+    assert blocked["transient_model"] is True
+    assert "not inert" in blocked["error"]
+    assert method not in {call[1] for call in client.calls}
+
+
+def test_a1_transient_model_with_inverse_field_stays_on_the_chain(server):
+    """An ``inverse`` method runs on write and is arbitrary code."""
+    client = _WizardClient(inverse_fields={"x.wizard": ["partner_ref"]})
+    blocked = server.execute_method(
+        _Ctx(client), "x.wizard", "write", args=[[1], {"partner_ref": "A"}],
+    )
+    assert blocked["success"] is False
+    assert blocked["transient_model"] is True
+    assert "partner_ref" in blocked["error"]
+
+
+def test_a1_reviewed_override_can_be_allowlisted(server, monkeypatch):
+    """The escape hatch is explicit and per model.method, never a class."""
+    monkeypatch.setenv(
+        "ODOO_MCP_ALLOWED_SIDE_EFFECT_METHODS", "account.setup.wizard.write",
+    )
+    client = _WizardClient(overrides={"account.setup.wizard": ["write"]})
+    allowed = server.execute_method(
+        _Ctx(client), "account.setup.wizard", "write", args=[[1], {}],
+    )
+    assert allowed["success"] is True
+
+
+def test_a1_missing_bridge_profile_is_treated_as_persistent(server):
+    """Without the Odoo-side helper the exemption must simply not apply."""
+
+    class _NoHelper:
+        def execute_method(self, model, method, *args, **kwargs):
+            if model == "nesa.mcp.doc.helper":
+                raise RuntimeError("model does not exist")
+            raise AssertionError("must not reach the write")
+
+    blocked = server.execute_method(
+        _Ctx(_NoHelper()), "x.wizard", "write", args=[[1], {}],
+    )
+    assert blocked["success"] is False
+    assert blocked["transient_model"] is False
+
+
+@pytest.mark.parametrize(
+    "method", ["update", "toggle_active", "action_archive", "action_unarchive"],
+)
+def test_a1_public_orm_mutator_aliases_stay_on_the_chain(server, method):
+    """Negative test: ``update`` and the archive helpers are writes.
+
+    They are public on ``BaseModel`` and therefore RPC-reachable, and each of
+    them ends in ``write()`` — under native ACL parity they would otherwise be
+    token-free writes on any persistent model.
+    """
+    blocked = server.execute_method(
+        _Ctx(_WizardClient()), "res.partner", method, args=[[7], {"name": "x"}],
+    )
+    assert blocked["success"] is False
+    assert "validate_write" in blocked["error"]
 
 
 # ----- A3/A4: honest counts and a deterministic order ---------------------
@@ -224,6 +321,59 @@ def test_a6_transport_error_is_retried_once(server):
 
     assert server.call_with_transport_retry(flaky, label="probe") == "ok"
     assert len(attempts) == 2
+
+
+def test_a6_non_idempotent_call_is_never_retried(server):
+    """Odoo commits before it answers, so a lost answer is not a failed call.
+
+    Retrying ``action_post`` after a timeout could post the same invoice
+    twice; the bridge has to say "unknown outcome" instead.
+    """
+    attempts = []
+
+    def flaky():
+        attempts.append(1)
+        raise ConnectionResetError("connection reset by peer")
+
+    with pytest.raises(server.UnknownOutcomeError):
+        server.call_with_transport_retry(
+            flaky, label="account.move.action_post", idempotent=False,
+        )
+    assert len(attempts) == 1
+
+
+def test_a6_unknown_outcome_is_reported_as_such(server, monkeypatch):
+    monkeypatch.setenv(
+        "ODOO_MCP_ALLOWED_SIDE_EFFECT_METHODS", "account.move.action_post",
+    )
+
+    class _Lost:
+        def execute_method(self, model, method, *args, **kwargs):
+            if model == "nesa.mcp.doc.helper":
+                raise AssertionError("no write profile needed for a read method")
+            raise ConnectionResetError("connection reset by peer")
+
+    result = server.execute_method(
+        _Ctx(_Lost()), "account.move", "action_post", args=[[1]],
+    )
+    assert result["success"] is False
+    assert result["outcome_unknown"] is True
+    assert result["retryable"] is False
+    assert "Read the affected record back" in result["remedy"]
+
+
+def test_a6_traceback_never_reaches_the_answer(server):
+    """The cause line is useful; Odoo's source paths are not the agent's business."""
+    fault = RuntimeError(
+        'Traceback (most recent call last):\\n  File "/opt/odoo/models.py", '
+        'line 42, in write\\n    raise ValueError(...)\\nValueError: '
+        "Invalid field account.move.no_such_field in leaf"
+    )
+    response = server.error_response("execute_method", fault)
+    assert "no_such_field" in response["error"]
+    assert "error_traceback_tail" not in response
+    assert "/opt/odoo/models.py" not in json.dumps(response)
+    assert len(response["error_ref"]) == 12
 
 
 def test_a6_business_error_is_raised_immediately(server):
@@ -619,3 +769,56 @@ def test_b9_rejects_non_mapping_values(server):
     result = server.price_preview(_Ctx(_DocClient()), "sale.order.line", None)
     assert result["success"] is False
     assert "values" in result["error"]
+
+
+# ----- Follow-ups from the adversarial review (2026-08-22) ----------------
+
+
+def test_wildcard_refuses_when_metadata_is_unavailable(server):
+    """A10 must fail closed: no metadata is not a licence to read everything."""
+
+    class _NoMeta:
+        def get_model_fields(self, model):
+            return {"error": "Access denied"}
+
+    ctx = _Ctx(_NoMeta())
+    life = ctx.request_context.lifespan_context
+    with pytest.raises(ValueError, match="binary payloads"):
+        server.resolve_read_fields(life, life.odoo, "ir.attachment", ["*"])
+
+
+def test_confirm_false_does_not_consume_the_approval_token(server, monkeypatch):
+    """The store never re-arms the same token, so a local gate must run first."""
+    consumed = []
+
+    def _spy(app_context, approval):
+        consumed.append(approval)
+        return {"ok": True, "payload": {}}
+
+    monkeypatch.setattr(server, "require_validated_write_approval", _spy)
+    agent_tools = importlib.import_module("odoo_mcp.agent_tools")
+    payload = {
+        "model": "res.partner",
+        "operation": "write",
+        "record_ids": [1],
+        "values": {"name": "x"},
+        "context": {},
+    }
+    approval = {**payload, "token": agent_tools.build_approval_token(payload)}
+
+    result = server.execute_approved_write(_Ctx(_WizardClient()), approval, confirm=False)
+
+    assert result["success"] is False
+    assert result["reason_code"] == "confirm_missing"
+    assert consumed == [], "token was consumed before the confirm gate"
+
+
+def test_render_report_caps_the_record_count(server):
+    result = server.render_report(
+        _Ctx(_DocClient()),
+        "account.move",
+        list(range(1, server.MAX_REPORT_RECORDS + 2)),
+        "account.account_invoices",
+    )
+    assert result["success"] is False
+    assert str(server.MAX_REPORT_RECORDS) in result["error"]
