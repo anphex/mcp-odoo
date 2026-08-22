@@ -172,14 +172,31 @@ def test_a1_transient_model_with_inverse_field_stays_on_the_chain(server):
     assert "partner_ref" in blocked["error"]
 
 
-def test_a1_reviewed_override_can_be_allowlisted(server, monkeypatch):
-    """The escape hatch is explicit and per model.method, never a class."""
+def test_a1_allowlist_entry_does_not_override_the_profile(server, monkeypatch):
+    """Both conditions must hold: named on the allowlist AND inert.
+
+    The allowlist decides *whether a model is eligible at all*; the profile
+    can still veto. That way a wizard that gains a create/write override in a
+    later Odoo version silently falls back to the approval chain instead of
+    staying exempt on the strength of an old review.
+    """
     monkeypatch.setenv(
         "ODOO_MCP_ALLOWED_SIDE_EFFECT_METHODS", "account.setup.wizard.write",
     )
     client = _WizardClient(overrides={"account.setup.wizard": ["write"]})
-    allowed = server.execute_method(
+    blocked = server.execute_method(
         _Ctx(client), "account.setup.wizard", "write", args=[[1], {}],
+    )
+    assert blocked["success"] is False
+    assert "not inert" in blocked["error"]
+
+
+def test_a1_allowlist_entry_makes_a_reviewed_wizard_eligible(server, monkeypatch):
+    monkeypatch.setenv(
+        "ODOO_MCP_ALLOWED_SIDE_EFFECT_METHODS", "some.other.wizard.write",
+    )
+    allowed = server.execute_method(
+        _Ctx(_WizardClient()), "some.other.wizard", "write", args=[[1], {}],
     )
     assert allowed["success"] is True
 
@@ -822,3 +839,63 @@ def test_render_report_caps_the_record_count(server):
     )
     assert result["success"] is False
     assert str(server.MAX_REPORT_RECORDS) in result["error"]
+
+
+def test_a1_unreviewed_wizard_is_not_exempt(server):
+    """The allowlist is the positive authorizer, not the transient flag.
+
+    Being transient cannot prove that a write stays inside the wizard —
+    x2many commands, _inherits and constraints all reach further — so a model
+    has to be reviewed and named before it is exempt.
+    """
+    client = _WizardClient()
+    blocked = server.execute_method(
+        _Ctx(client), "some.unreviewed.wizard", "write", args=[[1], {"x": 1}],
+    )
+    assert blocked["success"] is False
+    assert blocked["transient_model"] is True
+    assert "not been reviewed" in blocked["error"]
+
+
+@pytest.mark.parametrize("command", [0, 1, 2, 3])
+def test_a1_x2many_commands_cannot_write_through_the_wizard(server, command):
+    """base.language.install carries a Many2many('res.lang').
+
+    A (2, id) command on such a field deletes a persistent language record,
+    so the exempt path only accepts linking commands.
+    """
+
+    class _RelationClient(_WizardClient):
+        def get_model_fields(self, model):
+            return {
+                "id": {"type": "integer"},
+                "lang_ids": {"type": "many2many", "relation": "res.lang"},
+            }
+
+    client = _RelationClient()
+    blocked = server.execute_method(
+        _Ctx(client),
+        "nesa.shk.product.match.wizard",
+        "write",
+        args=[[1], {"lang_ids": [[command, 7, {"name": "x"}]]}],
+    )
+    assert blocked["success"] is False
+    assert "x2many command" in blocked["error"]
+    assert "write" not in {call[1] for call in client.calls}
+
+
+def test_a1_linking_commands_stay_allowed(server):
+    class _RelationClient(_WizardClient):
+        def get_model_fields(self, model):
+            return {
+                "id": {"type": "integer"},
+                "lang_ids": {"type": "many2many", "relation": "res.lang"},
+            }
+
+    allowed = server.execute_method(
+        _Ctx(_RelationClient()),
+        "nesa.shk.product.match.wizard",
+        "write",
+        args=[[1], {"lang_ids": [[6, 0, [1, 2]]]}],
+    )
+    assert allowed["success"] is True

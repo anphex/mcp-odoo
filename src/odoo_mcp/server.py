@@ -68,6 +68,19 @@ DEFAULT_SEARCH_ORDER = "id desc"
 # alias stay on the approval chain even for transient models.
 TRANSIENT_EXEMPT_METHODS = frozenset({"create", "write"})
 
+# Reviewed wizards that may be filled in without the approval chain.  This is
+# the positive authorizer and it is code-owned on purpose: a heuristic cannot
+# prove that writing a record has no persistent effect, so a model earns its
+# place here by having been read.  The deployment can add further exact
+# ``model.method`` pairs through the side-effect allowlist (env or the
+# ``nesa.mcp.allowed_method`` model) without touching this file.
+TRANSIENT_EXEMPT_MODELS = frozenset({
+    # Dealer product search: Char search term, Boolean, m2o to a product, and
+    # a one2many whose comodel is itself transient.  No create/write override.
+    "nesa.shk.product.match.wizard",
+    "nesa.shk.product.match.wizard.result",
+})
+
 # NESA B1/B2: bounded text windows so a single OCR read cannot flood context.
 DOC_TEXT_WINDOW_DEFAULT = 8000
 DOC_TEXT_WINDOW_MAX = 40_000
@@ -494,28 +507,83 @@ def transient_write_is_exempt(
 ) -> tuple[bool, Optional[Dict[str, Any]]]:
     """Decide whether ``model.method`` may skip the approval chain.
 
-    Three things have to be true: the method is ``create`` or ``write``, the
-    model is transient, and that specific method is inert on it.  An explicit
-    allowlist entry (``ODOO_MCP_ALLOWED_SIDE_EFFECT_METHODS`` or the DB-side
-    allowlist) can still exempt a reviewed wizard whose override was read and
-    found harmless.
+    The positive authorizer is the **allowlist**, not the heuristic.  A
+    property like "writing this record has no persistent effect" cannot be
+    proven from outside: x2many commands reach into the comodel, ``_inherits``
+    forwards writes to a parent table, constraints and computes run arbitrary
+    code.  So a model only becomes eligible by being reviewed and named —
+    either in ``TRANSIENT_EXEMPT_MODELS`` here, or as an exact
+    ``model.method`` entry in the deployment's side-effect allowlist.
+
+    On top of that the Odoo-side profile still has to agree that the model is
+    transient and that this method is inert on it.  Both conditions must hold,
+    so the heuristic can only ever narrow the allowlist, never widen it.
     """
     if method not in TRANSIENT_EXEMPT_METHODS:
         return False, None
+    listed = (
+        model in TRANSIENT_EXEMPT_MODELS
+        or side_effect_method_allowed(model, method)
+    )
+    if not listed:
+        return False, transient_write_profile(app_context, odoo, model)
     profile = transient_write_profile(app_context, odoo, model)
     if profile is None:
         return False, None
     if not profile.get("transient"):
-        return False, profile
-    if profile.get(f"inert_{method}"):
-        return True, profile
-    if side_effect_method_allowed(model, method):
-        logger.info(
-            "[transient] %s.%s exempted through the reviewed allowlist despite "
-            "overrides=%s", model, method, profile.get("overrides"),
+        # An allowlist entry does not turn a persistent model into a wizard.
+        logger.warning(
+            "[transient] %s is allowlisted for %s but is not transient — "
+            "keeping it on the approval chain", model, method,
         )
-        return True, profile
-    return False, profile
+        return False, profile
+    if not profile.get(f"inert_{method}"):
+        logger.warning(
+            "[transient] %s.%s is allowlisted but the model overrides %s — "
+            "keeping it on the approval chain", model, method,
+            profile.get("overrides"),
+        )
+        return False, profile
+    return True, profile
+
+
+# Values that mutate the *other* side of a relation: create (0), update (1),
+# delete (2) and, on a one2many, unlink (3) — all of them write comodel rows.
+# Linking commands (4/5/6) only touch the relation itself.
+_MUTATING_X2MANY_COMMANDS = frozenset({0, 1, 2, 3})
+_X2MANY_TYPES = frozenset({"one2many", "many2many"})
+
+
+def x2many_commands_are_inert(
+    app_context: AppContext, odoo: OdooClient, model: str, values: Any
+) -> Optional[str]:
+    """Return a reason when ``values`` would write through a relation.
+
+    Even a wizard that never overrides ``create``/``write`` can reach
+    persistent data: ``base.language.install`` carries a
+    ``Many2many('res.lang')``, and a ``(2, id)`` command on it deletes a
+    language.  The exempt path therefore accepts only linking commands.
+
+    Returns ``None`` when nothing objectionable was found.
+    """
+    if not isinstance(values, dict) or not values:
+        return None
+    metadata = _cached_fields_metadata(app_context, odoo, model)
+    for field_name, value in values.items():
+        field_type = (metadata.get(field_name) or {}).get("type")
+        if field_type not in _X2MANY_TYPES or not isinstance(value, (list, tuple)):
+            continue
+        for command in value:
+            if not isinstance(command, (list, tuple)) or not command:
+                continue
+            if command[0] in _MUTATING_X2MANY_COMMANDS:
+                return (
+                    f"{field_name} carries x2many command {command[0]}, which "
+                    "creates, updates or deletes records on the other side of "
+                    "the relation. Only linking commands (4/5/6) run without "
+                    "the approval chain."
+                )
+    return None
 
 
 def _binary_field_names(metadata: Dict[str, Any]) -> List[str]:
@@ -2826,6 +2894,7 @@ def execute_method(
         transient_model = False
         transient_profile: Optional[Dict[str, Any]] = None
         exempt = False
+        relation_block: Optional[str] = None
         gated_method = (
             method in DESTRUCTIVE_METHODS or method in WRITE_EQUIVALENT_METHODS
         )
@@ -2840,23 +2909,51 @@ def execute_method(
             exempt, transient_profile = transient_write_is_exempt(
                 app_context, app_context.odoo, model, method,
             )
+            if exempt:
+                # Defense in depth: even a reviewed wizard must not be used as
+                # a pipe into a persistent comodel via x2many commands.
+                candidate_values = None
+                if method == "create" and args:
+                    candidate_values = args[0]
+                elif method == "write" and len(args or []) > 1:
+                    candidate_values = args[1]
+                relation_reason = x2many_commands_are_inert(
+                    app_context, app_context.odoo, model, candidate_values,
+                )
+                if relation_reason:
+                    exempt = False
+                    relation_block = relation_reason
             if transient_profile is None:
                 transient_profile = transient_write_profile(
                     app_context, app_context.odoo, model,
                 )
             transient_model = bool((transient_profile or {}).get("transient"))
         if gated_method and not exempt:
-            if transient_model and method in TRANSIENT_EXEMPT_METHODS:
+            if relation_block:
+                reason = (
+                    f"{relation_block} Use validate_write -> "
+                    "execute_approved_write for this write."
+                )
+            elif transient_model and method in TRANSIENT_EXEMPT_METHODS:
                 overrides = (transient_profile or {}).get("overrides") or []
                 inverse_fields = (transient_profile or {}).get("inverse_fields") or []
-                reason = (
-                    f"{model} is transient, but {method!r} is not inert on it "
-                    f"(overrides={list(overrides)}, "
-                    f"inverse_fields={list(inverse_fields)[:5]}), so it can "
-                    "write persistent records. Use validate_write -> "
-                    "execute_approved_write, or have the override reviewed and "
-                    f"add '{model}.{method}' to the side-effect allowlist."
-                )
+                if not overrides and not inverse_fields:
+                    reason = (
+                        f"{model} is a transient wizard, but it has not been "
+                        "reviewed for direct writes. Use validate_write -> "
+                        "execute_approved_write, or have the model reviewed "
+                        f"and add '{model}.{method}' to the side-effect "
+                        "allowlist. Being transient is not on its own a "
+                        "guarantee that writing it stays inside the wizard."
+                    )
+                else:
+                    reason = (
+                        f"{model} is transient, but {method!r} is not inert on "
+                        f"it (overrides={list(overrides)}, "
+                        f"inverse_fields={list(inverse_fields)[:5]}), so it can "
+                        "write persistent records. Use validate_write -> "
+                        "execute_approved_write."
+                    )
             elif transient_model:
                 reason = (
                     f"{method!r} stays on the approved-write chain even for "
