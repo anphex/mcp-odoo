@@ -201,6 +201,14 @@ den Fixes aus Runde 1:
 | MAJOR: `image_process()` lief ohne `verify_resolution=True`, das 50-Megapixel-Limit griff also nie. | Aktiviert. |
 | MAJOR: Das nginx-Snippet referenzierte einen Upstream und eine Zone, die es auf diesem Host nicht gibt. | Echte Zone-Datei plus je ein Snippet für Staging (3014) und Production (3012). |
 
+### Runde 5 — Review vor der Main-Promotion (2026-08-22)
+
+| Fund | Fix |
+|---|---|
+| MAJOR: `mcp_render_report` rief generisch `_render_qweb_pdf()` auf. `nesa_fsm_advanced_worksheet_report` überschreibt die Methode, archiviert danach per `sudo()` ein PDF am Einsatz und schreibt Chatter — die Nullstunden-Rückfrage hängt dagegen an der markierten HTTP-Druckroute, die ein RPC-Render nicht durchläuft. Aus Leserecht auf `project.task` wurde ein persistenter Write ohne Druckbestätigung. | Zwei Systemparameter entscheiden, nicht der Aufrufer: `nesa.mcp.report_render_allowlist` (leer = nichts renderbar) und `nesa.mcp.report_render_blocklist` (gewinnt immer, Default `industry_fsm.worksheet_custom`). |
+| MAJOR: Auf Production fehlte die Download-Location; der Token wäre über `location /` in `access.log` gelandet — und per 308 zusätzlich an den `nesa.de`-vHost weitergereicht. Port 80 protokolliert ihn beim Redirect ebenfalls. | Snippets für 443 **und** 80, je Instanz: `mcp-download-route-{production,staging}.conf` und `mcp-download-route-{production,staging}-http.conf`. Auf Staging installiert und belegt: Kontrollpfad steht im Log, Token-Pfad nicht. |
+| MAJOR: `nesa_mcp_doc_helper.py` lag bei 598 Zeilen und vereinte vier eigenständige Sicherheitsgrenzen (400-Zeilen-Cap aus `PROJECT_REFERENCE.md`). | Aufgeteilt in Basis + `nesa_mcp_attachment_helper.py`, `nesa_mcp_report_helper.py`, `nesa_mcp_price_helper.py`; Tests entsprechend in vier Dateien plus `tests/common.py`. |
+
 ### Review-Backlog (Zukunft)
 
 * Der Atomaritaets-Test des Download-Tokens ruft `_consume()` zweimal
