@@ -271,3 +271,27 @@ steht zusaetzlich in `NON_DELEGABLE_METHOD_PREFIXES`, damit ein Agent nicht per
 Odoo-Gegenseite: `nesa_mcp_bridge` ab 18.0.1.6.0 (`nesa.mcp.upload.token`,
 `models/nesa_mcp_upload_helper.py`, `controllers/mcp_upload.py`,
 nginx-Snippet `nesa_patches/nginx/mcp-upload-route-*.conf`).
+
+### In welchen Vhost die Token-Routen gehoeren
+
+Der Token steht im Pfad und IST die Autorisierung. Er darf deshalb in keiner
+Logzeile stehen — und entscheidend ist nicht, welcher Vhost "der Odoo-Vhost"
+heisst, sondern welcher Host in `web.base.url` steht, denn danach baut Odoo den
+Link.
+
+| Instanz | `web.base.url` | Vhost, der die Routen-Snippets braucht |
+| --- | --- | --- |
+| Production | `https://nesa.de` | `odoo_https_nesa_de.conf` (`server_name nesa.de`) — plus der Alias `odoo_https_nesa-main.conf` fuer Alt-Links |
+| Staging | `https://staging-odoo.nesa.de` | `odoo_https_staging-odoo_nesa_de.conf` |
+
+Jeder Vhost, der solche Anfragen nur weiterleitet (`www.nesa.de`, Port 80),
+bekommt `mcp-token-routes-nesade-redirect.conf`: gleiche Umleitung, nur ohne
+Logzeile.
+
+Am 2026-08-29 beim Prod-Deploy aufgefallen und behoben: die Snippets lagen nur
+im `odoo.nesa.de`-Alias-Vhost. Da `web.base.url` seit dem Domain-Flip auf
+`nesa.de` steht, lief jeder echte Link ueber den nesa.de-Vhost in dessen
+`location /` — und stand vollstaendig in `/var/log/nginx/access.log`. Das
+betraf auch die seit August produktive Download-Route. Gegenprobe nach dem Fix:
+ein frisch gepraegter Token, erfolgreich eingeloest, taucht in access.log,
+error.log und Odoo-Log kein einziges Mal auf.
