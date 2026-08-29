@@ -244,3 +244,30 @@ cd /var/odoo/mcp-odoo
 sudo -u odoo git fetch upstream
 sudo -u odoo git merge upstream/main  # ggf. Konflikte lösen
 ```
+
+
+## 7. Datei-EMPFANG (`create_attachment_from_url`, `create_attachment_upload`)
+
+**Stand 2026-08-29.** Gegenstueck zu `create_attachment_download`: bisher konnte
+der Agent Dateien nur ausgeben. Zwei Wege zurueck, in beiden laeuft kein Byte
+durch das Kontextfenster.
+
+| Tool | Weg | Grenze |
+| ---- | --- | ------ |
+| `create_attachment_from_url(url, model, res_id, filename=None)` | Der MCP-Prozess holt die Datei und reicht sie per XML-RPC an `nesa.mcp.doc.helper.mcp_store_attachment` | Hartkodierte URL-Allowlist (zwei Regexes, HTTPS-only), keine Redirects, 30 s Timeout, 40 MB Cap gegen `Content-Length` UND beim Streamen |
+| `create_attachment_upload(model, res_id, filename, ttl_seconds=900)` | Odoo praegt einen Einmal-Token; der Agent laedt per `curl -T` gegen `PUT /nesa/mcp/upload/<token>` | Token einmalig + TTL, Ziel/Name/Mimetype beim Praegen fixiert, Cap 40 MB, GC-Cron |
+
+Der Fetch liegt bewusst hier und nicht in Odoo: die URL kommt aus einer Mail,
+und der Odoo-Prozess waere der schlechteste denkbare SSRF-Proxy. Die Allowlist
+ist code-owned (`src/odoo_mcp/_nesa_file_intake.py`) — kein Tool-Parameter,
+keine ENV, kein Odoo-Parameter, weil wer den Prompt beeinflusst sonst auch das
+Ziel beeinflusst.
+
+Rechte entscheidet weiterhin Odoo: `ir.attachment.check` verlangt Schreibrecht
+am Zielrecord, der Anhang wird ohne `sudo` angelegt. `nesa.mcp.upload.token.`
+steht zusaetzlich in `NON_DELEGABLE_METHOD_PREFIXES`, damit ein Agent nicht per
+`execute_method` an den TTL-Grenzen vorbei praegt.
+
+Odoo-Gegenseite: `nesa_mcp_bridge` ab 18.0.1.6.0 (`nesa.mcp.upload.token`,
+`models/nesa_mcp_upload_helper.py`, `controllers/mcp_upload.py`,
+nginx-Snippet `nesa_patches/nginx/mcp-upload-route-*.conf`).

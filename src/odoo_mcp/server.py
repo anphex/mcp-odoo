@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import time
+import urllib.parse
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -43,6 +44,7 @@ from .diagnostics import (
     sanitize_odoo_error,
     upgrade_risk_report as build_upgrade_risk_report,
 )
+from ._nesa_file_intake import FileIntakeError, fetch_allowlisted_url
 from .odoo_client import OdooClient, get_odoo_client
 
 logger = logging.getLogger(__name__)
@@ -140,6 +142,10 @@ NON_DELEGABLE_METHOD_PREFIXES = frozenset({
     "nesa.mcp.doc.helper.",
     "nesa.mcp.download.token.",
     "nesa.mcp.shadow.",
+    # Der Upload-Token ist ein Schreibrecht auf Zeit. Ueber execute_method
+    # koennte ein Agent sonst mcp_issue mit beliebigem TTL aufrufen und die
+    # Obergrenzen von create_attachment_upload umgehen.
+    "nesa.mcp.upload.token.",
 })
 
 AUDIT_SUPPRESSION_CONTEXT_KEYS = frozenset({
@@ -4113,6 +4119,180 @@ def create_attachment_download(
         return error_response(
             "create_attachment_download", e, attachment_id=attachment_id
         )
+
+
+@mcp.tool(
+    description=(
+        "Fetch a file from a short-lived NESA download link (mail-mcp.nesa.de "
+        "or openarchiver.nesa.de) and attach it to an Odoo record. Use it to "
+        "put a mail attachment onto a partner, a sales order or a task without "
+        "the file ever passing through the conversation. Any other URL is "
+        "refused: the allowlist is code-owned and cannot be widened."
+    ),
+    annotations=SIDE_EFFECT_TOOL,
+    structured_output=True,
+)
+def create_attachment_from_url(
+    ctx: Context,
+    url: str,
+    model: str,
+    res_id: int,
+    filename: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Pull one allowlisted file into Odoo as an ``ir.attachment``.
+
+    The download happens in this server process, never in Odoo: the URL comes
+    out of a mail and is therefore attacker-influenced, and Odoo is the process
+    with the database and the filestore.  HTTPS only, no redirects, 30 s
+    timeout, hard 40 MB cap checked against ``Content-Length`` *and* while
+    streaming.
+
+    Odoo then decides whether the acting user may attach anything to that
+    record — ``ir.attachment`` requires write access on the target, exactly as
+    in the backend.
+    """
+    odoo = ctx.request_context.lifespan_context.odoo
+    try:
+        validate_model_name(model)
+        denied = hard_deny_result("create_attachment_from_url", model, "create")
+        if denied:
+            return denied
+        if res_id < 1:
+            raise ValueError("res_id must be greater than 0")
+        try:
+            fetched = fetch_allowlisted_url(url, filename=filename)
+        except FileIntakeError as exc:
+            return {
+                "success": False,
+                "tool": "create_attachment_from_url",
+                "error": str(exc),
+                "error_type": exc.error_type,
+                "retryable": exc.error_type in {"fetch_timeout", "fetch_failed"},
+            }
+
+        payload = base64.b64encode(fetched.content).decode("ascii")
+        try:
+            result = call_with_transport_retry(
+                lambda: call_doc_helper(
+                    odoo, "mcp_store_attachment", model, res_id,
+                    fetched.filename, payload, fetched.mimetype or "",
+                ),
+                label="mcp_store_attachment",
+                # A stored attachment is a write.  A lost answer must be
+                # verified, never repeated — otherwise the record ends up with
+                # the same file twice.
+                idempotent=False,
+            )
+        except UnknownOutcomeError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — mapped to guidance below
+            missing = _doc_helper_missing_response("create_attachment_from_url", exc)
+            if missing:
+                return missing
+            raise
+        if not isinstance(result, dict) or not result.get("success"):
+            return {
+                "success": False,
+                "tool": "create_attachment_from_url",
+                "error": (
+                    (result or {}).get("error")
+                    if isinstance(result, dict)
+                    else "the file could not be stored"
+                ),
+                "error_type": "store_failed",
+                "retryable": False,
+            }
+        response = {
+            "success": True,
+            "tool": "create_attachment_from_url",
+            **result,
+            "fetched_bytes": fetched.size,
+            "source_host": urllib.parse.urlsplit(url).netloc,
+        }
+        # Both sides hash the bytes independently.  A mismatch means the
+        # transfer changed the file — the agent must not treat it as filed.
+        if result.get("sha256") and result["sha256"] != fetched.sha256:
+            response["success"] = False
+            response["error"] = (
+                "The stored file does not match what was downloaded "
+                f"(source sha256 {fetched.sha256}, stored {result['sha256']}). "
+                "Delete the attachment and retry."
+            )
+            response["error_type"] = "checksum_mismatch"
+            response["retryable"] = False
+        return response
+    except Exception as e:
+        return error_response("create_attachment_from_url", e, model=model)
+
+
+@mcp.tool(
+    description=(
+        "Mint a short-lived, single-use HTTPS upload URL for one Odoo record. "
+        "Use it to put a file you have locally onto a record: upload it with "
+        "`curl -T <file> <upload_url>`. Filename and target are fixed when the "
+        "URL is minted, the link works exactly once, and it expires."
+    ),
+    annotations=SIDE_EFFECT_TOOL,
+    structured_output=True,
+)
+def create_attachment_upload(
+    ctx: Context,
+    model: str,
+    res_id: int,
+    filename: str,
+    ttl_seconds: int = 900,
+) -> Dict[str, Any]:
+    """Mint a one-shot upload URL that files a local file onto a record.
+
+    The mirror image of ``create_attachment_download``.  Odoo checks the acting
+    user's write access on the target *before* handing out the URL, so an
+    unusable link is never issued; the uploader itself stays anonymous and
+    cannot choose the filename, the mimetype or the target.
+    """
+    odoo = ctx.request_context.lifespan_context.odoo
+    try:
+        validate_model_name(model)
+        denied = hard_deny_result("create_attachment_upload", model, "create")
+        if denied:
+            return denied
+        if res_id < 1:
+            raise ValueError("res_id must be greater than 0")
+        if not filename or not str(filename).strip():
+            raise ValueError("filename must not be empty")
+        if ttl_seconds < 60:
+            raise ValueError("ttl_seconds must be at least 60")
+        try:
+            result = call_doc_helper(
+                odoo, "mcp_create_upload", model, res_id, filename, ttl_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 — mapped to guidance below
+            missing = _doc_helper_missing_response("create_attachment_upload", exc)
+            if missing:
+                return missing
+            raise
+        if not isinstance(result, dict) or not result.get("success"):
+            return {
+                "success": False,
+                "tool": "create_attachment_upload",
+                "error": (
+                    (result or {}).get("error")
+                    if isinstance(result, dict)
+                    else "upload link could not be created"
+                ),
+                "error_type": "link_failed",
+                "retryable": False,
+            }
+        return {
+            "success": True,
+            "tool": "create_attachment_upload",
+            **result,
+            "how_to_upload": (
+                f"curl -T <local-file> '{result.get('upload_url')}' — one PUT, "
+                "one file, then the link is dead."
+            ),
+        }
+    except Exception as e:
+        return error_response("create_attachment_upload", e, model=model)
 
 
 @mcp.tool(
