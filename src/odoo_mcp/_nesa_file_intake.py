@@ -23,8 +23,14 @@ Grenzen des Abrufs (alle drei zusammen, nicht wahlweise):
 * **40 MB Cap, doppelt geprueft.** ``Content-Length`` ist eine Behauptung des
   Absenders — deshalb wird beim Streamen zusaetzlich mitgezaehlt und beim
   Ueberschreiten abgebrochen.
-* **Zeit.** 30 s pro Lesevorgang und 60 s fuer den gesamten Abruf; ein
-  Tropf-Server soll keinen MCP-Worker binden.
+* **Zeit.** 30 s Socket-Timeout pro Lesevorgang und ein Gesamtbudget von
+  60 s, das zwischen zwei Chunks geprueft wird. Das ist bewusst *nicht* als
+  harte Wanduhr formuliert: ``iter_content`` blockiert bis zum vollstaendigen
+  Chunk, ein Tropf-Server kann den Socket-Timeout also mehrfach zuruecksetzen,
+  bevor Python wieder zur Pruefung kommt (Review-MINOR 2026-08-29). In der
+  Praxis begrenzt das den Schaden auf ein Vielfaches von 30 s statt auf
+  unbegrenzt; wer es haerter braucht, muesste den Abruf in einen eigenen
+  Prozess mit Signal-Deadline auslagern.
 """
 
 from __future__ import annotations
@@ -209,8 +215,8 @@ def _stream_capped(response: requests.Response, started: float) -> bytes:
             )
         if time.monotonic() - started > MAX_TOTAL_SECONDS:
             raise FileIntakeError(
-                f"The transfer took longer than {MAX_TOTAL_SECONDS}s and was "
-                "aborted.",
+                f"The transfer exceeded the {MAX_TOTAL_SECONDS}s budget and "
+                "was aborted between two chunks.",
                 error_type="fetch_timeout",
             )
         chunks.append(chunk)

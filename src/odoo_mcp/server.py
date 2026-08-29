@@ -4149,7 +4149,9 @@ def create_attachment_from_url(
 
     Odoo then decides whether the acting user may attach anything to that
     record — ``ir.attachment`` requires write access on the target, exactly as
-    in the backend.
+    in the backend.  The checksum measured here travels with the payload and is
+    compared *before* the attachment is created, so a corrupted transfer leaves
+    nothing behind instead of a file plus an apology.
     """
     odoo = ctx.request_context.lifespan_context.odoo
     try:
@@ -4176,6 +4178,7 @@ def create_attachment_from_url(
                 lambda: call_doc_helper(
                     odoo, "mcp_store_attachment", model, res_id,
                     fetched.filename, payload, fetched.mimetype or "",
+                    fetched.sha256,
                 ),
                 label="mcp_store_attachment",
                 # A stored attachment is a write.  A lost answer must be
@@ -4209,14 +4212,17 @@ def create_attachment_from_url(
             "fetched_bytes": fetched.size,
             "source_host": urllib.parse.urlsplit(url).netloc,
         }
-        # Both sides hash the bytes independently.  A mismatch means the
-        # transfer changed the file — the agent must not treat it as filed.
+        # Odoo already refused a mismatching payload before creating anything
+        # (``expected_sha256``).  This second comparison is the belt to that
+        # braces: it catches a helper version that ignores the argument, and it
+        # never leaves the caller believing a corrupted file was filed.
         if result.get("sha256") and result["sha256"] != fetched.sha256:
             response["success"] = False
             response["error"] = (
                 "The stored file does not match what was downloaded "
                 f"(source sha256 {fetched.sha256}, stored {result['sha256']}). "
-                "Delete the attachment and retry."
+                "Delete attachment "
+                f"{result.get('attachment_id')} and retry."
             )
             response["error_type"] = "checksum_mismatch"
             response["retryable"] = False

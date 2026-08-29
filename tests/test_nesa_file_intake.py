@@ -271,6 +271,9 @@ def test_from_url_stores_and_reports_the_attachment(server, intake, monkeypatch)
     model, method, args = client.calls[0]
     assert (model, method) == ("nesa.mcp.doc.helper", "mcp_store_attachment")
     assert args[:3] == ("res.partner", 7, "beleg.pdf")
+    # The checksum travels WITH the payload so Odoo can refuse a corrupted
+    # transfer before it creates anything.
+    assert args[5] == hashlib.sha256(b"pdf-bytes").hexdigest()
 
 
 def test_from_url_refuses_a_foreign_host_without_calling_odoo(server):
@@ -304,6 +307,17 @@ def test_from_url_reports_a_checksum_mismatch_as_a_failure(
     )
     assert result["success"] is False
     assert result["error_type"] == "checksum_mismatch"
+
+
+def test_from_url_reports_an_odoo_side_checksum_refusal(server, intake, monkeypatch):
+    """Odoo lehnt einen Mismatch ab, BEVOR es speichert — kein halber Zustand."""
+    monkeypatch.setattr(intake.requests, "get", lambda *a, **kw: _FakeResponse())
+    client = _StoreClient(success=False, error="Checksum mismatch: nothing was stored.")
+    result = server.create_attachment_from_url(
+        _Ctx(client), ALLOWED_URL, "res.partner", 7,
+    )
+    assert result["success"] is False
+    assert "nothing was stored" in result["error"]
 
 
 def test_from_url_passes_an_odoo_refusal_through(server, intake, monkeypatch):
