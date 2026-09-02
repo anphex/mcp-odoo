@@ -1514,15 +1514,51 @@ def test_search_records_explicit_fields_pass_through():
     client = _SmartFieldsClient()
 
     result = server.search_records(
-        FakeCtx(client), "res.partner", fields=["name", "email"]
+        FakeCtx(client), "res.partner", fields=["name", "code"]
     )
 
     assert result["success"] is True
     assert result["smart_fields_applied"] is False
-    assert result["fields_used"] == ["name", "email"]
-    assert client.search_read_calls[0]["fields"] == ["name", "email"]
-    # No fields_get lookup needed when caller specified fields explicitly.
-    assert client.fields_get_calls == 0
+    assert result["fields_used"] == ["name", "code"]
+    assert client.search_read_calls[0]["fields"] == ["name", "code"]
+    # Explicit fields are validated against fields_get once per model
+    # (lifespan cache) so a guessed name never reaches Odoo.
+    assert client.fields_get_calls == 1
+
+
+def test_search_records_rejects_unknown_explicit_fields_before_rpc():
+    """A guessed field name must fail in the MCP, not as an Odoo ERROR."""
+    server = importlib.import_module("odoo_mcp.server")
+    client = _SmartFieldsClient(
+        fields_meta={
+            "id": {"type": "integer"},
+            "name": {"type": "char"},
+            "date_end": {"type": "datetime"},
+            "planned_date_begin": {"type": "datetime"},
+        }
+    )
+
+    result = server.search_records(
+        FakeCtx(client), "project.task", fields=["name", "planned_date_end"]
+    )
+
+    assert result["success"] is False
+    assert client.search_read_calls == []  # never reached Odoo
+    text = json.dumps(result)
+    assert "planned_date_end" in text
+    assert "planned_date_begin" in text  # close-match hint
+
+
+def test_search_records_unknown_field_check_fails_open_without_metadata():
+    server = importlib.import_module("odoo_mcp.server")
+    client = _SmartFieldsClient(fields_meta={"error": "boom"})
+
+    result = server.search_records(
+        FakeCtx(client), "res.partner", fields=["name", "whatever"]
+    )
+
+    assert result["success"] is True
+    assert client.search_read_calls[0]["fields"] == ["name", "whatever"]
 
 
 def test_read_record_applies_smart_fields_and_uses_schema_cache():
@@ -1971,15 +2007,29 @@ def test_resolve_read_fields_treats_empty_metadata_as_no_smart():
 def test_resolve_read_fields_passes_explicit_fields_through():
     server = importlib.import_module("odoo_mcp.server")
 
-    class ExplodingClient:
-        def get_model_fields(self, model):
-            raise AssertionError("should not call fields_get when caller specifies fields")
+    class CountingClient:
+        calls = 0
 
-    app_context = FakeLife(ExplodingClient())
+        def get_model_fields(self, model):
+            # One fields_get per model: served from the lifespan cache after.
+            CountingClient.calls += 1
+            return {"id": {"type": "integer"}, "name": {"type": "char"},
+                    "email": {"type": "char"}}
+
+    app_context = FakeLife(CountingClient())
     resolved, _notes = server.resolve_read_fields(
         app_context, app_context.odoo, "res.partner", ["name", "email"]
     )
     assert resolved == ["name", "email"]
+    server.resolve_read_fields(
+        app_context, app_context.odoo, "res.partner", ["email"]
+    )
+    assert CountingClient.calls == 1
+
+    with pytest.raises(ValueError, match="Unknown field"):
+        server.resolve_read_fields(
+            app_context, app_context.odoo, "res.partner", ["name", "e_mail"]
+        )
 
 
 def test_aggregate_records_rejects_invalid_model_name():

@@ -1075,7 +1075,54 @@ def resolve_read_fields(
                 "name, or use read_attachment / create_attachment_download."
             )
         return expanded, notes
+    unknown = _unknown_field_names(app_context, odoo, model, fields)
+    if unknown:
+        raise ValueError(_unknown_fields_message(app_context, odoo, model, unknown))
     return fields, notes
+
+
+def _unknown_field_names(
+    app_context: AppContext, odoo: OdooClient, model: str, fields: List[str]
+) -> List[str]:
+    """Explicit field names that ``fields_get`` does not know for ``model``.
+
+    Checked BEFORE the RPC (NESA): a guessed name such as
+    ``project.task.planned_date_end`` otherwise reaches Odoo, which logs a
+    full ``Invalid field`` traceback at ERROR level on the production server
+    for every attempt (~10 per day in the daily log report, 2026-09-01) and
+    hands the agent back only the bare ValueError.  The metadata is served
+    from the lifespan cache, so the cost is one ``fields_get`` per model per
+    process.  Fails open: without metadata the list is returned unchanged
+    and Odoo rejects as before.
+    """
+    metadata = _cached_fields_metadata(app_context, odoo, model)
+    if not metadata:
+        return []
+    return [
+        name
+        for name in fields
+        if not isinstance(name, str) or name not in metadata
+    ]
+
+
+def _unknown_fields_message(
+    app_context: AppContext, odoo: OdooClient, model: str, unknown: List[str]
+) -> str:
+    import difflib
+
+    metadata = _cached_fields_metadata(app_context, odoo, model)
+    parts = []
+    for name in unknown:
+        close = difflib.get_close_matches(
+            str(name), list(metadata), n=3, cutoff=0.6
+        )
+        hint = f" (did you mean: {', '.join(close)})" if close else ""
+        parts.append(f"{name!r}{hint}")
+    return (
+        f"Unknown field(s) on {model}: {'; '.join(parts)}. Only names from "
+        "the model's fields_get are readable — omit 'fields' for the smart "
+        "default selection, or pass fields=['*'] for every non-binary field."
+    )
 
 
 def normalize_domain_input(domain: Any) -> List[Any]:
