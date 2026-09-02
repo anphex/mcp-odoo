@@ -234,11 +234,7 @@ SERVER_INSTRUCTIONS = (
 
 def _result_summary(result: Any) -> tuple[Optional[bool], Optional[int], int]:
     """(success, record_count, bytes) of a tool result as the agent sees it."""
-    structured: Any = None
-    if isinstance(result, tuple) and len(result) == 2:
-        structured = result[1]
-    elif isinstance(result, dict):
-        structured = result
+    structured = _structured_of(result)
     size = 0
     blocks = result[0] if isinstance(result, tuple) else result
     if not isinstance(blocks, dict):
@@ -313,9 +309,18 @@ def log_tool_call(
 
 
 def _structured_of(result: Any) -> Any:
-    if isinstance(result, tuple) and len(result) == 2:
-        return result[1]
-    return result if isinstance(result, dict) else None
+    """The tool's own response dict out of what FastMCP.call_tool returned.
+
+    Tools annotated ``Dict[str, Any]`` get ``wrap_output=True`` in the SDK, so
+    the structured half is ``{"result": <our dict>}``; unwrap that layer.
+    """
+    structured = result[1] if isinstance(result, tuple) and len(result) == 2 else result
+    if not isinstance(structured, dict):
+        return None
+    inner = structured.get("result")
+    if set(structured) == {"result"} and isinstance(inner, dict):
+        return inner
+    return structured
 
 
 class NesaFastMCP(FastMCP):

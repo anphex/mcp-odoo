@@ -4787,9 +4787,10 @@ def test_tool_call_log_line_reports_login_model_count_bytes(caplog):
                 started, None,
             )
             server.log_tool_call("execute_method", {"model": "sale.order"}, None, started, "ValueError")
+            # FastMCP wraps Dict[str, Any] returns: structured == {"result": <dict>}
             server.log_tool_call(
                 "read_record", {"model": "x\nINJECTED y"},
-                ([], {"success": False, "error_type": "odoo_error"}), started, None,
+                ([], {"result": {"success": False, "error_type": "odoo_error"}}), started, None,
             )
     finally:
         auth.reset_user_context(token)
