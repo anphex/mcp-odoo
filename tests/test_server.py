@@ -2032,6 +2032,77 @@ def test_resolve_read_fields_passes_explicit_fields_through():
         )
 
 
+def test_explicit_field_check_is_per_user_not_shared():
+    """fields_get hides group-restricted fields, so the cache must be per user.
+
+    A shared entry would let whoever warms it decide what everybody else may
+    name: the restricted user's view of res.partner would hide the manager's
+    field, and the manager's read would be refused before Odoo ever sees it.
+    """
+    server = importlib.import_module("odoo_mcp.server")
+    per_user = importlib.import_module("odoo_mcp._nesa_per_user_auth")
+
+    class PerUserClient:
+        calls = []
+
+        def get_model_fields(self, model):
+            login, _key = per_user.current_user_context()
+            PerUserClient.calls.append(login)
+            base = {"id": {"type": "integer"}, "name": {"type": "char"}}
+            if login == "manager":
+                base["margin"] = {"type": "float"}
+            return base
+
+    app_context = FakeLife(PerUserClient())
+
+    token = per_user.set_user_context("restricted", "key-restricted")
+    try:
+        with pytest.raises(ValueError, match="Unknown field"):
+            server.resolve_read_fields(
+                app_context, app_context.odoo, "res.partner", ["margin"]
+            )
+    finally:
+        per_user.reset_user_context(token)
+
+    token = per_user.set_user_context("manager", "key-manager")
+    try:
+        resolved, _notes = server.resolve_read_fields(
+            app_context, app_context.odoo, "res.partner", ["margin"]
+        )
+    finally:
+        per_user.reset_user_context(token)
+
+    assert resolved == ["margin"]
+    assert "manager" in PerUserClient.calls
+
+
+def test_unknown_field_is_rechecked_against_fresh_metadata():
+    """A field added after the cache was warmed must not stay unknown."""
+    server = importlib.import_module("odoo_mcp.server")
+
+    class GrowingClient:
+        calls = 0
+
+        def get_model_fields(self, model):
+            GrowingClient.calls += 1
+            fields = {"id": {"type": "integer"}, "name": {"type": "char"}}
+            if GrowingClient.calls > 1:
+                fields["x_studio_new"] = {"type": "char"}
+            return fields
+
+    app_context = FakeLife(GrowingClient())
+    resolved, _notes = server.resolve_read_fields(
+        app_context, app_context.odoo, "project.task", ["name"]
+    )
+    assert resolved == ["name"]
+
+    resolved, _notes = server.resolve_read_fields(
+        app_context, app_context.odoo, "project.task", ["x_studio_new"]
+    )
+    assert resolved == ["x_studio_new"]
+    assert GrowingClient.calls == 2
+
+
 def test_aggregate_records_rejects_invalid_model_name():
     server = importlib.import_module("odoo_mcp.server")
     client = _AggregateClient(version="17.0")

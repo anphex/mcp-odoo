@@ -437,16 +437,37 @@ def max_smart_fields() -> int:
     return max(1, value)
 
 
+def _fields_cache_key(model: str) -> str:
+    """Cache key for ``fields_get`` metadata, scoped to the requesting user.
+
+    ``fields_get`` omits fields the calling user may not see (``groups=``), so
+    a single entry per model would let whoever warms the cache first decide
+    what every later caller is allowed to name — a restricted user would hide
+    a manager's field, and the suggestions in an error message would show a
+    restricted user names they never had access to (NESA).  The API key only
+    ever enters the key as a digest.
+    """
+    from ._nesa_per_user_auth import current_user_context
+
+    context = current_user_context()
+    if not context:
+        return f"fields:service:{model}"
+    login, api_key = context
+    digest = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+    return f"fields:{login}:{digest}:{model}"
+
+
 def _cached_fields_metadata(
-    app_context: AppContext, odoo: OdooClient, model: str
+    app_context: AppContext, odoo: OdooClient, model: str, *, refresh: bool = False
 ) -> Dict[str, Any]:
     """Return fields_get metadata for ``model`` using the lifespan cache."""
-    cached = app_context.schema_cache.get(model)
-    if isinstance(cached, dict):
+    cache_key = _fields_cache_key(model)
+    cached = app_context.schema_cache.get(cache_key)
+    if not refresh and isinstance(cached, dict):
         return cached
     fields_metadata = odoo.get_model_fields(model)
     if isinstance(fields_metadata, dict) and "error" not in fields_metadata:
-        app_context.schema_cache[model] = fields_metadata
+        app_context.schema_cache[cache_key] = fields_metadata
         return fields_metadata
     return {}
 
@@ -1098,6 +1119,20 @@ def _unknown_field_names(
     metadata = _cached_fields_metadata(app_context, odoo, model)
     if not metadata:
         return []
+    unknown = _names_missing_from(fields, metadata)
+    if not unknown:
+        return []
+    # A field that appeared after this process cached the model — a Studio
+    # deployment, a module install — must not stay "unknown" until the next
+    # restart.  Re-read once before refusing; the cost falls on the rare
+    # failing call, not on the hot path.
+    metadata = _cached_fields_metadata(app_context, odoo, model, refresh=True)
+    if not metadata:
+        return []
+    return _names_missing_from(fields, metadata)
+
+
+def _names_missing_from(fields: List[str], metadata: Dict[str, Any]) -> List[str]:
     return [
         name
         for name in fields
