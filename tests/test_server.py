@@ -2153,7 +2153,7 @@ def test_aggregate_records_clamps_high_limits():
         measures=["id:count"],
         limit=999,
     )
-    assert client.calls[0][2]["limit"] == 100  # MAX_SEARCH_LIMIT
+    assert client.calls[0][2]["limit"] == 101  # MAX_SEARCH_LIMIT + 1 overfetch
 
 
 def test_aggregate_records_passes_lazy_and_order_through():
@@ -3760,7 +3760,7 @@ def test_aggregate_records_falls_back_propagates_offset_and_order():
     )
     fallback_kwargs = client.calls[1][2]
     assert fallback_kwargs["offset"] == 3
-    assert fallback_kwargs["limit"] == 50
+    assert fallback_kwargs["limit"] == 51  # limit + 1 overfetch
     assert fallback_kwargs["orderby"] == "id:count desc"
 
 
@@ -3778,7 +3778,7 @@ def test_aggregate_records_passes_offset_and_order_in_formatted_path():
     )
     kwargs = client.calls[0][2]
     assert kwargs["offset"] == 2
-    assert kwargs["limit"] == 20
+    assert kwargs["limit"] == 21  # limit + 1 overfetch
     assert kwargs["order"] == "amount_total:sum desc"
 
 
@@ -4709,7 +4709,8 @@ def test_name_search_returns_id_display_name_pairs_in_one_rpc():
     assert len(client.calls) == 1
     args, kwargs = client.calls[0]
     assert args[:2] == ("res.partner", "name_search")
-    assert kwargs == {"name": "Müller", "domain": [], "operator": "ilike", "limit": 5}
+    # Odoo 18: name_search(name='', args=None, operator='ilike', limit=100)
+    assert kwargs == {"name": "Müller", "args": [], "operator": "ilike", "limit": 5}
 
     truncated = server.name_search(FakeCtx(client), "res.partner", "M", limit=2)
     assert truncated["truncated"] is True
@@ -4747,15 +4748,30 @@ def test_aggregate_records_defaults_to_100_groups_and_strips_internals():
 
     assert result["success"] is True
     _, kwargs = client.calls[0]
-    assert kwargs["limit"] == server.MAX_SEARCH_LIMIT
+    assert kwargs["limit"] == server.MAX_SEARCH_LIMIT + 1  # overfetch one group
     assert result["rows"] == [{"partner_id": [7, "A"], "__count": 3}]
     assert result["limit"] == 100 and "truncated" not in result
 
+    # Exactly `limit` groups is a complete page, not a truncation.
     client.calls.clear()
-    capped = server.aggregate_records(
+    exact = server.aggregate_records(
         FakeCtx(client), "sale.order", group_by=["partner_id"], measures=["amount_total:sum"], limit=1,
     )
+    assert exact["row_count"] == 1 and "truncated" not in exact
+
+    class _TwoGroups(_CountingSchemaClient):
+        def execute_method(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return [
+                {"partner_id": [7, "A"], "__count": 3, "__range": {"x": 1}},
+                {"partner_id": [8, "B"], "__count": 1},
+            ]
+
+    capped = server.aggregate_records(
+        FakeCtx(_TwoGroups()), "sale.order", group_by=["partner_id"], measures=["amount_total:sum"], limit=1,
+    )
     assert capped["truncated"] is True and "offset" in capped["warning"]
+    assert capped["rows"] == [{"partner_id": [7, "A"], "__count": 3, "__range": {"x": 1}}]
 
 
 def test_tool_call_log_line_reports_login_model_count_bytes(caplog):
@@ -4771,12 +4787,18 @@ def test_tool_call_log_line_reports_login_model_count_bytes(caplog):
                 started, None,
             )
             server.log_tool_call("execute_method", {"model": "sale.order"}, None, started, "ValueError")
+            server.log_tool_call(
+                "read_record", {"model": "x\nINJECTED y"},
+                ([], {"success": False, "error_type": "odoo_error"}), started, None,
+            )
     finally:
         auth.reset_user_context(token)
 
     lines = [r.getMessage() for r in caplog.records if "[mcp_call]" in r.getMessage()]
-    assert len(lines) == 2
+    assert len(lines) == 3
     assert "tool=search_records login=alice model=res.partner ok=true n=2 bytes=" in lines[0]
+    assert "model=x_INJECTED_y ok=false" in lines[2] and lines[2].endswith("error=odoo_error")
+    assert "\n" not in lines[2]
     assert "key-a" not in lines[0]
     assert "tool=execute_method login=alice model=sale.order ok=- n=- bytes=0" in lines[1]
     assert lines[1].endswith("error=ValueError")

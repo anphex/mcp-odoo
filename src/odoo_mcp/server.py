@@ -239,6 +239,17 @@ def _result_summary(result: Any) -> tuple[Optional[bool], Optional[int], int]:
         structured = result[1]
     elif isinstance(result, dict):
         structured = result
+    size = 0
+    blocks = result[0] if isinstance(result, tuple) else result
+    if not isinstance(blocks, dict):
+        # FastMCP already serialized the payload into text blocks; measuring
+        # those costs nothing and is exactly what the agent receives.
+        try:
+            for block in blocks or []:
+                text = getattr(block, "text", None)
+                size += len(text.encode("utf-8")) if isinstance(text, str) else 0
+        except TypeError:
+            pass
     if isinstance(structured, dict):
         success = structured.get("success")
         count: Optional[int] = None
@@ -251,20 +262,22 @@ def _result_summary(result: Any) -> tuple[Optional[bool], Optional[int], int]:
             payload = structured.get("result", structured.get("records"))
             if isinstance(payload, list):
                 count = len(payload)
-        try:
-            size = len(json.dumps(structured, default=str, ensure_ascii=False))
-        except Exception:  # noqa: BLE001 — a log line never fails the call
-            size = -1
+        if size == 0 and isinstance(result, dict):
+            try:
+                size = len(json.dumps(structured, default=str).encode("utf-8"))
+            except Exception:  # noqa: BLE001 — a log line never fails the call
+                size = -1
         return (success if isinstance(success, bool) else None), count, size
-    size = 0
-    blocks = result[0] if isinstance(result, tuple) else result
-    try:
-        for block in blocks or []:
-            text = getattr(block, "text", None)
-            size += len(text) if isinstance(text, str) else 0
-    except TypeError:
-        pass
     return None, None, size
+
+
+_LOG_FIELD_SAFE = re.compile(r"[^\w.@+\-]")
+
+
+def _log_field(value: Any, limit: int = 80) -> str:
+    """Whitelist a log field: no control characters, no line breaks."""
+    text = _LOG_FIELD_SAFE.sub("_", str(value))[:limit]
+    return text or "-"
 
 
 def log_tool_call(
@@ -284,17 +297,25 @@ def log_tool_call(
     login = user_context[0] if user_context else "<service-account>"
     success, count, size = _result_summary(result)
     model = arguments.get("model") if isinstance(arguments, dict) else None
+    if success is False and isinstance(structured := _structured_of(result), dict):
+        error_class = error_class or str(structured.get("error_type") or "tool_error")
     logger.info(
         "[mcp_call] tool=%s login=%s model=%s ok=%s n=%s bytes=%s ms=%d error=%s",
-        tool,
-        login,
-        model or "-",
+        _log_field(tool),
+        _log_field(login),
+        _log_field(model) if model else "-",
         "-" if success is None else str(success).lower(),
         "-" if count is None else count,
         size,
         int((time.perf_counter() - started) * 1000),
-        error_class or "-",
+        _log_field(error_class) if error_class else "-",
     )
+
+
+def _structured_of(result: Any) -> Any:
+    if isinstance(result, tuple) and len(result) == 2:
+        return result[1]
+    return result if isinstance(result, dict) else None
 
 
 class NesaFastMCP(FastMCP):
@@ -555,7 +576,7 @@ def max_smart_fields() -> int:
 
 
 DEFAULT_SCHEMA_CACHE_TTL_SECONDS = 900
-SCHEMA_CACHE_MAX_ENTRIES = 4000
+SCHEMA_CACHE_MAX_ENTRIES = 500
 _PROCESS_SCHEMA_CACHE: Dict[str, tuple[float, Any]] = {}
 _PROCESS_SCHEMA_CACHE_LOCK = threading.Lock()
 
@@ -580,7 +601,11 @@ def schema_cache_ttl_seconds() -> float:
 
 
 def process_cache_get(key: str) -> Any:
-    """Return a live process-cache entry or ``None``."""
+    """Return a live process-cache entry or ``None``.
+
+    Entries are shared between sessions of the same principal: treat them as
+    read-only, never mutate in place.
+    """
     ttl = schema_cache_ttl_seconds()
     if ttl <= 0:
         return None
@@ -600,7 +625,7 @@ def process_cache_set(key: str, value: Any) -> None:
     if schema_cache_ttl_seconds() <= 0:
         return
     with _PROCESS_SCHEMA_CACHE_LOCK:
-        if len(_PROCESS_SCHEMA_CACHE) >= SCHEMA_CACHE_MAX_ENTRIES:
+        if key not in _PROCESS_SCHEMA_CACHE and len(_PROCESS_SCHEMA_CACHE) >= SCHEMA_CACHE_MAX_ENTRIES:
             oldest = sorted(_PROCESS_SCHEMA_CACHE.items(), key=lambda kv: kv[1][0])
             for stale_key, _ in oldest[: max(1, SCHEMA_CACHE_MAX_ENTRIES // 10)]:
                 _PROCESS_SCHEMA_CACHE.pop(stale_key, None)
@@ -678,6 +703,10 @@ def _cached_fields_metadata(
         app_context.schema_cache[cache_key] = fields_metadata
         process_cache_set(cache_key, fields_metadata)
         return fields_metadata
+    if isinstance(fields_metadata, dict) and "error" in fields_metadata:
+        # Kept for the caller that wants the cause (get_model_fields) without
+        # paying the RPC twice; never enters the shared cache.
+        app_context.schema_cache[cache_key + ":error"] = fields_metadata
     return {}
 
 
@@ -3768,7 +3797,7 @@ def get_model_fields(
         app_context = ctx.request_context.lifespan_context
         fields = _cached_fields_metadata(app_context, odoo, model)
         if not fields:
-            fields = odoo.get_model_fields(model)
+            fields = app_context.schema_cache.pop(_fields_cache_key(model) + ":error", None) or {}
         if "error" in fields:
             return error_response(
                 "get_model_fields", RuntimeError(str(fields["error"])), model=model,
@@ -4156,7 +4185,7 @@ def aggregate_records(
             if offset:
                 kwargs["offset"] = offset
             if clamped_limit is not None:
-                kwargs["limit"] = clamped_limit
+                kwargs["limit"] = clamped_limit + 1
             if order:
                 kwargs["order"] = order
             try:
@@ -4172,7 +4201,7 @@ def aggregate_records(
                 if offset:
                     kwargs_fallback["offset"] = offset
                 if clamped_limit is not None:
-                    kwargs_fallback["limit"] = clamped_limit
+                    kwargs_fallback["limit"] = clamped_limit + 1
                 if order:
                     kwargs_fallback["orderby"] = order
                 rows = odoo.execute_method(model, "read_group", **kwargs_fallback)
@@ -4189,13 +4218,15 @@ def aggregate_records(
             if offset:
                 kwargs["offset"] = offset
             if clamped_limit is not None:
-                kwargs["limit"] = clamped_limit
+                # One extra group tells us whether the page is complete.
+                kwargs["limit"] = clamped_limit + 1
             if order:
                 kwargs["orderby"] = order
             rows = odoo.execute_method(model, "read_group", **kwargs)
             fallback_reason = ""
 
-        rows = [strip_read_group_internals(row) for row in rows]
+        truncated = len(rows) > clamped_limit
+        rows = [strip_read_group_internals(row) for row in rows[:clamped_limit]]
         response = {
             "success": True,
             "method": method_used,
@@ -4209,24 +4240,25 @@ def aggregate_records(
             "offset": offset,
             "rows": rows,
         }
-        if len(rows) >= clamped_limit:
+        if truncated:
             response["truncated"] = True
             response["warning"] = (
-                f"Only the first {clamped_limit} groups are returned. Narrow the "
-                "domain, group coarser, or page with offset."
+                f"More than {clamped_limit} groups exist; only the first "
+                f"{clamped_limit} are returned. Narrow the domain, group "
+                "coarser, or page with offset."
             )
         return response
     except Exception as e:
         return error_response("aggregate_records", e, model=model)
 
 
-READ_GROUP_INTERNAL_KEYS = ("__domain", "__context", "__range", "__fold")
+READ_GROUP_INTERNAL_KEYS = ("__domain", "__context", "__fold")
 
 
 def strip_read_group_internals(row: Any) -> Any:
     """Drop read_group bookkeeping (``__domain`` repeats the whole domain per
-    row, ``__context`` the group context) that no agent needs; ``__count``
-    stays."""
+    row, ``__context`` the lazy-groupby context) that no agent needs.
+    ``__count`` and ``__range`` (exact date-group bounds) stay."""
     if not isinstance(row, dict):
         return row
     return {k: v for k, v in row.items() if k not in READ_GROUP_INTERNAL_KEYS}
@@ -4444,8 +4476,9 @@ def name_search(
         normalized_domain = normalize_domain_input(domain)
         audit_odoo_execution("name_search", model, "name_search")
         pairs = call_with_transport_retry(
+            # Odoo 18 signature: name_search(name='', args=None, operator='ilike', limit=100)
             lambda: odoo.execute_method(
-                model, "name_search", name=name, domain=normalized_domain,
+                model, "name_search", name=name, args=normalized_domain,
                 operator=operator, limit=limit,
             ),
             label=f"name_search({model})",
