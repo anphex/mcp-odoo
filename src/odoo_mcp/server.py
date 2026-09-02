@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import urllib.parse
 import uuid
@@ -203,9 +204,10 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
 SERVER_INSTRUCTIONS = (
     "Odoo 18 ERP of NESA Haustechnik, per-user: every call runs with the "
     "Odoo rights of the authenticated user.\n"
-    "READ: search_records (paged, total_count) -> read_record/read_records "
-    "by id -> aggregate_records for counts/sums per group -> chatter_read "
-    "for message history. Use get_model_fields before guessing a field "
+    "READ: name_search to turn a name into ids -> search_records (paged, "
+    "total_count) -> read_record/read_records by id -> aggregate_records "
+    "for counts/sums per group -> chatter_read for message history. Use "
+    "get_model_fields before guessing a field "
     "name; list_models to find a model. Never use execute_method for "
     "plain reads.\n"
     "WRITE: validate_write -> execute_approved_write (preview_write is an "
@@ -230,7 +232,92 @@ SERVER_INSTRUCTIONS = (
     "number. bank.rec.widget is a UI widget and cannot be driven over RPC."
 )
 
-mcp = FastMCP(
+def _result_summary(result: Any) -> tuple[Optional[bool], Optional[int], int]:
+    """(success, record_count, bytes) of a tool result as the agent sees it."""
+    structured: Any = None
+    if isinstance(result, tuple) and len(result) == 2:
+        structured = result[1]
+    elif isinstance(result, dict):
+        structured = result
+    if isinstance(structured, dict):
+        success = structured.get("success")
+        count: Optional[int] = None
+        for key in ("count", "row_count", "record_count"):
+            value = structured.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                count = value
+                break
+        if count is None:
+            payload = structured.get("result", structured.get("records"))
+            if isinstance(payload, list):
+                count = len(payload)
+        try:
+            size = len(json.dumps(structured, default=str, ensure_ascii=False))
+        except Exception:  # noqa: BLE001 — a log line never fails the call
+            size = -1
+        return (success if isinstance(success, bool) else None), count, size
+    size = 0
+    blocks = result[0] if isinstance(result, tuple) else result
+    try:
+        for block in blocks or []:
+            text = getattr(block, "text", None)
+            size += len(text) if isinstance(text, str) else 0
+    except TypeError:
+        pass
+    return None, None, size
+
+
+def log_tool_call(
+    tool: str, arguments: Dict[str, Any], result: Any, started: float,
+    error_class: Optional[str],
+) -> None:
+    """One structured INFO line per tool call.
+
+    The Odoo-side audit log only sees calls that go through the NESA bridge;
+    the Claude.ai connector (the bulk of the traffic) was invisible.  This line
+    carries what an operator needs to size and debug agent usage — never
+    argument values, never the result itself.
+    """
+    from ._nesa_per_user_auth import current_user_context
+
+    user_context = current_user_context()
+    login = user_context[0] if user_context else "<service-account>"
+    success, count, size = _result_summary(result)
+    model = arguments.get("model") if isinstance(arguments, dict) else None
+    logger.info(
+        "[mcp_call] tool=%s login=%s model=%s ok=%s n=%s bytes=%s ms=%d error=%s",
+        tool,
+        login,
+        model or "-",
+        "-" if success is None else str(success).lower(),
+        "-" if count is None else count,
+        size,
+        int((time.perf_counter() - started) * 1000),
+        error_class or "-",
+    )
+
+
+class NesaFastMCP(FastMCP):
+    """FastMCP with a per-call log line (see ``log_tool_call``)."""
+
+    async def call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
+        started = time.perf_counter()
+        result: Any = None
+        error_class: Optional[str] = None
+        try:
+            result = await super().call_tool(name, arguments)
+            return result
+        except BaseException as exc:
+            error_class = type(exc).__name__
+            raise
+        finally:
+            try:
+                log_tool_call(name, arguments, result, started, error_class)
+            except Exception:  # noqa: BLE001 — logging must never break a call
+                logger.debug("[mcp_call] log line failed", exc_info=True)
+
+
+mcp = NesaFastMCP(
     "Odoo MCP Server",
     instructions=SERVER_INSTRUCTIONS,
     dependencies=["requests"],
@@ -467,6 +554,92 @@ def max_smart_fields() -> int:
     return max(1, value)
 
 
+DEFAULT_SCHEMA_CACHE_TTL_SECONDS = 900
+SCHEMA_CACHE_MAX_ENTRIES = 4000
+_PROCESS_SCHEMA_CACHE: Dict[str, tuple[float, Any]] = {}
+_PROCESS_SCHEMA_CACHE_LOCK = threading.Lock()
+
+
+def schema_cache_ttl_seconds() -> float:
+    """TTL of the process-wide schema cache (``ODOO_MCP_SCHEMA_CACHE_TTL``).
+
+    The NESA bridge opens a fresh MCP session — and with it a fresh
+    ``AppContext`` — for every tool call, so a per-session cache never hits:
+    each call without ``fields`` paid a full ``fields_get`` (hundreds of KB on
+    account.move) and every ``list_models`` re-read 900+ models.  Metadata
+    changes only on module upgrades, so a few minutes of staleness is safe.
+    ``0`` disables the process cache.
+    """
+    raw = os.environ.get("ODOO_MCP_SCHEMA_CACHE_TTL", "").strip()
+    if not raw:
+        return DEFAULT_SCHEMA_CACHE_TTL_SECONDS
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return DEFAULT_SCHEMA_CACHE_TTL_SECONDS
+
+
+def process_cache_get(key: str) -> Any:
+    """Return a live process-cache entry or ``None``."""
+    ttl = schema_cache_ttl_seconds()
+    if ttl <= 0:
+        return None
+    with _PROCESS_SCHEMA_CACHE_LOCK:
+        entry = _PROCESS_SCHEMA_CACHE.get(key)
+        if entry is None:
+            return None
+        stored_at, value = entry
+        if time.monotonic() - stored_at > ttl:
+            _PROCESS_SCHEMA_CACHE.pop(key, None)
+            return None
+        return value
+
+
+def process_cache_set(key: str, value: Any) -> None:
+    """Store ``value`` under ``key``; oldest entries go first when full."""
+    if schema_cache_ttl_seconds() <= 0:
+        return
+    with _PROCESS_SCHEMA_CACHE_LOCK:
+        if len(_PROCESS_SCHEMA_CACHE) >= SCHEMA_CACHE_MAX_ENTRIES:
+            oldest = sorted(_PROCESS_SCHEMA_CACHE.items(), key=lambda kv: kv[1][0])
+            for stale_key, _ in oldest[: max(1, SCHEMA_CACHE_MAX_ENTRIES // 10)]:
+                _PROCESS_SCHEMA_CACHE.pop(stale_key, None)
+        _PROCESS_SCHEMA_CACHE[key] = (time.monotonic(), value)
+
+
+def process_cache_clear() -> None:
+    with _PROCESS_SCHEMA_CACHE_LOCK:
+        _PROCESS_SCHEMA_CACHE.clear()
+
+
+def _user_scope_key() -> str:
+    """``login:digest`` of the acting user, or ``service`` — never the key."""
+    from ._nesa_per_user_auth import current_user_context
+
+    context = current_user_context()
+    if not context:
+        return "service"
+    login, api_key = context
+    digest = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+    return f"{login}:{digest}"
+
+
+def _models_cache_key() -> str:
+    return f"models:{_user_scope_key()}"
+
+
+def _cached_models(app_context: AppContext, odoo: OdooClient) -> Dict[str, Any]:
+    """``get_models()`` through the process cache (user-scoped key)."""
+    cache_key = _models_cache_key()
+    cached = process_cache_get(cache_key)
+    if isinstance(cached, dict):
+        return cached
+    models = odoo.get_models()
+    if isinstance(models, dict) and "error" not in models:
+        process_cache_set(cache_key, models)
+    return models
+
+
 def _fields_cache_key(model: str) -> str:
     """Cache key for ``fields_get`` metadata, scoped to the requesting user.
 
@@ -492,12 +665,18 @@ def _cached_fields_metadata(
 ) -> Dict[str, Any]:
     """Return fields_get metadata for ``model`` using the lifespan cache."""
     cache_key = _fields_cache_key(model)
-    cached = app_context.schema_cache.get(cache_key)
-    if not refresh and isinstance(cached, dict):
-        return cached
+    if not refresh:
+        cached = app_context.schema_cache.get(cache_key)
+        if isinstance(cached, dict):
+            return cached
+        shared = process_cache_get(cache_key)
+        if isinstance(shared, dict):
+            app_context.schema_cache[cache_key] = shared
+            return shared
     fields_metadata = odoo.get_model_fields(model)
     if isinstance(fields_metadata, dict) and "error" not in fields_metadata:
         app_context.schema_cache[cache_key] = fields_metadata
+        process_cache_set(cache_key, fields_metadata)
         return fields_metadata
     return {}
 
@@ -3459,9 +3638,9 @@ def list_models(
     odoo = ctx.request_context.lifespan_context.odoo
     try:
         limit = clamp_limit(limit, maximum=500)
-        models = odoo.get_models()
+        models = _cached_models(ctx.request_context.lifespan_context, odoo)
         if "error" in models:
-            return {"success": False, "error": models["error"]}
+            return error_response("list_models", RuntimeError(str(models["error"])))
 
         model_names = models.get("model_names", [])
         models_details = models.get("models_details", {})
@@ -3586,7 +3765,10 @@ def get_model_fields(
     odoo = ctx.request_context.lifespan_context.odoo
     try:
         validate_model_name(model)
-        fields = odoo.get_model_fields(model)
+        app_context = ctx.request_context.lifespan_context
+        fields = _cached_fields_metadata(app_context, odoo, model)
+        if not fields:
+            fields = odoo.get_model_fields(model)
         if "error" in fields:
             return error_response(
                 "get_model_fields", RuntimeError(str(fields["error"])), model=model,
@@ -3701,12 +3883,17 @@ def search_records(
         total_count: Optional[int] = None
         count_error: Optional[str] = None
         try:
-            counted = call_with_transport_retry(
-                lambda: odoo.execute_method(model, "search_count", normalized_domain),
-                label=f"search_count({model})",
-            )
-            if isinstance(counted, int):
-                total_count = counted
+            if offset == 0 and len(records) < limit:
+                # A short first page is the whole result set; the second
+                # RPC would only confirm what the page already proves.
+                total_count = len(records)
+            else:
+                counted = call_with_transport_retry(
+                    lambda: odoo.execute_method(model, "search_count", normalized_domain),
+                    label=f"search_count({model})",
+                )
+                if isinstance(counted, int):
+                    total_count = counted
         except Exception as count_exc:  # noqa: BLE001 — page result is still valid
             # Same rule as error_response: cause line to the agent, full
             # traceback only to the log.
@@ -3920,7 +4107,8 @@ def aggregate_records(
         bool, Field(description="read_group lazy flag; keep false for full grouping.")
     ] = False,
     limit: Annotated[
-        Optional[int], Field(description="Maximum number of groups to return.", ge=1)
+        Optional[int],
+        Field(description="Maximum number of groups to return (default and cap 100).", ge=1),
     ] = None,
     offset: Annotated[int, Field(description="Groups to skip.", ge=0)] = 0,
     order: Annotated[
@@ -3945,7 +4133,7 @@ def aggregate_records(
             raise ValueError("group_by must include at least one field")
         if offset < 0:
             raise ValueError("offset must be greater than or equal to 0")
-        clamped_limit = clamp_limit(limit) if limit is not None else None
+        clamped_limit = clamp_limit(limit if limit is not None else MAX_SEARCH_LIMIT)
         normalized_domain = normalize_domain_input(domain)
         normalized_measures: List[str] = []
         parsed_measures: List[tuple[str, str]] = []
@@ -4007,7 +4195,8 @@ def aggregate_records(
             rows = odoo.execute_method(model, "read_group", **kwargs)
             fallback_reason = ""
 
-        return {
+        rows = [strip_read_group_internals(row) for row in rows]
+        response = {
             "success": True,
             "method": method_used,
             "major_version": major,
@@ -4016,10 +4205,31 @@ def aggregate_records(
             "group_by": group_by,
             "measures": normalized_measures,
             "row_count": len(rows),
+            "limit": clamped_limit,
+            "offset": offset,
             "rows": rows,
         }
+        if len(rows) >= clamped_limit:
+            response["truncated"] = True
+            response["warning"] = (
+                f"Only the first {clamped_limit} groups are returned. Narrow the "
+                "domain, group coarser, or page with offset."
+            )
+        return response
     except Exception as e:
         return error_response("aggregate_records", e, model=model)
+
+
+READ_GROUP_INTERNAL_KEYS = ("__domain", "__context", "__range", "__fold")
+
+
+def strip_read_group_internals(row: Any) -> Any:
+    """Drop read_group bookkeeping (``__domain`` repeats the whole domain per
+    row, ``__context`` the group context) that no agent needs; ``__count``
+    stays."""
+    if not isinstance(row, dict):
+        return row
+    return {k: v for k, v in row.items() if k not in READ_GROUP_INTERNAL_KEYS}
 
 
 def _message_post_returning_id(odoo, model: str, record_id: int, kwargs: Dict[str, Any]) -> int:
@@ -4199,6 +4409,68 @@ def chatter_post(
         }
     except Exception as e:
         return error_response("chatter_post", e, model=model)
+
+
+@mcp.tool(
+    description=(
+        "Resolve a name to record ids in one RPC: returns [{id, display_name}] "
+        "using the model's own name_search (matches name, ref, email, ... as "
+        "the model defines). Use this instead of search_records with ilike "
+        "when you only need to find the record."
+    ),
+    annotations=READ_ONLY_TOOL,
+    structured_output=True,
+)
+def name_search(
+    ctx: Context,
+    model: Annotated[str, Field(description="Technical model name, e.g. 'res.partner'.")],
+    name: Annotated[str, Field(description="Text to match, e.g. 'Müller' or 'S00042'.")],
+    limit: Annotated[int, Field(description="Maximum matches, 1-100.", ge=1)] = 20,
+    domain: Annotated[
+        Optional[Union[str, List[Any], Dict[str, Any]]],
+        Field(description="Optional extra domain to restrict candidates, same format as search_records."),
+    ] = None,
+    operator: Annotated[
+        str, Field(description="Odoo match operator: 'ilike' (default), '=', '=ilike', 'not ilike'."),
+    ] = "ilike",
+) -> Dict[str, Any]:
+    """Find records by display name; one round trip, no field list needed."""
+    odoo = ctx.request_context.lifespan_context.odoo
+    try:
+        validate_model_name(model)
+        limit = clamp_limit(limit)
+        if operator not in {"ilike", "=", "=ilike", "not ilike", "like", "=like"}:
+            raise ValueError("operator must be one of ilike, =, =ilike, not ilike, like, =like")
+        normalized_domain = normalize_domain_input(domain)
+        audit_odoo_execution("name_search", model, "name_search")
+        pairs = call_with_transport_retry(
+            lambda: odoo.execute_method(
+                model, "name_search", name=name, domain=normalized_domain,
+                operator=operator, limit=limit,
+            ),
+            label=f"name_search({model})",
+        )
+        result = [
+            {"id": pair[0], "display_name": pair[1]}
+            for pair in (pairs or [])
+            if isinstance(pair, (list, tuple)) and len(pair) >= 2
+        ]
+        response: Dict[str, Any] = {
+            "success": True,
+            "model": model,
+            "count": len(result),
+            "limit": limit,
+            "result": result,
+        }
+        if len(result) >= limit:
+            response["truncated"] = True
+            response["warning"] = (
+                f"{limit} matches returned; more may exist. Refine the name or "
+                "add a domain."
+            )
+        return response
+    except Exception as e:
+        return error_response("name_search", e, model=model)
 
 
 @mcp.tool(

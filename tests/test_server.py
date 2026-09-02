@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import logging
 import json
 from pathlib import Path
 
@@ -162,6 +163,7 @@ def test_server_registers_expected_tools_and_resources_without_lifespan():
         "search_records",
         "read_record",
         "search_employee",
+        "name_search",
         "search_holidays",
         "diagnose_odoo_call",
         "diagnose_access",
@@ -194,7 +196,7 @@ def test_server_registers_expected_tools_and_resources_without_lifespan():
         "price_preview",
     }
     assert expected_tools <= tools
-    assert len(tools) == 35
+    assert len(tools) == 36
     assert "odoo://models" in resources
     assert {
         "odoo://model/{model_name}",
@@ -1217,7 +1219,7 @@ def test_profile_health_and_prompts_are_available():
 
     health = call_tool_json(server, "health_check", {})
     assert health["success"] is True
-    assert health["server"]["tool_count"] == 35
+    assert health["server"]["tool_count"] == 36
     assert health["runtime"]["chatter_direct_enabled"] is False
     assert health["runtime"]["broad_unknown_method_mode"]["enabled"] is False
 
@@ -2301,7 +2303,7 @@ def test_max_smart_fields_invalid_env_falls_back_to_default(monkeypatch):
 def test_mcp_surface_counts_reports_v030_totals():
     server = importlib.import_module("odoo_mcp.server")
     counts = server.mcp_surface_counts()
-    assert counts["tool_count"] == 35
+    assert counts["tool_count"] == 36
     assert counts["prompt_count"] == 5
     # 1 fixed resource + 3 templates = 4
     assert counts["resource_count"] == 4
@@ -4589,3 +4591,209 @@ def test_core_tool_parameters_carry_descriptions():
     domain = tools["search_records"].inputSchema["properties"]["domain"]["description"]
     assert "[field, operator, value]" in domain
     assert "UTC" in domain
+
+
+# ----- 2026-09-02: Aufwand-M-Punkte (Anchor mcp_agent_ergonomics_m) --------
+
+
+class _CountingSchemaClient:
+    def __init__(self, models=None):
+        self.fields_calls = 0
+        self.models_calls = 0
+        self.calls = []
+        self._models = models or {
+            "model_names": ["res.partner", "sale.order"],
+            "models_details": {"res.partner": {"name": "Contact"}, "sale.order": {"name": "Sales Order"}},
+        }
+
+    def get_model_fields(self, model):
+        self.fields_calls += 1
+        return dict(_PARTNER_FIELDS)
+
+    def get_models(self):
+        self.models_calls += 1
+        return self._models
+
+    def get_server_version(self):
+        return {"server_version": "18.0"}
+
+    def search_read(self, model_name, domain, fields=None, **kwargs):
+        self.calls.append(((model_name, "search_read", domain, fields), kwargs))
+        return [{"id": 1, "name": "A"}, {"id": 2, "name": "B"}]
+
+    def execute_method(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        method = args[1] if len(args) > 1 else None
+        if method == "name_search":
+            return [[7, "Müller GmbH"], [9, "Müller, Anna"]]
+        if method == "search_read":
+            return [{"id": 1}, {"id": 2}]
+        if method == "search_count":
+            return 250
+        if method == "read_group":
+            return [
+                {"partner_id": [7, "A"], "__count": 3, "__domain": [["partner_id", "=", 7]], "__context": {"group_by": []}},
+            ]
+        return []
+
+
+def test_process_schema_cache_survives_a_new_app_context(monkeypatch):
+    server = importlib.import_module("odoo_mcp.server")
+    monkeypatch.delenv("ODOO_MCP_SCHEMA_CACHE_TTL", raising=False)
+    client = _CountingSchemaClient()
+
+    first = server.get_model_fields(FakeCtx(client), "res.partner")
+    second = server.get_model_fields(FakeCtx(client), "res.partner")  # fresh session
+    server.search_records(FakeCtx(client), "res.partner")  # smart fields need metadata too
+
+    assert first["success"] and second["success"]
+    assert client.fields_calls == 1
+
+    server.list_models(FakeCtx(client))
+    server.list_models(FakeCtx(client), query="sale")
+    assert client.models_calls == 1
+
+
+def test_process_schema_cache_is_scoped_per_user(monkeypatch):
+    server = importlib.import_module("odoo_mcp.server")
+    auth = importlib.import_module("odoo_mcp._nesa_per_user_auth")
+    client = _CountingSchemaClient()
+
+    token = auth.set_user_context("alice", "key-a")
+    try:
+        server.get_model_fields(FakeCtx(client), "res.partner")
+    finally:
+        auth.reset_user_context(token)
+    token = auth.set_user_context("bob", "key-b")
+    try:
+        server.get_model_fields(FakeCtx(client), "res.partner")
+        server.get_model_fields(FakeCtx(client), "res.partner")
+    finally:
+        auth.reset_user_context(token)
+
+    assert client.fields_calls == 2
+
+
+def test_process_schema_cache_can_be_disabled_and_expires(monkeypatch):
+    server = importlib.import_module("odoo_mcp.server")
+    client = _CountingSchemaClient()
+
+    monkeypatch.setenv("ODOO_MCP_SCHEMA_CACHE_TTL", "0")
+    server.get_model_fields(FakeCtx(client), "res.partner")
+    server.get_model_fields(FakeCtx(client), "res.partner")
+    assert client.fields_calls == 2
+
+    monkeypatch.setenv("ODOO_MCP_SCHEMA_CACHE_TTL", "300")
+    server.get_model_fields(FakeCtx(client), "res.partner")
+    assert client.fields_calls == 3
+    server.get_model_fields(FakeCtx(client), "res.partner")
+    assert client.fields_calls == 3
+    clock = [server.time.monotonic() + 301]
+    monkeypatch.setattr(server.time, "monotonic", lambda: clock[0])
+    server.get_model_fields(FakeCtx(client), "res.partner")
+    assert client.fields_calls == 4
+
+
+def test_name_search_returns_id_display_name_pairs_in_one_rpc():
+    server = importlib.import_module("odoo_mcp.server")
+    client = _CountingSchemaClient()
+
+    result = server.name_search(FakeCtx(client), "res.partner", "Müller", limit=5)
+
+    assert result["success"] is True
+    assert result["result"] == [
+        {"id": 7, "display_name": "Müller GmbH"},
+        {"id": 9, "display_name": "Müller, Anna"},
+    ]
+    assert result["count"] == 2 and "truncated" not in result
+    assert len(client.calls) == 1
+    args, kwargs = client.calls[0]
+    assert args[:2] == ("res.partner", "name_search")
+    assert kwargs == {"name": "Müller", "domain": [], "operator": "ilike", "limit": 5}
+
+    truncated = server.name_search(FakeCtx(client), "res.partner", "M", limit=2)
+    assert truncated["truncated"] is True
+
+    bad = server.name_search(FakeCtx(client), "res.partner", "x", operator="drop")
+    assert bad["success"] is False and "operator" in bad["error"]
+
+
+def test_search_records_skips_search_count_for_a_short_first_page():
+    server = importlib.import_module("odoo_mcp.server")
+    client = _CountingSchemaClient()
+
+    page = server.search_records(FakeCtx(client), "res.partner", fields=["name"], limit=10)
+    methods = [args[1] for args, _ in client.calls]
+    assert methods == ["search_read"]
+    assert page["total_count"] == 2 and page["has_more"] is False
+
+    client.calls.clear()
+    full = server.search_records(FakeCtx(client), "res.partner", fields=["name"], limit=2)
+    assert [args[1] for args, _ in client.calls] == ["search_read", "search_count"]
+    assert full["total_count"] == 250 and full["has_more"] is True
+
+    client.calls.clear()
+    server.search_records(FakeCtx(client), "res.partner", fields=["name"], limit=10, offset=5)
+    assert [args[1] for args, _ in client.calls] == ["search_read", "search_count"]
+
+
+def test_aggregate_records_defaults_to_100_groups_and_strips_internals():
+    server = importlib.import_module("odoo_mcp.server")
+    client = _CountingSchemaClient()
+
+    result = server.aggregate_records(
+        FakeCtx(client), "sale.order", group_by=["partner_id"], measures=["amount_total:sum"],
+    )
+
+    assert result["success"] is True
+    _, kwargs = client.calls[0]
+    assert kwargs["limit"] == server.MAX_SEARCH_LIMIT
+    assert result["rows"] == [{"partner_id": [7, "A"], "__count": 3}]
+    assert result["limit"] == 100 and "truncated" not in result
+
+    client.calls.clear()
+    capped = server.aggregate_records(
+        FakeCtx(client), "sale.order", group_by=["partner_id"], measures=["amount_total:sum"], limit=1,
+    )
+    assert capped["truncated"] is True and "offset" in capped["warning"]
+
+
+def test_tool_call_log_line_reports_login_model_count_bytes(caplog):
+    server = importlib.import_module("odoo_mcp.server")
+    auth = importlib.import_module("odoo_mcp._nesa_per_user_auth")
+    started = server.time.perf_counter()
+    token = auth.set_user_context("alice", "key-a")
+    try:
+        with caplog.at_level(logging.INFO, logger=server.logger.name):
+            server.log_tool_call(
+                "search_records", {"model": "res.partner", "domain": []},
+                ([], {"success": True, "count": 2, "result": [{"id": 1}, {"id": 2}]}),
+                started, None,
+            )
+            server.log_tool_call("execute_method", {"model": "sale.order"}, None, started, "ValueError")
+    finally:
+        auth.reset_user_context(token)
+
+    lines = [r.getMessage() for r in caplog.records if "[mcp_call]" in r.getMessage()]
+    assert len(lines) == 2
+    assert "tool=search_records login=alice model=res.partner ok=true n=2 bytes=" in lines[0]
+    assert "key-a" not in lines[0]
+    assert "tool=execute_method login=alice model=sale.order ok=- n=- bytes=0" in lines[1]
+    assert lines[1].endswith("error=ValueError")
+
+
+def test_call_tool_logs_even_when_the_tool_raises(monkeypatch, caplog):
+    import asyncio
+    server = importlib.import_module("odoo_mcp.server")
+
+    async def _fail(self, name, arguments):
+        raise RuntimeError("kaputt")
+
+    # Only the wrapper's finally-branch is under test, not FastMCP dispatch.
+    monkeypatch.setattr(server.FastMCP, "call_tool", _fail)
+    probe = server.NesaFastMCP("probe")
+    with caplog.at_level(logging.INFO, logger=server.logger.name):
+        with pytest.raises(RuntimeError):
+            asyncio.run(probe.call_tool("list_models", {}))
+    lines = [r.getMessage() for r in caplog.records if "[mcp_call]" in r.getMessage()]
+    assert lines and "tool=list_models" in lines[0] and lines[0].endswith("error=RuntimeError")
