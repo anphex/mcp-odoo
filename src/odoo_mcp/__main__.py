@@ -103,7 +103,9 @@ def setup_logging(
 
     stream_handler = logging.StreamHandler(sys.stderr)
     stream_handler.setFormatter(formatter)
-    stream_handler.setLevel(resolved_level)
+    # With a log file configured, stderr keeps only warnings and errors;
+    # otherwise every line was written twice (file + journal/err file).
+    stream_handler.setLevel("WARNING" if resolved_file else resolved_level)
     root.addHandler(stream_handler)
 
     if resolved_file:
@@ -117,7 +119,31 @@ def setup_logging(
         file_handler.setLevel(resolved_level)
         root.addHandler(file_handler)
 
+    quiet_transport_loggers(resolved_level)
     return root
+
+
+# Session bookkeeping of the MCP SDK: "Created new transport", "Terminating
+# session", "idle timeout", "Processing request of type ...".  Three lines per
+# session, ~3 000 lines a day from health probes alone, no operational value
+# below DEBUG.
+NOISY_TRANSPORT_LOGGERS = (
+    "mcp.server.streamable_http_manager",
+    "mcp.server.streamable_http",
+    "mcp.server.lowlevel.server",
+    "mcp.server.session",
+)
+
+
+def quiet_transport_loggers(resolved_level: str) -> None:
+    """Raise the SDK transport loggers to WARNING unless DEBUG was requested.
+
+    DEBUG resets them to NOTSET so a reconfiguration from INFO to DEBUG in the
+    same process really re-enables the SDK output.
+    """
+    level = logging.NOTSET if resolved_level == "DEBUG" else logging.WARNING
+    for name in NOISY_TRANSPORT_LOGGERS:
+        logging.getLogger(name).setLevel(level)
 
 
 def parse_bool(value: str | None) -> bool:
@@ -319,6 +345,9 @@ def main() -> int:
                 host=mcp.settings.host,
                 port=mcp.settings.port,
                 log_level=mcp.settings.log_level.lower(),
+                # One "POST /mcp 200" per request says nothing the tool-level
+                # log does not; it was ~850 of every 3000 stdout lines.
+                access_log=False,
             )
         else:
             mcp.run(transport=args.transport)

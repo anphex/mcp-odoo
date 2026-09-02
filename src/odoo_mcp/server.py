@@ -17,7 +17,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
+from typing import Annotated, Any, AsyncIterator, Callable, Dict, List, Optional, Union
 
 from mcp.server.fastmcp import Context, FastMCP, Image
 from mcp.types import Annotations, ToolAnnotations
@@ -200,9 +200,39 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
 
 
 # Create MCP server
+SERVER_INSTRUCTIONS = (
+    "Odoo 18 ERP of NESA Haustechnik, per-user: every call runs with the "
+    "Odoo rights of the authenticated user.\n"
+    "READ: search_records (paged, total_count) -> read_record/read_records "
+    "by id -> aggregate_records for counts/sums per group -> chatter_read "
+    "for message history. Use get_model_fields before guessing a field "
+    "name; list_models to find a model. Never use execute_method for "
+    "plain reads.\n"
+    "WRITE: validate_write -> execute_approved_write (preview_write is an "
+    "optional dry run). execute_method runs business methods "
+    "(action_confirm, action_done, ...); CRUD on persistent models is "
+    "refused there. list_allowed_methods explains the policy instead of "
+    "probing. A rejected approval token that was 'already consumed' means "
+    "the write DID run: read the record back, do not repeat.\n"
+    "FORMATS: domain = JSON list of [field, operator, value] triples, e.g. "
+    "[[\"partner_id\", \"=\", 42], [\"state\", \"in\", [\"sale\", \"done\"]]]; "
+    "prefix operators \"&\"/\"|\"/\"!\" are allowed. Dates are "
+    "\"YYYY-MM-DD\", datetimes are naive UTC \"YYYY-MM-DD HH:MM:SS\" (the "
+    "company runs on Europe/Berlin, so convert before comparing). many2one "
+    "values come back as [id, display_name], x2many as id lists, empty "
+    "values as false. Without 'fields' a curated subset is returned; "
+    "fields=[\"*\"] returns every non-binary field. limit is capped at 100.\n"
+    "ODOO 18 NAMES (not 17): project.task uses date_deadline (no "
+    "planned_date_end), product cost is standard_price (no "
+    "purchase_price), task effort is allocated_hours (no planned_hours), "
+    "invoice payment reference is payment_reference. Legacy work "
+    "reports are searched as 'TGZ-<nr>' in the task name, never as a bare "
+    "number. bank.rec.widget is a UI widget and cannot be driven over RPC."
+)
+
 mcp = FastMCP(
     "Odoo MCP Server",
-    instructions="MCP Server for interacting with Odoo ERP systems",
+    instructions=SERVER_INSTRUCTIONS,
     dependencies=["requests"],
     lifespan=app_lifespan,
 )
@@ -266,7 +296,7 @@ def get_model_info(model_name: str) -> str:
 
         return json.dumps(model_info, indent=2)
     except Exception as e:
-        return json.dumps({"error": str(e)}, indent=2)
+        return json.dumps({"error": compact_error_message(e)[0]}, indent=2)
 
 
 @mcp.resource(
@@ -296,7 +326,7 @@ def get_record(model_name: str, record_id: str) -> str:
             )
         return json.dumps(record[0], indent=2)
     except Exception as e:
-        return json.dumps({"error": str(e)}, indent=2)
+        return json.dumps({"error": compact_error_message(e)[0]}, indent=2)
 
 
 @mcp.resource(
@@ -329,7 +359,7 @@ def search_records_resource(model_name: str, domain: str) -> str:
 
         return json.dumps(results, indent=2)
     except Exception as e:
-        return json.dumps({"error": str(e)}, indent=2)
+        return json.dumps({"error": compact_error_message(e)[0]}, indent=2)
 
 
 # ----- Pydantic models for type safety -----
@@ -1160,8 +1190,27 @@ def _unknown_fields_message(
     )
 
 
+DOMAIN_FORMAT_HINT = (
+    "Pass the domain as a JSON list of [field, operator, value] triples, "
+    'e.g. [["state", "=", "sale"], ["partner_id", "in", [7, 9]]]; the prefix '
+    'operators "&", "|" and "!" are allowed as bare strings. An empty list '
+    "means no filter."
+)
+
+
+def _domain_error(reason: str) -> ValueError:
+    return ValueError(f"Invalid domain: {reason}. {DOMAIN_FORMAT_HINT}")
+
+
 def normalize_domain_input(domain: Any) -> List[Any]:
-    """Normalize common MCP/JSON domain shapes to an Odoo domain list."""
+    """Normalize common MCP/JSON domain shapes to an Odoo domain list.
+
+    Empty input (``None``, ``""``, ``[]``, ``[[]]``, ``{}``) means "no
+    filter".  Anything else that cannot be turned into a domain raises
+    ``ValueError`` instead of being dropped: a silently emptied domain used to
+    turn "find the invoices of partner X" into "find every invoice" and the
+    agent had no way to notice.
+    """
     if domain is None:
         return []
     if isinstance(domain, SearchDomain):
@@ -1169,6 +1218,8 @@ def normalize_domain_input(domain: Any) -> List[Any]:
 
     domain_value = domain
     if isinstance(domain_value, str):
+        if not domain_value.strip():
+            return []
         try:
             domain_value = json.loads(domain_value)
         except json.JSONDecodeError:
@@ -1177,26 +1228,49 @@ def normalize_domain_input(domain: Any) -> List[Any]:
 
                 domain_value = ast.literal_eval(domain_value)
             except (SyntaxError, ValueError):
-                return []
+                raise _domain_error(
+                    f"the string {domain_value[:120]!r} is neither JSON nor a "
+                    "Python literal"
+                ) from None
 
     if isinstance(domain_value, dict):
+        if not domain_value:
+            return []
         conditions = domain_value.get("conditions")
-        if isinstance(conditions, list):
-            return [
-                [cond["field"], cond["operator"], cond["value"]]
-                for cond in conditions
-                if isinstance(cond, dict)
-                and all(k in cond for k in ["field", "operator", "value"])
-            ]
-        return []
+        if not isinstance(conditions, list):
+            raise _domain_error(
+                "a dict domain needs a 'conditions' list of "
+                "{field, operator, value} objects"
+            )
+        normalized: List[Any] = []
+        for cond in conditions:
+            if not (
+                isinstance(cond, dict)
+                and isinstance(cond.get("field"), str)
+                and isinstance(cond.get("operator"), str)
+                and "value" in cond
+            ):
+                raise _domain_error(
+                    f"condition {cond!r:.120} needs string field/operator and a value"
+                )
+            normalized.append([cond["field"], cond["operator"], cond["value"]])
+        return normalized
 
+    if isinstance(domain_value, tuple):
+        domain_value = list(domain_value)
     if not isinstance(domain_value, list):
-        return []
+        raise _domain_error(
+            f"got {type(domain_value).__name__} {domain_value!r:.120}"
+        )
 
-    if len(domain_value) == 1 and isinstance(domain_value[0], list) and domain_value[0]:
-        domain_value = domain_value[0]
+    if (
+        len(domain_value) == 1
+        and isinstance(domain_value[0], (list, tuple))
+        and domain_value[0]
+    ):
+        domain_value = list(domain_value[0])
 
-    if not domain_value:
+    if not domain_value or domain_value == [[]]:
         return []
     if (
         len(domain_value) == 3
@@ -1214,12 +1288,16 @@ def normalize_domain_input(domain: Any) -> List[Any]:
             valid_conditions.append(cond)
             continue
         if (
-            isinstance(cond, list)
+            isinstance(cond, (list, tuple))
             and len(cond) == 3
             and isinstance(cond[0], str)
             and isinstance(cond[1], str)
         ):
-            valid_conditions.append(cond)
+            valid_conditions.append(list(cond))
+            continue
+        raise _domain_error(
+            f"element {cond!r:.120} is not a [field, operator, value] triple"
+        )
 
     return valid_conditions
 
@@ -1968,11 +2046,7 @@ def inspect_model_relationships(
             include_computed=include_computed,
         )
     except Exception as e:
-        return {
-            "success": False,
-            "tool": "inspect_model_relationships",
-            "error": str(e),
-        }
+        return error_response("inspect_model_relationships", e, model=model)
 
 
 @mcp.tool(
@@ -2333,7 +2407,7 @@ def diagnose_access(
             },
         }
     except Exception as e:
-        return {"success": False, "tool": "diagnose_access", "error": str(e)}
+        return error_response("diagnose_access", e, model=model)
 
 
 @mcp.tool(
@@ -2446,7 +2520,7 @@ def get_odoo_profile(
             },
         }
     except Exception as e:
-        return {"success": False, "tool": "get_odoo_profile", "error": str(e)}
+        return error_response("get_odoo_profile", e)
 
 
 @mcp.tool(
@@ -2536,7 +2610,7 @@ def schema_catalog(
         app_context.schema_cache[cache_key] = dict(report)
         return report
     except Exception as e:
-        return {"success": False, "tool": "schema_catalog", "error": str(e)}
+        return error_response("schema_catalog", e)
 
 
 @mcp.tool(
@@ -2570,7 +2644,7 @@ def preview_write(
             context=context,
         )
     except Exception as e:
-        return {"success": False, "tool": "preview_write", "error": str(e)}
+        return error_response("preview_write", e, model=model)
 
 
 @mcp.tool(
@@ -2667,7 +2741,7 @@ def validate_write(
             }
         return report
     except Exception as e:
-        return {"success": False, "tool": "validate_write", "error": str(e)}
+        return error_response("validate_write", e, model=model)
 
 
 @mcp.tool(
@@ -2928,7 +3002,7 @@ def build_domain(
             fields_metadata=fields_metadata,
         )
     except Exception as e:
-        return {"success": False, "tool": "build_domain", "error": str(e)}
+        return error_response("build_domain", e)
 
 
 @mcp.tool(
@@ -2961,7 +3035,7 @@ def business_pack_report(
             installed_modules=installed_modules,
         )
     except Exception as e:
-        return {"success": False, "tool": "business_pack_report", "error": str(e)}
+        return error_response("business_pack_report", e)
 
 
 @mcp.tool(
@@ -2984,17 +3058,166 @@ def health_check() -> Dict[str, Any]:
     }
 
 
+# Positional index of ``limit`` / ``fields`` in the Odoo 18 ORM signatures
+# that execute_method is most often (mis)used for.  search_read(domain, fields,
+# offset, limit, order), search(domain, offset, limit, order),
+# search_fetch(domain, field_names, offset, limit, order), read(ids, fields).
+_EXECUTE_READ_LIMIT_POSITION = {"search_read": 3, "search": 2, "search_fetch": 3}
+_EXECUTE_READ_FIELDS_POSITION = {"search_read": 1, "search_fetch": 1, "read": 1}
+_EXECUTE_READ_FIELDS_KWARG = {"search_read": "fields", "search_fetch": "field_names", "read": "fields"}
+
+
+def _bounded_execute_limit(value: Any) -> int:
+    """Clamp an execute_method ``limit`` to the read-tool page size.
+
+    ``None``/``False``/``0`` mean "no limit" in the ORM and therefore become
+    the cap; anything that is not a positive integer is rejected.
+    """
+    if value is None or value is False or value == 0:
+        return MAX_SEARCH_LIMIT
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(
+            f"limit must be a positive integer (max {MAX_SEARCH_LIMIT}), got {value!r:.60}"
+        )
+    return min(value, MAX_SEARCH_LIMIT)
+
+
+def bound_execute_method_read(
+    app_context: "AppContext",
+    odoo: OdooClient,
+    model: str,
+    method: str,
+    args: List[Any],
+    kwargs: Dict[str, Any],
+) -> tuple[List[Any], Dict[str, Any], List[str]]:
+    """Apply the read-tool limits to reads that arrive through execute_method.
+
+    search_records/read_records cap the page at ``MAX_SEARCH_LIMIT`` and never
+    return binary fields unless named.  The same ``search_read`` issued through
+    execute_method used to bypass both, so one unbounded call on ir.attachment
+    could hand the agent every ``datas`` blob in the database.  Explicit field
+    lists win; limits are clamped to the cap; every adjustment is reported.
+    """
+    notes: List[str] = []
+    limit_pos = _EXECUTE_READ_LIMIT_POSITION.get(method)
+    if limit_pos is not None:
+        if len(args) > limit_pos:
+            bounded = _bounded_execute_limit(args[limit_pos])
+            if bounded != args[limit_pos]:
+                notes.append(
+                    f"limit {args[limit_pos]!r} clamped to {bounded}. Prefer "
+                    "search_records, which pages and reports total_count."
+                )
+            args[limit_pos] = bounded
+        elif "limit" in kwargs:
+            bounded = _bounded_execute_limit(kwargs["limit"])
+            if bounded != kwargs["limit"]:
+                notes.append(
+                    f"limit {kwargs['limit']!r} clamped to {bounded}. Prefer "
+                    "search_records, which pages and reports total_count."
+                )
+            kwargs["limit"] = bounded
+        else:
+            kwargs["limit"] = MAX_SEARCH_LIMIT
+            notes.append(
+                f"No limit given; limit={MAX_SEARCH_LIMIT} applied. Prefer "
+                "search_records, which pages and reports total_count."
+            )
+    if method == "read":
+        ids = args[0] if args else kwargs.get("ids")
+        if isinstance(ids, (list, tuple)) and len(ids) > MAX_SEARCH_LIMIT:
+            raise ValueError(
+                f"read accepts at most {MAX_SEARCH_LIMIT} record ids per call "
+                f"(got {len(ids)}); page the ids or use read_records."
+            )
+    fields_pos = _EXECUTE_READ_FIELDS_POSITION.get(method)
+    if fields_pos is not None:
+        fields_kwarg = _EXECUTE_READ_FIELDS_KWARG[method]
+        positional_present = len(args) > fields_pos
+        keyword_present = fields_kwarg in kwargs
+        if positional_present and keyword_present:
+            raise ValueError(
+                f"{fields_kwarg} was given both positionally and as a keyword"
+            )
+        explicit = args[fields_pos] if positional_present else kwargs.get(fields_kwarg)
+        if not explicit:
+            # ``None``/``[]`` mean "every field" in the ORM, binaries included.
+            try:
+                expanded, _ = resolve_read_fields(app_context, odoo, model, ["*"])
+            except Exception as exc:
+                raise ValueError(
+                    f"Cannot expand the omitted {fields_kwarg} for {model} "
+                    f"({compact_error_message(exc)[0]}); name the fields you "
+                    "need or use search_records/read_records."
+                ) from exc
+            if positional_present:
+                args[fields_pos] = expanded
+            else:
+                kwargs[fields_kwarg] = expanded
+            notes.append(
+                f"No {fields_kwarg} given; every non-binary field was requested "
+                "instead of the raw default that includes binary payloads. "
+                "Name the fields you need, or use read_records."
+            )
+    return args, kwargs, notes
+
+
+def is_unmarshallable_none_fault(exc: BaseException) -> bool:
+    """True for Odoo's fault when a method returned ``None`` over XML-RPC.
+
+    Odoo executes and commits first, then fails to encode the response:
+    ``cannot marshal None unless allow_none is enabled``.  The transaction is
+    done by then, so the caller must not treat it as a failed call.
+    """
+    import xmlrpc.client
+
+    # Only a Fault proves the request reached Odoo.  xmlrpc.client raises a
+    # client-side TypeError with the very same text when *our* arguments
+    # contain None — nothing was sent then, and "do not repeat" would lie.
+    if not isinstance(exc, xmlrpc.client.Fault):
+        return False
+    return "cannot marshal none" in str(exc.faultString).casefold()
+
+
 @mcp.tool(
-    description="Execute a custom method on an Odoo model",
+    description=(
+        "Run one Odoo model method, e.g. sale.order.action_confirm or "
+        "mail.activity.action_done, with the acting user's rights. Not for "
+        "reads (use search_records/read_records/aggregate_records) and not "
+        "for create/write/unlink on persistent models (use validate_write -> "
+        "execute_approved_write). Reads that still arrive here are capped at "
+        "100 rows and exclude binary fields unless named."
+    ),
     annotations=DESTRUCTIVE_TOOL,
     structured_output=True,
 )
 def execute_method(
     ctx: Context,
-    model: str,
-    method: str,
-    args: Optional[List[Any]] = None,
-    kwargs: Optional[Dict[str, Any]] = None,
+    model: Annotated[str, Field(description="Technical model name, e.g. 'sale.order'.")],
+    method: Annotated[
+        str,
+        Field(
+            description=(
+                "Method name, e.g. 'action_confirm'. For plain reads use "
+                "search_records/read_records instead; create/write/unlink on "
+                "persistent models go through validate_write -> "
+                "execute_approved_write."
+            )
+        ),
+    ],
+    args: Annotated[
+        Optional[List[Any]],
+        Field(
+            description=(
+                "Positional arguments. Record methods take the id list first, "
+                "e.g. [[42]] for sale.order.action_confirm on id 42."
+            )
+        ),
+    ] = None,
+    kwargs: Annotated[
+        Optional[Dict[str, Any]],
+        Field(description="Keyword arguments, e.g. {\"limit\": 20} or {\"context\": {...}}."),
+    ] = None,
 ) -> Dict[str, Any]:
     """
     Execute a custom method on an Odoo model
@@ -3120,19 +3343,40 @@ def execute_method(
             and not side_effect_method_allowed(model, method)
             and not truthy_env("ODOO_MCP_ALLOW_UNKNOWN_METHODS")
         ):
+            from . import _nesa_db_allowlist
+
+            model_prefix = f"{model}."
+            allowed_here = sorted(
+                entry
+                for entry in set(_nesa_db_allowlist.methods()) | set(allowed_side_effect_methods())
+                if entry.startswith(model_prefix)
+            )
+            if allowed_here:
+                alternatives = (
+                    f"Methods reviewed for {model}: "
+                    + ", ".join(entry[len(model_prefix):] for entry in allowed_here)
+                    + "."
+                )
+            else:
+                alternatives = f"No method of {model} is on the reviewed list yet."
             return {
                 "success": False,
                 "error": (
-                    "Unreviewed side-effect methods are blocked by default. Review "
-                    "custom source and allow exact methods through "
-                    "ODOO_MCP_ALLOWED_SIDE_EFFECT_METHODS=model.method, or set "
-                    "ODOO_MCP_NATIVE_ACL_PARITY=1 with strict per-user "
-                    "authentication so native Odoo permissions decide."
+                    f"{model}.{method} is a side-effect method that has not been "
+                    "reviewed for this deployment, so it is not executed. "
+                    f"{alternatives} Call list_allowed_methods(model=...) for "
+                    "the full policy. If the goal is a create/write, use "
+                    "validate_write -> execute_approved_write. Reviewing a "
+                    "method is an administrator task in Odoo (NESA MCP > "
+                    "Allowed Methods), not something this session can change."
                 ),
+                "reason_code": "method_not_reviewed",
+                "allowed_methods_for_model": allowed_here,
                 "classification": safety,
             }
         args = args or []
         kwargs, removed_context_keys = sanitized_execution_kwargs(kwargs)
+        warnings: List[str] = []
 
         # Special handling for search methods like search, search_count, search_read
         search_methods = ["search", "search_count", "search_read"]
@@ -3148,15 +3392,34 @@ def execute_method(
                 args = normalized_args
 
         odoo = app_context.odoo
+        args, kwargs, read_notes = bound_execute_method_read(
+            app_context, odoo, model, method, list(args), dict(kwargs),
+        )
+        warnings.extend(read_notes)
         audit_odoo_execution("execute_method", model, method)
         call_args = list(args)
         call_kwargs = dict(kwargs)
-        result = call_with_transport_retry(
-            lambda: odoo.execute_method(model, method, *call_args, **call_kwargs),
-            label=f"{model}.{method}",
-            idempotent=method in IDEMPOTENT_READ_METHODS,
-        )
+        try:
+            result = call_with_transport_retry(
+                lambda: odoo.execute_method(model, method, *call_args, **call_kwargs),
+                label=f"{model}.{method}",
+                idempotent=method in IDEMPOTENT_READ_METHODS,
+            )
+        except Exception as call_exc:
+            if not is_unmarshallable_none_fault(call_exc):
+                raise
+            # Odoo ran the method and committed; only encoding the `None`
+            # return value for XML-RPC failed afterwards.  Reporting that as
+            # an error made agents repeat reconciliations five times in a row.
+            result = None
+            warnings.append(
+                f"{model}.{method} executed and returned None, which XML-RPC "
+                "cannot encode. The call succeeded — do not repeat it; read the "
+                "record back if you need to confirm the effect."
+            )
         response: Dict[str, Any] = {"success": True, "result": result}
+        if warnings:
+            response["warnings"] = warnings
         if transient_model:
             response["transient_model"] = True
         result_counts = _act_window_result_counts(app_context, odoo, model, result)
@@ -3166,10 +3429,10 @@ def execute_method(
             # forcing a blind follow-up read.
             response["result_counts"] = result_counts
         if removed_context_keys:
-            response["warnings"] = [
+            response.setdefault("warnings", []).append(
                 "Removed audit-suppression context keys: "
                 + ", ".join(removed_context_keys)
-            ]
+            )
         return response
     except Exception as e:
         return error_response("execute_method", e, model=model, method=method)
@@ -3182,8 +3445,11 @@ def execute_method(
 )
 def list_models(
     ctx: Context,
-    query: Optional[str] = None,
-    limit: int = 100,
+    query: Annotated[
+        Optional[str],
+        Field(description="Case-insensitive substring of technical name or label, e.g. 'invoice'."),
+    ] = None,
+    limit: Annotated[int, Field(description="Maximum models to return (cap 500).", ge=1)] = 100,
 ) -> Dict[str, Any]:
     """
     List available Odoo model technical names and display names.
@@ -3218,18 +3484,99 @@ def list_models(
         ]
         return {"success": True, "count": len(records), "result": records}
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return error_response("list_models", e)
+
+
+FIELD_METADATA_DEFAULT_ATTRIBUTES = (
+    "type", "string", "required", "readonly", "relation", "selection", "store",
+)
+
+
+def project_field_metadata(
+    fields: Dict[str, Any],
+    *,
+    field_names: Optional[List[str]] = None,
+    query: Optional[str] = None,
+    attributes: Optional[List[str]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Narrow a raw ``fields_get`` result for an agent.
+
+    A full ``fields_get`` of res.partner is roughly 250 fields with a dozen
+    attributes each — well over 100 KB for one question like "is there a
+    mobile field".  This keeps the answer to the attributes that decide how a
+    field is read or written, and lets the caller filter by name or label.
+    """
+    wanted = list(attributes) if attributes else list(FIELD_METADATA_DEFAULT_ATTRIBUTES)
+    all_attributes = "*" in wanted
+    needle = (query or "").strip().casefold()
+    selected: Dict[str, Dict[str, Any]] = {}
+    name_filter = set(field_names or [])
+    for name, meta in fields.items():
+        if not isinstance(meta, dict):
+            continue
+        if name_filter and name not in name_filter:
+            continue
+        if needle:
+            label = str(meta.get("string") or "")
+            relation = str(meta.get("relation") or "")
+            if (
+                needle not in name.casefold()
+                and needle not in label.casefold()
+                and needle not in relation.casefold()
+            ):
+                continue
+        if all_attributes:
+            selected[name] = dict(meta)
+            continue
+        projected = {key: meta[key] for key in wanted if key in meta}
+        # Drop the noise that says nothing: false flags and empty selections.
+        for key in ("required", "readonly", "store"):
+            if key in projected and projected[key] is False and key not in (attributes or ()):
+                projected.pop(key)
+        if "selection" in projected and not projected["selection"]:
+            projected.pop("selection")
+        selected[name] = projected
+    return selected
 
 
 @mcp.tool(
-    description="Get field metadata for a specific Odoo model",
+    description=(
+        "Field metadata of one Odoo model, compact by default: type, label, "
+        "required/readonly flags, relation target and selection values per "
+        "field. Filter with 'query' (substring of technical name, label or "
+        "relation) or 'field_names'; ask for more attributes (e.g. 'help', "
+        "'domain', 'groups' or '*') via 'attributes'. Call this before "
+        "guessing a field name."
+    ),
     annotations=READ_ONLY_TOOL,
     structured_output=True,
 )
 def get_model_fields(
     ctx: Context,
-    model: str,
-    field_names: Optional[List[str]] = None,
+    model: Annotated[str, Field(description="Technical model name, e.g. 'res.partner'.")],
+    field_names: Annotated[
+        Optional[List[str]],
+        Field(description="Only these technical field names."),
+    ] = None,
+    query: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Case-insensitive substring matched against technical name, "
+                "label and relation, e.g. 'phone' or 'res.partner'."
+            )
+        ),
+    ] = None,
+    attributes: Annotated[
+        Optional[List[str]],
+        Field(
+            description=(
+                "fields_get attributes to return. Default: type, string, "
+                "required, readonly, relation, selection, store. Use ['*'] "
+                "for the raw Odoo metadata."
+            )
+        ),
+    ] = None,
 ) -> Dict[str, Any]:
     """
     Read field definitions for a model.
@@ -3241,12 +3588,31 @@ def get_model_fields(
         validate_model_name(model)
         fields = odoo.get_model_fields(model)
         if "error" in fields:
-            return {"success": False, "error": fields["error"]}
+            return error_response(
+                "get_model_fields", RuntimeError(str(fields["error"])), model=model,
+            )
+        total = sum(1 for meta in fields.values() if isinstance(meta, dict))
+        result = project_field_metadata(
+            fields, field_names=field_names, query=query, attributes=attributes,
+        )
+        response: Dict[str, Any] = {
+            "success": True,
+            "model": model,
+            "count": len(result),
+            "total_fields": total,
+            "attributes": (
+                ["*"] if attributes and "*" in attributes
+                else list(attributes or FIELD_METADATA_DEFAULT_ATTRIBUTES)
+            ),
+            "result": result,
+        }
         if field_names:
-            fields = {name: fields[name] for name in field_names if name in fields}
-        return {"success": True, "count": len(fields), "result": fields}
+            missing = [name for name in field_names if name not in fields]
+            if missing:
+                response["unknown_field_names"] = missing
+        return response
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return error_response("get_model_fields", e, model=model)
 
 
 @mcp.tool(
@@ -3263,12 +3629,39 @@ def get_model_fields(
 )
 def search_records(
     ctx: Context,
-    model: str,
-    domain: Optional[Any] = None,
-    fields: Optional[List[str]] = None,
-    limit: int = 10,
-    offset: int = 0,
-    order: Optional[str] = None,
+    model: Annotated[str, Field(description="Technical model name, e.g. 'sale.order'.")],
+    domain: Annotated[
+        Optional[Any],
+        Field(
+            description=(
+                "Odoo domain as JSON list of [field, operator, value] triples, "
+                'e.g. [["partner_id", "=", 42], ["state", "in", ["sale", "done"]]]. '
+                'Prefix operators "&", "|", "!" allowed. Datetimes are naive '
+                'UTC "YYYY-MM-DD HH:MM:SS", dates "YYYY-MM-DD". Omit for no filter.'
+            )
+        ),
+    ] = None,
+    fields: Annotated[
+        Optional[List[str]],
+        Field(
+            description=(
+                "Fields to return. Omit for a curated subset (id, display_name "
+                "and the most telling fields), [\"*\"] for every non-binary field. "
+                "many2one comes back as [id, display_name], x2many as id list, "
+                "empty as false."
+            )
+        ),
+    ] = None,
+    limit: Annotated[
+        int, Field(description="Page size, 1-100 (capped at 100).", ge=1)
+    ] = 10,
+    offset: Annotated[
+        int, Field(description="Rows to skip; use next_offset from the previous page.", ge=0)
+    ] = 0,
+    order: Annotated[
+        Optional[str],
+        Field(description="Odoo order string, e.g. 'date_order desc, id desc'. Default 'id desc'."),
+    ] = None,
 ) -> Dict[str, Any]:
     """
     Search and read records with bounded read-only semantics.
@@ -3361,9 +3754,17 @@ def search_records(
 )
 def read_record(
     ctx: Context,
-    model: str,
-    record_id: int,
-    fields: Optional[List[str]] = None,
+    model: Annotated[str, Field(description="Technical model name, e.g. 'res.partner'.")],
+    record_id: Annotated[int, Field(description="Database id of the record.", ge=1)],
+    fields: Annotated[
+        Optional[List[str]],
+        Field(
+            description=(
+                "Fields to return. Omit for a curated subset, [\"*\"] for every "
+                "non-binary field. many2one comes back as [id, display_name]."
+            )
+        ),
+    ] = None,
 ) -> Dict[str, Any]:
     """
     Read one record by ID with bounded read-only semantics.
@@ -3418,9 +3819,19 @@ def read_record(
 )
 def read_records(
     ctx: Context,
-    model: str,
-    record_ids: List[int],
-    fields: Optional[List[str]] = None,
+    model: Annotated[str, Field(description="Technical model name, e.g. 'res.partner'.")],
+    record_ids: Annotated[
+        List[int], Field(description="Database ids, at most 100 per call.", min_length=1)
+    ],
+    fields: Annotated[
+        Optional[List[str]],
+        Field(
+            description=(
+                "Fields to return. Omit for a curated subset, [\"*\"] for every "
+                "non-binary field. many2one comes back as [id, display_name]."
+            )
+        ),
+    ] = None,
 ) -> Dict[str, Any]:
     """Read many records by ID with the same field semantics as read_record.
 
@@ -3480,14 +3891,42 @@ def read_records(
 )
 def aggregate_records(
     ctx: Context,
-    model: str,
-    group_by: List[str],
-    measures: Optional[List[str]] = None,
-    domain: Optional[Any] = None,
-    lazy: bool = False,
-    limit: Optional[int] = None,
-    offset: int = 0,
-    order: Optional[str] = None,
+    model: Annotated[str, Field(description="Technical model name, e.g. 'account.move.line'.")],
+    group_by: Annotated[
+        List[str],
+        Field(
+            description=(
+                "Fields to group by, e.g. ['partner_id'] or ['date:month', 'state']. "
+                "Date granularity suffixes :day/:week/:month/:quarter/:year."
+            ),
+            min_length=1,
+        ),
+    ],
+    measures: Annotated[
+        Optional[List[str]],
+        Field(
+            description=(
+                "Aggregates as 'field:agg', e.g. ['amount_total:sum', 'id:count']. "
+                "agg is sum, avg, min, max, count or count_distinct. A bare field "
+                "name means sum. The row count per group is always included."
+            )
+        ),
+    ] = None,
+    domain: Annotated[
+        Optional[Any],
+        Field(description="Odoo domain as JSON list of [field, operator, value] triples."),
+    ] = None,
+    lazy: Annotated[
+        bool, Field(description="read_group lazy flag; keep false for full grouping.")
+    ] = False,
+    limit: Annotated[
+        Optional[int], Field(description="Maximum number of groups to return.", ge=1)
+    ] = None,
+    offset: Annotated[int, Field(description="Groups to skip.", ge=0)] = 0,
+    order: Annotated[
+        Optional[str],
+        Field(description="Order of groups, e.g. 'amount_total:sum desc'."),
+    ] = None,
 ) -> Dict[str, Any]:
     """Group records server-side and aggregate measures.
 
@@ -3580,7 +4019,7 @@ def aggregate_records(
             "rows": rows,
         }
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return error_response("aggregate_records", e, model=model)
 
 
 def _message_post_returning_id(odoo, model: str, record_id: int, kwargs: Dict[str, Any]) -> int:
@@ -3759,7 +4198,7 @@ def chatter_post(
             "result": message_id,
         }
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return error_response("chatter_post", e, model=model)
 
 
 @mcp.tool(
@@ -3796,7 +4235,7 @@ def search_employee(
         ]
         return SearchEmployeeResponse(success=True, result=parsed_result)
     except Exception as e:
-        return SearchEmployeeResponse(success=False, error=str(e))
+        return SearchEmployeeResponse(success=False, error=compact_error_message(e)[0])
 
 
 @mcp.tool(
@@ -3863,7 +4302,7 @@ def search_holidays(
         return SearchHolidaysResponse(success=True, result=parsed_holidays)
 
     except Exception as e:
-        return SearchHolidaysResponse(success=False, error=str(e))
+        return SearchHolidaysResponse(success=False, error=compact_error_message(e)[0])
 
 
 # ----- NESA document, report and pricing tools -----
@@ -4571,12 +5010,23 @@ def list_allowed_methods(
 )
 def chatter_read(
     ctx: Context,
-    model: str,
-    record_id: int,
-    limit: int = 20,
-    offset: int = 0,
-    body_char_limit: int = 2000,
-    message_types: Optional[List[str]] = None,
+    model: Annotated[str, Field(description="Technical model name of the record.")],
+    record_id: Annotated[int, Field(description="Database id of the record.", ge=1)],
+    limit: Annotated[int, Field(description="Messages per page, newest first.", ge=1)] = 20,
+    offset: Annotated[int, Field(description="Messages to skip.", ge=0)] = 0,
+    body_char_limit: Annotated[
+        int,
+        Field(description="Truncate each message body to this many characters.", ge=1),
+    ] = 2000,
+    message_types: Annotated[
+        Optional[List[str]],
+        Field(
+            description=(
+                "Filter by mail.message type: 'comment' (notes and mails), "
+                "'email', 'notification' (tracking). Default: all."
+            )
+        ),
+    ] = None,
 ) -> Dict[str, Any]:
     """Return the message history of one record in reverse chronological order.
 

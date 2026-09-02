@@ -7,6 +7,7 @@ the External JSON-2 API by setting ``ODOO_TRANSPORT=json2`` and an API key.
 
 import http.client
 import json
+import logging
 import os
 import re
 import socket
@@ -17,6 +18,8 @@ import urllib.parse
 import urllib.request
 import xmlrpc.client
 from typing import Any, cast
+
+_logger = logging.getLogger(__name__)
 
 from .diagnostics import JSON2_POSITIONAL_ARG_MAP, sanitize_odoo_error
 
@@ -106,12 +109,11 @@ class OdooClient:
 
     def _connect(self) -> None:
         """Initialize the selected transport and authenticate."""
-        print(f"Connecting to Odoo at: {self.url}", file=sys.stderr)
-        print(f"  Hostname: {self.hostname}", file=sys.stderr)
-        print(f"  Transport: {self.transport}", file=sys.stderr)
-        print(
-            f"  Timeout: {self.timeout}s, Verify SSL: {self.verify_ssl}",
-            file=sys.stderr,
+        # One line per client, at DEBUG: a per-user client is built every few
+        # minutes and the four-line banner used to be most of the log.
+        _logger.debug(
+            "Connecting to Odoo at %s (transport=%s, timeout=%ss, verify_ssl=%s)",
+            self.url, self.transport, self.timeout, self.verify_ssl,
         )
 
         if self.transport == "json2":
@@ -136,15 +138,10 @@ class OdooClient:
         )
 
         # Authenticate and capture the user ID.
-        print(
-            f"Authenticating with database: {self.db}, username: {self.username}",
-            file=sys.stderr,
+        _logger.debug(
+            "Authenticating with database %s, username %s", self.db, self.username,
         )
         try:
-            print(
-                f"Making request to {self.hostname}/xmlrpc/2/common (attempt 1)",
-                file=sys.stderr,
-            )
             self.uid = self._common.authenticate(
                 self.db, self.username, self.password, {}
             )
@@ -261,10 +258,7 @@ class OdooClient:
         )
 
         try:
-            print(
-                f"Making JSON-2 request to {self.hostname}/json/2/{model}/{method}",
-                file=sys.stderr,
-            )
+            _logger.debug("JSON-2 request to %s/json/2/%s/%s", self.hostname, model, method)
             with urllib.request.urlopen(
                 request,
                 timeout=self.timeout,
@@ -634,7 +628,7 @@ class RedirectTransport(xmlrpc.client.Transport):
         redirects = 0
         while redirects < self.max_redirects:
             try:
-                print(f"Making request to {host}{handler}", file=sys.stderr)
+                _logger.debug("XML-RPC request to %s%s", host, handler)
                 return super().request(host, handler, request_body, verbose)
             except xmlrpc.client.ProtocolError as err:
                 if err.errcode in (301, 302, 303, 307, 308) and err.headers.get(

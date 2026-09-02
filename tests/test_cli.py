@@ -435,3 +435,40 @@ def test_main_entrypoint_invokes_sys_exit_with_main_return_value(monkeypatch, ca
     # restore the real main for any later tests
     monkeypatch.setattr(cli, "main", real_main)
     monkeypatch.setattr(_sys, "exit", real_exit)
+
+
+def test_setup_logging_with_file_keeps_stderr_to_warnings(monkeypatch, tmp_path, capsys):
+    cli = importlib.import_module("odoo_mcp.__main__")
+    log_path = tmp_path / "odoo-mcp.log"
+
+    try:
+        cli.setup_logging(level="INFO", log_file=str(log_path))
+        logging.getLogger("odoo_mcp.test").info("file only")
+        logging.getLogger("odoo_mcp.test").warning("both places")
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+        err = capsys.readouterr().err
+        content = log_path.read_text(encoding="utf-8")
+        assert "file only" in content and "both places" in content
+        assert "file only" not in err
+        assert "both places" in err
+    finally:
+        _restore_root_logger()
+
+
+def test_setup_logging_quiets_sdk_transport_loggers_unless_debug(monkeypatch):
+    cli = importlib.import_module("odoo_mcp.__main__")
+    monkeypatch.delenv("ODOO_MCP_LOG_FILE", raising=False)
+
+    try:
+        cli.setup_logging(level="INFO")
+        for name in cli.NOISY_TRANSPORT_LOGGERS:
+            assert logging.getLogger(name).level == logging.WARNING
+        # Switching to DEBUG in the same process must re-enable the SDK output.
+        cli.setup_logging(level="DEBUG")
+        for name in cli.NOISY_TRANSPORT_LOGGERS:
+            assert logging.getLogger(name).level == logging.NOTSET
+    finally:
+        for name in cli.NOISY_TRANSPORT_LOGGERS:
+            logging.getLogger(name).setLevel(logging.NOTSET)
+        _restore_root_logger()

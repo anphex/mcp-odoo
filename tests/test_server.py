@@ -136,7 +136,11 @@ def test_server_import_initializes_fastmcp_with_current_sdk_without_lifespan():
 
     assert isinstance(server.mcp, FastMCP)
     assert server.mcp.name == "Odoo MCP Server"
-    assert server.mcp.instructions == "MCP Server for interacting with Odoo ERP systems"
+    instructions = server.mcp.instructions or ""
+    assert instructions.startswith("Odoo 18 ERP")
+    # The client-facing contract: read path, write chain, domain shape, UTC.
+    for marker in ("search_records", "validate_write", "[field, operator, value]", "UTC"):
+        assert marker in instructions
 
 
 def test_server_registers_expected_tools_and_resources_without_lifespan():
@@ -554,7 +558,9 @@ def test_execute_method_blocks_direct_writes_and_unknown_methods(monkeypatch):
         args=[[7]],
     )
     assert blocked_unknown["success"] is False
-    assert "blocked by default" in blocked_unknown["error"]
+    assert "not been reviewed" in blocked_unknown["error"]
+    assert blocked_unknown["reason_code"] == "method_not_reviewed"
+    assert "list_allowed_methods" in blocked_unknown["error"]
     assert blocked_unknown["classification"]["safety"] == "side_effect"
 
 
@@ -853,7 +859,7 @@ def test_execute_method_allows_exact_side_effect_allowlist(monkeypatch):
     assert allowed["success"] is True
     assert calls == [(("sale.order", "action_confirm", [7]), {})]
     assert blocked["success"] is False
-    assert "Unreviewed side-effect" in blocked["error"]
+    assert "not been reviewed" in blocked["error"]
 
 
 def test_validate_write_only_registers_live_metadata_approvals(monkeypatch):
@@ -2692,26 +2698,41 @@ def test_normalize_domain_input_accepts_search_domain_object():
     assert server.normalize_domain_input(sd) == [["name", "=", "Ada"]]
 
 
-def test_normalize_domain_input_returns_empty_for_invalid_string():
+def test_normalize_domain_input_rejects_invalid_string():
     server = importlib.import_module("odoo_mcp.server")
-    assert server.normalize_domain_input("def x():") == []
+    # A domain that cannot be parsed must not silently become "no filter":
+    # that turned "invoices of partner X" into "every invoice".
+    with pytest.raises(ValueError, match="Invalid domain"):
+        server.normalize_domain_input("def x():")
 
 
 def test_normalize_domain_input_handles_python_literal_via_ast():
     server = importlib.import_module("odoo_mcp.server")
-    # Python tuple literal that json can't parse but ast.literal_eval can
-    assert server.normalize_domain_input("[('name', '=', 'Ada')]") == []
+    # Python tuple literal that json can't parse but ast.literal_eval can.
+    assert server.normalize_domain_input("[('name', '=', 'Ada')]") == [
+        ["name", "=", "Ada"]
+    ]
 
 
-def test_normalize_domain_input_returns_empty_for_dict_without_conditions_list():
+def test_normalize_domain_input_rejects_dict_without_conditions_list():
     server = importlib.import_module("odoo_mcp.server")
-    assert server.normalize_domain_input({"foo": "bar"}) == []
-    assert server.normalize_domain_input({"conditions": "not-a-list"}) == []
+    with pytest.raises(ValueError, match="conditions"):
+        server.normalize_domain_input({"foo": "bar"})
+    with pytest.raises(ValueError, match="conditions"):
+        server.normalize_domain_input({"conditions": "not-a-list"})
+    assert server.normalize_domain_input({}) == []
 
 
-def test_normalize_domain_input_returns_empty_for_non_list_value():
+def test_normalize_domain_input_rejects_non_list_value():
     server = importlib.import_module("odoo_mcp.server")
-    assert server.normalize_domain_input(42) == []
+    with pytest.raises(ValueError, match="got int"):
+        server.normalize_domain_input(42)
+
+
+def test_normalize_domain_input_rejects_malformed_condition_instead_of_dropping_it():
+    server = importlib.import_module("odoo_mcp.server")
+    with pytest.raises(ValueError, match="not a \\[field, operator, value\\] triple"):
+        server.normalize_domain_input([["state", "=", "sale"], ["partner_id", 42]])
 
 
 def test_normalize_domain_input_returns_empty_for_empty_list():
@@ -4188,6 +4209,9 @@ def test_execute_method_normalizes_domain_for_search_methods(monkeypatch):
     captured = []
 
     class _Client:
+        def get_model_fields(self, model):
+            return {"name": {"type": "char", "string": "Name"}}
+
         def execute_method(self, *args, **kwargs):
             captured.append((args, kwargs))
             return []
@@ -4200,3 +4224,368 @@ def test_execute_method_normalizes_domain_for_search_methods(monkeypatch):
         args=['[["name","=","Ada"]]'],
     )
     assert captured[0][0] == ("res.partner", "search_read", [["name", "=", "Ada"]])
+
+
+# ----- 2026-09-02: agent-facing low-hanging fruits ------------------------
+
+_PARTNER_FIELDS = {
+    "id": {"type": "integer", "string": "ID", "readonly": True, "required": False, "store": True},
+    "name": {"type": "char", "string": "Name", "required": True, "readonly": False,
+             "store": True, "help": "The partner's name", "searchable": True},
+    "mobile": {"type": "char", "string": "Mobile", "required": False, "readonly": False,
+               "store": True, "selection": []},
+    "image_1920": {"type": "binary", "string": "Image", "required": False,
+                   "readonly": False, "store": True},
+    "parent_id": {"type": "many2one", "string": "Related Company", "relation": "res.partner",
+                  "required": False, "readonly": False, "store": True},
+    "type": {"type": "selection", "string": "Address Type", "required": False,
+             "readonly": False, "store": True,
+             "selection": [["contact", "Contact"], ["invoice", "Invoice Address"]]},
+}
+
+
+class _FieldsClient:
+    def __init__(self, fields=None, fail=False):
+        self._fields = fields if fields is not None else _PARTNER_FIELDS
+        self._fail = fail
+        self.calls = []
+
+    def get_model_fields(self, model):
+        if self._fail:
+            raise RuntimeError("fields_get exploded\nTraceback (most recent call last):\n  File \"/srv/odoo/x.py\"\nValueError: boom")
+        return self._fields
+
+    def execute_method(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return [{"id": 1}]
+
+
+def test_get_model_fields_defaults_to_compact_projection():
+    server = importlib.import_module("odoo_mcp.server")
+    result = server.get_model_fields(FakeCtx(_FieldsClient()), "res.partner")
+
+    assert result["success"] is True
+    assert result["total_fields"] == 6
+    assert result["count"] == 6
+    name = result["result"]["name"]
+    # Only the deciding attributes, no help text, no false flags.
+    assert name == {"type": "char", "string": "Name", "required": True, "store": True}
+    assert "help" not in name and "searchable" not in name
+    assert result["result"]["parent_id"]["relation"] == "res.partner"
+    assert result["result"]["type"]["selection"][0] == ["contact", "Contact"]
+    assert "selection" not in result["result"]["mobile"]
+
+
+def test_get_model_fields_query_filters_by_name_label_and_relation():
+    server = importlib.import_module("odoo_mcp.server")
+    by_label = server.get_model_fields(FakeCtx(_FieldsClient()), "res.partner", query="company")
+    assert list(by_label["result"]) == ["parent_id"]
+    by_relation = server.get_model_fields(
+        FakeCtx(_FieldsClient()), "res.partner", query="res.partner"
+    )
+    assert list(by_relation["result"]) == ["parent_id"]
+    by_name = server.get_model_fields(FakeCtx(_FieldsClient()), "res.partner", query="MOB")
+    assert list(by_name["result"]) == ["mobile"]
+
+
+def test_get_model_fields_star_returns_raw_metadata_and_reports_unknown_names():
+    server = importlib.import_module("odoo_mcp.server")
+    raw = server.get_model_fields(
+        FakeCtx(_FieldsClient()), "res.partner", field_names=["name", "nope"], attributes=["*"]
+    )
+    assert raw["result"] == {"name": _PARTNER_FIELDS["name"]}
+    assert raw["unknown_field_names"] == ["nope"]
+    assert raw["attributes"] == ["*"]
+    custom = server.get_model_fields(
+        FakeCtx(_FieldsClient()), "res.partner", field_names=["name"], attributes=["help"]
+    )
+    assert custom["result"] == {"name": {"help": "The partner's name"}}
+
+
+def test_get_model_fields_errors_are_compact_not_tracebacks():
+    server = importlib.import_module("odoo_mcp.server")
+    result = server.get_model_fields(FakeCtx(_FieldsClient(fail=True)), "res.partner")
+    assert result["success"] is False
+    assert result["tool"] == "get_model_fields"
+    assert "Traceback" not in result["error"]
+    assert "/srv/odoo" not in result["error"]
+    assert result["error_ref"]
+
+
+def test_execute_method_search_read_without_limit_gets_capped_and_expanded(monkeypatch):
+    server = importlib.import_module("odoo_mcp.server")
+    monkeypatch.setenv("ODOO_MCP_NATIVE_ACL_PARITY", "1")
+    client = _FieldsClient()
+
+    result = server.execute_method(
+        FakeCtx(client), "res.partner", "search_read", args=[[["name", "ilike", "a"]]]
+    )
+
+    assert result["success"] is True
+    (_call_args, call_kwargs), = client.calls
+    assert call_kwargs["limit"] == server.MAX_SEARCH_LIMIT
+    # Binary payloads stay out unless named; everything else is requested.
+    assert "image_1920" not in call_kwargs["fields"]
+    assert "name" in call_kwargs["fields"] and "parent_id" in call_kwargs["fields"]
+    assert any("limit=100" in note for note in result["warnings"])
+    assert any("non-binary" in note for note in result["warnings"])
+
+
+def test_execute_method_respects_explicit_limit_and_fields(monkeypatch):
+    server = importlib.import_module("odoo_mcp.server")
+    monkeypatch.setenv("ODOO_MCP_NATIVE_ACL_PARITY", "1")
+    client = _FieldsClient()
+
+    positional = server.execute_method(
+        FakeCtx(client), "res.partner", "search_read",
+        args=[[["name", "ilike", "a"]], ["name"], 0, 5],
+    )
+    keyword = server.execute_method(
+        FakeCtx(client), "res.partner", "read",
+        args=[[7]], kwargs={"fields": ["image_1920"]},
+    )
+
+    assert positional["success"] is True and "warnings" not in positional
+    assert client.calls[0][0][2:] == ([["name", "ilike", "a"]], ["name"], 0, 5)
+    assert client.calls[0][1] == {}
+    assert keyword["success"] is True and "warnings" not in keyword
+    assert client.calls[1][1] == {"fields": ["image_1920"]}
+
+
+def test_execute_method_treats_unmarshallable_none_as_success(monkeypatch):
+    server = importlib.import_module("odoo_mcp.server")
+    monkeypatch.setenv(
+        "ODOO_MCP_ALLOWED_SIDE_EFFECT_METHODS", "account.move.line.reconcile"
+    )
+
+    class NoneReturningClient:
+        def __init__(self):
+            self.calls = 0
+
+        def execute_method(self, *args, **kwargs):
+            self.calls += 1
+            import xmlrpc.client
+            raise xmlrpc.client.Fault(
+                1, "cannot marshal None unless allow_none is enabled"
+            )
+
+    client = NoneReturningClient()
+    result = server.execute_method(
+        FakeCtx(client), "account.move.line", "reconcile", args=[[7, 8]]
+    )
+
+    assert result["success"] is True
+    assert result["result"] is None
+    assert client.calls == 1
+    assert any("do not repeat" in note for note in result["warnings"])
+
+
+def test_execute_method_clamps_explicit_limits_and_rejects_bad_ones():
+    server = importlib.import_module("odoo_mcp.server")
+    client = _FieldsClient()
+
+    over = server.execute_method(
+        FakeCtx(client), "res.partner", "search_read",
+        args=[[], ["name"]], kwargs={"limit": 5000},
+    )
+    assert over["success"] is True
+    assert client.calls[-1][1]["limit"] == server.MAX_SEARCH_LIMIT
+    assert any("clamped to 100" in w for w in over["warnings"])
+
+    positional_zero = server.execute_method(
+        FakeCtx(client), "res.partner", "search", args=[[], 0, 0],
+    )
+    assert positional_zero["success"] is True
+    assert client.calls[-1][0][2:] == ([], 0, server.MAX_SEARCH_LIMIT)
+
+    none_limit = server.execute_method(
+        FakeCtx(client), "res.partner", "search_read",
+        args=[[], ["name"]], kwargs={"limit": None},
+    )
+    assert none_limit["success"] is True
+    assert client.calls[-1][1]["limit"] == server.MAX_SEARCH_LIMIT
+
+    before = len(client.calls)
+    negative = server.execute_method(
+        FakeCtx(client), "res.partner", "search_read",
+        args=[[], ["name"]], kwargs={"limit": -1},
+    )
+    assert negative["success"] is False
+    assert "positive integer" in negative["error"]
+    assert len(client.calls) == before
+
+    too_many = server.execute_method(
+        FakeCtx(client), "res.partner", "read",
+        args=[list(range(1, 102)), ["name"]],
+    )
+    assert too_many["success"] is False
+    assert "at most 100 record ids" in too_many["error"]
+    assert len(client.calls) == before
+
+
+def test_execute_method_search_fetch_uses_field_names_keyword(monkeypatch):
+    server = importlib.import_module("odoo_mcp.server")
+    # search_fetch is not on the built-in read list of this fork; the deployed
+    # parity mode lets it through, the test opts in explicitly.
+    monkeypatch.setenv("ODOO_MCP_ALLOWED_SIDE_EFFECT_METHODS", "res.partner.search_fetch")
+    client = _FieldsClient()
+
+    explicit = server.execute_method(
+        FakeCtx(client), "res.partner", "search_fetch",
+        args=[[]], kwargs={"field_names": ["name"], "limit": 3},
+    )
+    assert explicit["success"] is True
+    assert client.calls[-1][1] == {"field_names": ["name"], "limit": 3}
+    assert "warnings" not in explicit
+
+    expanded = server.execute_method(
+        FakeCtx(client), "res.partner", "search_fetch", args=[[]],
+    )
+    assert expanded["success"] is True
+    injected = client.calls[-1][1]
+    assert "fields" not in injected
+    assert "image_1920" not in injected["field_names"]
+    assert "name" in injected["field_names"]
+
+    duplicate = server.execute_method(
+        FakeCtx(client), "res.partner", "search_read",
+        args=[[], ["name"]], kwargs={"fields": ["mobile"]},
+    )
+    assert duplicate["success"] is False
+    assert "both positionally and as a keyword" in duplicate["error"]
+
+
+def test_execute_method_fails_closed_when_fields_cannot_be_expanded():
+    server = importlib.import_module("odoo_mcp.server")
+    client = _FieldsClient(fail=True)
+
+    result = server.execute_method(
+        FakeCtx(client), "res.partner", "search_read", args=[[]],
+    )
+    assert result["success"] is False
+    assert "Cannot expand the omitted fields" in result["error"]
+    assert "Traceback" not in result["error"]
+    assert client.calls == []
+
+
+def test_execute_method_client_side_marshal_error_is_not_success(monkeypatch):
+    server = importlib.import_module("odoo_mcp.server")
+    monkeypatch.setenv(
+        "ODOO_MCP_ALLOWED_SIDE_EFFECT_METHODS", "account.move.line.reconcile"
+    )
+
+    class ClientSideFailure:
+        def __init__(self):
+            self.calls = 0
+
+        def execute_method(self, *args, **kwargs):
+            self.calls += 1
+            # xmlrpc.client raises this before any byte reaches Odoo when the
+            # *request* contains None.
+            raise TypeError("cannot marshal None unless allow_none is enabled")
+
+    client = ClientSideFailure()
+    result = server.execute_method(
+        FakeCtx(client), "account.move.line", "reconcile", args=[[7], None]
+    )
+
+    assert result["success"] is False
+    assert "cannot marshal None" in result["error"]
+    assert "warnings" not in result
+    assert client.calls == 1
+
+
+def test_get_model_fields_client_error_dict_is_compacted():
+    server = importlib.import_module("odoo_mcp.server")
+
+    class ErrorDictClient:
+        def get_model_fields(self, model):
+            return {"error": "boom\nTraceback (most recent call last):\n  File \"/srv/odoo/x.py\""}
+
+    result = server.get_model_fields(FakeCtx(ErrorDictClient()), "res.partner")
+    assert result["success"] is False
+    assert result["tool"] == "get_model_fields"
+    assert "Traceback" not in result["error"]
+    assert "error_type" in result
+
+
+def test_normalize_domain_rejects_dict_condition_with_non_string_field():
+    server = importlib.import_module("odoo_mcp.server")
+    with pytest.raises(ValueError, match="string field/operator"):
+        server.normalize_domain_input(
+            {"conditions": [{"field": 7, "operator": "=", "value": 1}]}
+        )
+    assert server.normalize_domain_input(
+        {"conditions": [{"field": "state", "operator": "=", "value": None}]}
+    ) == [["state", "=", None]]
+
+
+def test_execute_method_unreviewed_error_names_reviewed_alternatives(monkeypatch):
+    server = importlib.import_module("odoo_mcp.server")
+
+    class FakeClient:
+        def execute_method(self, *args, **kwargs):
+            raise AssertionError("blocked methods must fail before client call")
+
+    monkeypatch.delenv("ODOO_MCP_ALLOW_UNKNOWN_METHODS", raising=False)
+    monkeypatch.delenv("ODOO_MCP_NATIVE_ACL_PARITY", raising=False)
+    monkeypatch.setenv(
+        "ODOO_MCP_ALLOWED_SIDE_EFFECT_METHODS",
+        "sale.order.action_confirm,sale.order.action_cancel,res.partner.message_post",
+    )
+
+    blocked = server.execute_method(
+        FakeCtx(FakeClient()), "sale.order", "action_lock", args=[[7]]
+    )
+
+    assert blocked["success"] is False
+    assert blocked["reason_code"] == "method_not_reviewed"
+    assert blocked["allowed_methods_for_model"] == [
+        "sale.order.action_cancel", "sale.order.action_confirm",
+    ]
+    assert "action_confirm" in blocked["error"]
+    assert "ODOO_MCP_" not in blocked["error"]
+
+
+def test_search_records_rejects_unparsable_domain_instead_of_matching_everything():
+    server = importlib.import_module("odoo_mcp.server")
+    client = _FieldsClient()
+
+    result = server.search_records(
+        FakeCtx(client), "res.partner", domain="name = 'Ada'", fields=["name"]
+    )
+
+    assert result["success"] is False
+    assert "Invalid domain" in result["error"]
+    assert client.calls == []
+
+
+def test_list_models_error_uses_uniform_error_payload():
+    server = importlib.import_module("odoo_mcp.server")
+
+    class BrokenClient:
+        def get_models(self, *args, **kwargs):
+            raise RuntimeError("registry unavailable")
+
+        def execute_method(self, *args, **kwargs):
+            raise RuntimeError("registry unavailable")
+
+    result = server.list_models(FakeCtx(BrokenClient()))
+    assert result["success"] is False
+    assert result["tool"] == "list_models"
+    assert result["error_type"]
+
+
+def test_core_tool_parameters_carry_descriptions():
+    server = importlib.import_module("odoo_mcp.server")
+    tools = {tool.name: tool for tool in asyncio.run(server.mcp.list_tools())}
+    for name in ("search_records", "read_record", "read_records", "get_model_fields",
+                 "aggregate_records", "execute_method", "chatter_read", "list_models"):
+        schema = tools[name].inputSchema
+        props = schema.get("properties", {})
+        assert props, name
+        undocumented = [key for key, spec in props.items() if not spec.get("description")]
+        assert undocumented == [], f"{name}: {undocumented}"
+    domain = tools["search_records"].inputSchema["properties"]["domain"]["description"]
+    assert "[field, operator, value]" in domain
+    assert "UTC" in domain
