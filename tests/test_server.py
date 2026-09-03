@@ -1,7 +1,8 @@
 import asyncio
 import importlib
-import logging
 import json
+import logging
+import xmlrpc.client
 from pathlib import Path
 
 import pytest
@@ -1901,7 +1902,7 @@ def test_chatter_post_direct_mode_resolves_id_when_marshal_fails(monkeypatch):
                 )
                 return [321] if is_followup else [300]
             self.calls.append((model, method, args, kwargs))
-            raise Exception("<Fault 1: cannot marshal objects>")
+            raise xmlrpc.client.Fault(1, "cannot marshal objects")
 
     client = _MarshalFaultClient()
     result = server.chatter_post(
@@ -4304,6 +4305,22 @@ def test_get_model_fields_star_returns_raw_metadata_and_reports_unknown_names():
     assert custom["result"] == {"name": {"help": "The partner's name"}}
 
 
+def test_get_model_fields_reports_and_ignores_unsafe_attributes():
+    server = importlib.import_module("odoo_mcp.server")
+    result = server.get_model_fields(
+        FakeCtx(_FieldsClient()),
+        "res.partner",
+        field_names=["name"],
+        attributes=["type", "domain", "depends"],
+    )
+
+    assert result["success"] is True
+    assert result["attributes"] == ["type"]
+    assert result["unknown_attributes"] == ["domain", "depends"]
+    assert result["result"] == {"name": {"type": "char"}}
+    assert "ignored" in result["warnings"][0]
+
+
 def test_get_model_fields_errors_are_compact_not_tracebacks():
     server = importlib.import_module("odoo_mcp.server")
     result = server.get_model_fields(FakeCtx(_FieldsClient(fail=True)), "res.partner")
@@ -4354,7 +4371,7 @@ def test_execute_method_respects_explicit_limit_and_fields(monkeypatch):
     assert client.calls[1][1] == {"fields": ["image_1920"]}
 
 
-def test_execute_method_treats_unmarshallable_none_as_success(monkeypatch):
+def test_execute_method_marks_unmarshallable_result_as_committed(monkeypatch):
     server = importlib.import_module("odoo_mcp.server")
     monkeypatch.setenv(
         "ODOO_MCP_ALLOWED_SIDE_EFFECT_METHODS", "account.move.line.reconcile"
@@ -4378,8 +4395,51 @@ def test_execute_method_treats_unmarshallable_none_as_success(monkeypatch):
 
     assert result["success"] is True
     assert result["result"] is None
+    assert result["result_unavailable"] is True
     assert client.calls == 1
-    assert any("do not repeat" in note for note in result["warnings"])
+    assert "executed and committed" in result["warnings"][0]
+    assert "Do not repeat" in result["warnings"][0]
+
+
+def test_execute_method_unmarshallable_read_keeps_prior_warnings():
+    server = importlib.import_module("odoo_mcp.server")
+
+    class UnmarshallableReadClient(_FieldsClient):
+        def execute_method(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            raise xmlrpc.client.Fault(
+                1, "cannot marshal None unless allow_none is enabled"
+            )
+
+    client = UnmarshallableReadClient()
+    result = server.execute_method(
+        FakeCtx(client),
+        "res.partner",
+        "search_read",
+        args=[[], ["name"]],
+        kwargs={"limit": 5000},
+    )
+
+    assert result["success"] is True
+    assert result["result_unavailable"] is True
+    assert any("clamped to 100" in warning for warning in result["warnings"])
+    assert any("read may be retried" in warning for warning in result["warnings"])
+    assert not any("Do not repeat" in warning for warning in result["warnings"])
+
+
+def test_message_post_does_not_hide_client_side_marshal_errors():
+    server = importlib.import_module("odoo_mcp.server")
+
+    class ClientSideMarshalFailure(_ChatterClient):
+        def execute_method(self, model, method, *args, **kwargs):
+            if model == "mail.message" and method == "search":
+                return []
+            raise TypeError("cannot marshal None unless allow_none is enabled")
+
+    with pytest.raises(TypeError, match="cannot marshal None"):
+        server._message_post_returning_id(
+            ClientSideMarshalFailure(), "res.partner", 7, {"body": None}
+        )
 
 
 def test_execute_method_clamps_explicit_limits_and_rejects_bad_ones():

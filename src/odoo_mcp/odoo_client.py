@@ -19,11 +19,25 @@ import urllib.request
 import xmlrpc.client
 from typing import Any, cast
 
-_logger = logging.getLogger(__name__)
-
 from .diagnostics import JSON2_POSITIONAL_ARG_MAP, sanitize_odoo_error
 
+_logger = logging.getLogger(__name__)
+
 SUPPORTED_TRANSPORTS = {"xmlrpc", "json2"}
+FIELD_METADATA_RPC_ATTRIBUTES = (
+    "type",
+    "string",
+    "required",
+    "readonly",
+    "relation",
+    "selection",
+    "store",
+    "compute",
+    "tracking",
+    "automatic",
+    "help",
+    "groups",
+)
 
 
 class OdooJson2Error(ValueError):
@@ -480,7 +494,20 @@ class OdooClient:
             'char'
         """
         try:
-            fields = self._execute(model_name, "fields_get")
+            # Odoo's unrestricted fields_get metadata may contain nested None
+            # values. Verified on all 914 loaded NESA models: the offenders are
+            # ``account.analytic.line.employee_id.domain`` and
+            # ``product.pricelist.item_ids.domain``; the selected attributes
+            # below contain no None. Odoo's XML-RPC marshaller has
+            # allow_none=False, so one unsafe domain turns a read-only schema
+            # lookup into a server ERROR. Passing an explicit attributes list
+            # follows Odoo's documented external-API pattern.
+            fields = self._execute(
+                model_name,
+                "fields_get",
+                [],
+                attributes=list(FIELD_METADATA_RPC_ATTRIBUTES),
+            )
             return cast(dict[str, Any], fields)
         except Exception as e:
             print(f"Error retrieving fields: {str(e)}", file=sys.stderr)

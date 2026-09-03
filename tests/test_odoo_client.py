@@ -1245,6 +1245,34 @@ def test_get_model_fields_returns_full_metadata_dict(monkeypatch, odoo_client_mo
     assert fields == {"name": {"type": "char"}, "active": {"type": "boolean"}}
 
 
+def test_get_model_fields_requests_only_xmlrpc_safe_attributes(
+    monkeypatch, odoo_client_module
+):
+    client, _ = build_client(monkeypatch, odoo_client_module)
+    captured = []
+
+    def fake_execute_kw(*args):
+        captured.append(args)
+        return {"name": {"type": "char", "string": "Name"}}
+
+    client._models.execute_kw = fake_execute_kw  # type: ignore[attr-defined]
+
+    fields = client.get_model_fields("res.partner")
+
+    assert fields["name"]["type"] == "char"
+    assert captured[0][4] == "fields_get"
+    assert captured[0][5] == [[]]
+    attributes = captured[0][6]["attributes"]
+    assert set(odoo_client_module.FIELD_METADATA_RPC_ATTRIBUTES) == set(attributes)
+    assert "type" in attributes
+    assert "relation" in attributes
+    assert "selection" in attributes
+    assert "compute" in attributes
+    assert "tracking" in attributes
+    assert "automatic" in attributes
+    assert "domain" not in attributes
+
+
 def test_redirect_transport_request_decodes_bytes_location_header(
     monkeypatch, odoo_client_module
 ):

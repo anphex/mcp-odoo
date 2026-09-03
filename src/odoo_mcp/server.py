@@ -46,7 +46,11 @@ from .diagnostics import (
     upgrade_risk_report as build_upgrade_risk_report,
 )
 from ._nesa_file_intake import FileIntakeError, fetch_allowlisted_url
-from .odoo_client import OdooClient, get_odoo_client
+from .odoo_client import (
+    FIELD_METADATA_RPC_ATTRIBUTES,
+    OdooClient,
+    get_odoo_client,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1397,7 +1401,8 @@ def _unknown_fields_message(
         hint = f" (did you mean: {', '.join(close)})" if close else ""
         parts.append(f"{name!r}{hint}")
     return (
-        f"Unknown field(s) on {model}: {'; '.join(parts)}. Only names from "
+        f"Unknown field(s), or fields inaccessible to this user, on {model}: "
+        f"{'; '.join(parts)}. Only names from "
         "the model's fields_get are readable — omit 'fields' for the smart "
         "default selection, or pass fields=['*'] for every non-binary field."
     )
@@ -3375,12 +3380,13 @@ def bound_execute_method_read(
     return args, kwargs, notes
 
 
-def is_unmarshallable_none_fault(exc: BaseException) -> bool:
-    """True for Odoo's fault when a method returned ``None`` over XML-RPC.
+def is_unmarshallable_response_fault(exc: BaseException) -> bool:
+    """True for an Odoo-side XML-RPC response encoding fault.
 
-    Odoo executes and commits first, then fails to encode the response:
-    ``cannot marshal None unless allow_none is enabled``.  The transaction is
-    done by then, so the caller must not treat it as a failed call.
+    ``service.model.execute`` runs the model method through an inner cursor and
+    commits it before returning the value to the HTTP controller. A later
+    marshalling failure therefore loses only the result; repeating the method
+    could duplicate its committed effect.
     """
     import xmlrpc.client
 
@@ -3389,7 +3395,14 @@ def is_unmarshallable_none_fault(exc: BaseException) -> bool:
     # contain None — nothing was sent then, and "do not repeat" would lie.
     if not isinstance(exc, xmlrpc.client.Fault):
         return False
-    return "cannot marshal none" in str(exc.faultString).casefold()
+    if exc.faultCode != 1:
+        return False
+    message = str(exc.faultString).casefold()
+    return "cannot marshal" in message and (
+        "xmlrpc/client.py" in message
+        or "unless allow_none is enabled" in message
+        or "objects" in message
+    )
 
 
 @mcp.tool(
@@ -3619,17 +3632,44 @@ def execute_method(
                 idempotent=method in IDEMPOTENT_READ_METHODS,
             )
         except Exception as call_exc:
-            if not is_unmarshallable_none_fault(call_exc):
+            if not is_unmarshallable_response_fault(call_exc):
                 raise
-            # Odoo ran the method and committed; only encoding the `None`
-            # return value for XML-RPC failed afterwards.  Reporting that as
-            # an error made agents repeat reconciliations five times in a row.
-            result = None
-            warnings.append(
-                f"{model}.{method} executed and returned None, which XML-RPC "
-                "cannot encode. The call succeeded — do not repeat it; read the "
-                "record back if you need to confirm the effect."
+            is_read = method in IDEMPOTENT_READ_METHODS
+            logger.warning(
+                "[xmlrpc-result-unavailable] %s.%s completed but its result "
+                "could not be marshalled; automatic retry suppressed (read=%s)",
+                model,
+                method,
+                is_read,
             )
+            if is_read:
+                result_warning = (
+                    f"{model}.{method} completed, but XML-RPC could not encode "
+                    "its return value. This read may be retried after narrowing "
+                    "the requested fields or fields_get attributes."
+                )
+            else:
+                result_warning = (
+                    f"{model}.{method} executed and committed, but XML-RPC "
+                    "could not encode its return value. Do not repeat it; "
+                    "read the target record back to verify the effect."
+                )
+            warnings.append(result_warning)
+            if removed_context_keys:
+                warnings.append(
+                    "Removed audit-suppression context keys: "
+                    + ", ".join(removed_context_keys)
+                )
+            response = {
+                "success": True,
+                "result": None,
+                "result_unavailable": True,
+                "warnings": warnings,
+                "classification": safety,
+            }
+            if transient_model:
+                response["transient_model"] = True
+            return response
         response: Dict[str, Any] = {"success": True, "result": result}
         if warnings:
             response["warnings"] = warnings
@@ -3719,7 +3759,11 @@ def project_field_metadata(
     mobile field".  This keeps the answer to the attributes that decide how a
     field is read or written, and lets the caller filter by name or label.
     """
-    wanted = list(attributes) if attributes else list(FIELD_METADATA_DEFAULT_ATTRIBUTES)
+    wanted = (
+        list(attributes)
+        if attributes is not None
+        else list(FIELD_METADATA_DEFAULT_ATTRIBUTES)
+    )
     all_attributes = "*" in wanted
     needle = (query or "").strip().casefold()
     selected: Dict[str, Dict[str, Any]] = {}
@@ -3755,10 +3799,12 @@ def project_field_metadata(
 @mcp.tool(
     description=(
         "Field metadata of one Odoo model, compact by default: type, label, "
-        "required/readonly flags, relation target and selection values per "
+        "required/readonly flags, relation target, selection values and storage per "
         "field. Filter with 'query' (substring of technical name, label or "
-        "relation) or 'field_names'; ask for more attributes (e.g. 'help', "
-        "'domain', 'groups' or '*') via 'attributes'. Call this before "
+        "relation) or 'field_names'; ask for another cached XML-RPC-safe "
+        "attribute (e.g. 'help', 'compute', 'tracking' or 'groups') via "
+        "'attributes'. Raw 'domain' metadata is intentionally unavailable "
+        "because Odoo 18 can put non-marshallable None values there. Call this before "
         "guessing a field name."
     ),
     annotations=READ_ONLY_TOOL,
@@ -3785,8 +3831,9 @@ def get_model_fields(
         Field(
             description=(
                 "fields_get attributes to return. Default: type, string, "
-                "required, readonly, relation, selection, store. Use ['*'] "
-                "for the raw Odoo metadata."
+                "required, readonly, relation, selection, store. Use ['*'] for all "
+                "XML-RPC-safe metadata cached by this server; raw domain "
+                "metadata is excluded."
             )
         ),
     ] = None,
@@ -3807,9 +3854,27 @@ def get_model_fields(
             return error_response(
                 "get_model_fields", RuntimeError(str(fields["error"])), model=model,
             )
+        explicit_attributes = attributes is not None
+        requested_attributes = (
+            list(attributes)
+            if explicit_attributes
+            else list(FIELD_METADATA_DEFAULT_ATTRIBUTES)
+        )
+        unknown_attributes = []
+        if "*" not in requested_attributes:
+            safe_attributes = set(FIELD_METADATA_RPC_ATTRIBUTES)
+            unknown_attributes = [
+                name for name in requested_attributes if name not in safe_attributes
+            ]
+            requested_attributes = [
+                name for name in requested_attributes if name in safe_attributes
+            ]
         total = sum(1 for meta in fields.values() if isinstance(meta, dict))
         result = project_field_metadata(
-            fields, field_names=field_names, query=query, attributes=attributes,
+            fields,
+            field_names=field_names,
+            query=query,
+            attributes=requested_attributes if explicit_attributes else None,
         )
         response: Dict[str, Any] = {
             "success": True,
@@ -3817,8 +3882,7 @@ def get_model_fields(
             "count": len(result),
             "total_fields": total,
             "attributes": (
-                ["*"] if attributes and "*" in attributes
-                else list(attributes or FIELD_METADATA_DEFAULT_ATTRIBUTES)
+                ["*"] if "*" in requested_attributes else requested_attributes
             ),
             "result": result,
         }
@@ -3826,6 +3890,12 @@ def get_model_fields(
             missing = [name for name in field_names if name not in fields]
             if missing:
                 response["unknown_field_names"] = missing
+        if unknown_attributes:
+            response["unknown_attributes"] = unknown_attributes
+            response["warnings"] = [
+                "Unknown or XML-RPC-unsafe field metadata attributes were "
+                "ignored: " + ", ".join(unknown_attributes)
+            ]
         return response
     except Exception as e:
         return error_response("get_model_fields", e, model=model)
@@ -4291,7 +4361,7 @@ def _message_post_returning_id(odoo, model: str, record_id: int, kwargs: Dict[st
         if isinstance(result, dict) and isinstance(result.get("id"), int):
             return result["id"]
     except Exception as exc:
-        if "cannot marshal" not in str(exc) and "marshal" not in str(exc).lower():
+        if not is_unmarshallable_response_fault(exc):
             raise
     created = odoo.execute_method(
         "mail.message", "search",
