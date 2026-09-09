@@ -201,6 +201,15 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     """
     Application lifespan for initialization and cleanup
     """
+    try:
+        from .telemetry import get_telemetry
+
+        telemetry = get_telemetry()
+        if telemetry is not None:
+            for tool in server._tool_manager.list_tools():
+                telemetry.definition(tool)
+    except Exception:
+        logger.debug('MCP telemetry definition export failed (details suppressed)')
     yield AppContext()
 
 
@@ -283,6 +292,7 @@ def _log_field(value: Any, limit: int = 80) -> str:
 def log_tool_call(
     tool: str, arguments: Dict[str, Any], result: Any, started: float,
     error_class: Optional[str],
+    summary: Any = None,
 ) -> None:
     """One structured INFO line per tool call.
 
@@ -295,7 +305,7 @@ def log_tool_call(
 
     user_context = current_user_context()
     login = user_context[0] if user_context else "<service-account>"
-    success, count, size = _result_summary(result)
+    success, count, size = summary if summary is not None else _result_summary(result)
     model = arguments.get("model") if isinstance(arguments, dict) else None
     if success is False and isinstance(structured := _structured_of(result), dict):
         error_class = error_class or str(structured.get("error_type") or "tool_error")
@@ -332,17 +342,44 @@ class NesaFastMCP(FastMCP):
 
     async def call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
         started = time.perf_counter()
+        start_at = datetime.now(timezone.utc).isoformat()
         result: Any = None
         error_class: Optional[str] = None
+        telemetry = event = exception = None
+        try:
+            from .telemetry import get_telemetry
+            from ._nesa_per_user_auth import current_user_context
+
+            telemetry = get_telemetry()
+            if telemetry is not None:
+                user = current_user_context()
+                try:
+                    context = self.get_context().request_context
+                except (LookupError, ValueError):
+                    context = None
+                event = telemetry.begin(arguments, self._tool_manager.get_tool(name),
+                                        context, user[0] if user else 'service-account', start_at)
+        except Exception:
+            logger.debug('MCP telemetry setup failed (details suppressed)')
         try:
             result = await super().call_tool(name, arguments)
             return result
         except BaseException as exc:
+            exception = exc
             error_class = type(exc).__name__
             raise
         finally:
+            summary = None
+            if telemetry is not None and event is not None:
+                try:
+                    summary = _result_summary(result)
+                    success, count, size = summary
+                    telemetry.finish(event, time.perf_counter() - started, success, count,
+                                     size, _structured_of(result), exception)
+                except Exception:
+                    logger.debug('MCP telemetry completion failed (details suppressed)')
             try:
-                log_tool_call(name, arguments, result, started, error_class)
+                log_tool_call(name, arguments, result, started, error_class, summary)
             except Exception:  # noqa: BLE001 — logging must never break a call
                 logger.debug("[mcp_call] log line failed", exc_info=True)
 
