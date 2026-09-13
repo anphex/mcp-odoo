@@ -1001,6 +1001,10 @@ def classify_call_error(exc: BaseException) -> Dict[str, Any]:
 
     text = str(exc)
     lowered = text.casefold()
+    if isinstance(exc, SearchInputError):
+        # Input values may themselves contain words such as "timeout".
+        # A diagnosed schema error is never a transient transport failure.
+        return {"error_type": "request", "retryable": False, "detail": {"message": text}}
     if isinstance(exc, xmlrpc.client.Fault):
         return {
             "error_type": "odoo_error",
@@ -1136,6 +1140,23 @@ def compact_error_message(exc: BaseException) -> tuple[str, Optional[str]]:
     return cause, unescaped
 
 
+class SearchInputError(ValueError):
+    """A locally diagnosed search input error, without guessed corrections."""
+
+    def __init__(
+        self, message: str, *, reason_code: str, invalid_parameter: str,
+        expected_schema: Dict[str, Any], domain_item_index: Optional[int] = None,
+    ):
+        super().__init__(message)
+        self.details: Dict[str, Any] = {
+            "reason_code": reason_code,
+            "invalid_parameter": invalid_parameter,
+            "expected_schema": expected_schema,
+        }
+        if domain_item_index is not None:
+            self.details["domain_item_index"] = domain_item_index
+
+
 def error_response(tool: str, exc: BaseException, **extra: Any) -> Dict[str, Any]:
     """Build a uniform, non-anonymous error payload for a failed tool call.
 
@@ -1167,6 +1188,15 @@ def error_response(tool: str, exc: BaseException, **extra: Any) -> Dict[str, Any
             "[error_ref=%s] %s failed: %s\n%s",
             error_ref, tool, message, full_traceback,
         )
+    if tool == "search_records":
+        response["error_details"] = {
+            "reason_code": response["error_type"],
+            "message": message,
+            "invalid_parameter": None,
+            "retryable": response["retryable"],
+        }
+        if isinstance(exc, SearchInputError):
+            response["error_details"].update(exc.details)
     response.update(extra)
     return response
 
@@ -1382,7 +1412,15 @@ def resolve_read_fields(
         return expanded, notes
     unknown = _unknown_field_names(app_context, odoo, model, fields)
     if unknown:
-        raise ValueError(_unknown_fields_message(app_context, odoo, model, unknown))
+        raise SearchInputError(
+            _unknown_fields_message(app_context, odoo, model, unknown),
+            reason_code="invalid_field",
+            invalid_parameter="fields",
+            expected_schema={
+                "type": "array", "items": {"type": "string"},
+                "description": "Use field names from this model's fields_get metadata.",
+            },
+        )
     return fields, notes
 
 
@@ -1453,8 +1491,14 @@ DOMAIN_FORMAT_HINT = (
 )
 
 
-def _domain_error(reason: str) -> ValueError:
-    return ValueError(f"Invalid domain: {reason}. {DOMAIN_FORMAT_HINT}")
+def _domain_error(reason: str, *, item_index: Optional[int] = None) -> ValueError:
+    return SearchInputError(
+        f"Invalid domain: {reason}. {DOMAIN_FORMAT_HINT}",
+        reason_code="invalid_domain",
+        invalid_parameter="domain",
+        expected_schema={"type": "array", "description": DOMAIN_FORMAT_HINT},
+        domain_item_index=item_index,
+    )
 
 
 def normalize_domain_input(domain: Any) -> List[Any]:
@@ -1498,7 +1542,7 @@ def normalize_domain_input(domain: Any) -> List[Any]:
                 "{field, operator, value} objects"
             )
         normalized: List[Any] = []
-        for cond in conditions:
+        for item_index, cond in enumerate(conditions):
             if not (
                 isinstance(cond, dict)
                 and isinstance(cond.get("field"), str)
@@ -1506,7 +1550,8 @@ def normalize_domain_input(domain: Any) -> List[Any]:
                 and "value" in cond
             ):
                 raise _domain_error(
-                    f"condition {cond!r:.120} needs string field/operator and a value"
+                    f"condition {cond!r:.120} needs string field/operator and a value",
+                    item_index=item_index,
                 )
             normalized.append([cond["field"], cond["operator"], cond["value"]])
         return normalized
@@ -1538,7 +1583,7 @@ def normalize_domain_input(domain: Any) -> List[Any]:
         domain_list = domain_value
 
     valid_conditions: List[Any] = []
-    for cond in domain_list:
+    for item_index, cond in enumerate(domain_list):
         if isinstance(cond, str) and cond in ["&", "|", "!"]:
             valid_conditions.append(cond)
             continue
@@ -1551,7 +1596,8 @@ def normalize_domain_input(domain: Any) -> List[Any]:
             valid_conditions.append(list(cond))
             continue
         raise _domain_error(
-            f"element {cond!r:.120} is not a [field, operator, value] triple"
+            f"element {cond!r:.120} is not a [field, operator, value] triple",
+            item_index=item_index,
         )
 
     return valid_conditions
@@ -3945,7 +3991,15 @@ def get_model_fields(
         "'has_more' and 'next_offset' for paging. Without an explicit 'order' "
         "the result is sorted by 'id desc'. That makes paging deterministic "
         "but not snapshot-safe: records created or deleted while you page "
-        "still shift the offsets, so page by 'id < last_id' when that matters."
+        "still shift the offsets, so page by 'id < last_id' when that matters. "
+        "Request the fields you need here to avoid a subsequent read of the same "
+        "records. For known IDs use read_record (one) or read_records (several). "
+        "Use next_offset only for the next page of the same search; start a "
+        "different search when the model, domain or ordering needs to change. "
+        "Execution failures include error_details with reason_code, message, "
+        "invalid_parameter (null if undiagnosed), retryable, and, for local "
+        "input errors, expected_schema and an optional domain_item_index. "
+        "Corrections are never executed automatically."
     ),
     annotations=READ_ONLY_TOOL,
     structured_output=True,
@@ -4076,7 +4130,12 @@ def search_records(
 
 
 @mcp.tool(
-    description="Read a single Odoo record by model and ID",
+    description=(
+        "Read a single Odoo record by known model and ID. Use read_records for "
+        "several known IDs. When IDs are unknown, use search_records and request "
+        "the needed fields there to avoid a redundant read. Use search_records "
+        "with next_offset only to fetch another page of the same search."
+    ),
     annotations=READ_ONLY_TOOL,
     structured_output=True,
 )
@@ -4140,7 +4199,11 @@ def read_record(
     description=(
         "Read several Odoo records of one model in a single call. Prefer this "
         "over repeated read_record calls or a search_records detour via "
-        "[['id','in',[...]]]."
+        "[['id','in',[...]]]. Use read_record for one known ID. When IDs are "
+        "unknown, request the needed fields directly in search_records; a "
+        "follow-up read is needed only for additional data. Use next_offset "
+        "for another page of the same search, and a different search when "
+        "the model, domain or ordering needs to change."
     ),
     annotations=READ_ONLY_TOOL,
     structured_output=True,

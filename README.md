@@ -185,6 +185,48 @@ odoo-mcp --health
 | `schema_catalog` | Build a bounded model catalog with optional field metadata. |
 | `build_domain` | Build and validate an Odoo domain from structured conditions. |
 
+#### Choosing a read tool
+
+| Need | Tool and arguments |
+| --- | --- |
+| Find records with unknown IDs | `search_records`: request the needed `fields` immediately. |
+| Read one known ID | `read_record(model, record_id, fields)`. |
+| Read several known IDs of one model | `read_records(model, record_ids, fields)` (at most 100 IDs). |
+| Fetch the next page | Reuse the search parameters with `offset=next_offset`; heed `has_more`. |
+| Change the model, filter or ordering | Start a new `search_records` query. |
+| Fetch additional fields or related records | A subsequent read is appropriate; repeated tool names alone do not prove redundancy. |
+
+Search results already contain the requested fields. An extra read of those
+same fields is unnecessary. Pagination is not a snapshot: concurrent changes
+can shift offsets; see the tool description for keyset pagination.
+
+#### Search execution errors
+
+`search_records` preserves `success=false`, the legacy `error` string,
+`error_type` and `retryable`. It additionally returns `error_details`:
+
+| Field | Meaning |
+| --- | --- |
+| `reason_code` | `invalid_field` or `invalid_domain` for locally diagnosed input errors; otherwise the existing error classification. |
+| `message` | Human-readable cause, matching the legacy `error`. |
+| `invalid_parameter` | `fields` or `domain` when diagnosed locally, otherwise `null`. |
+| `retryable` | Whether a transient retry may help; local input errors always require correction first. |
+| `expected_schema` | Expected input shape and guidance, present for locally diagnosed input errors. |
+| `domain_item_index` | Optional zero-based index in the normalized domain list or the supplied `conditions` list. |
+
+For unknown fields, inspect `get_model_fields` and select fields appropriate
+to the task. Similar names in the message are suggestions, not replacements.
+No `corrected_request_example` is emitted when a correction would require
+guessing intent, removing a filter or changing the requested fields. Already
+supported alternate domain representations are normalized as before.
+No automatic correction or retry of an invalid request is introduced; the
+existing retry policy for transient read transport failures is unchanged.
+
+This contract covers errors returned by the search implementation. MCP/Pydantic
+argument validation before tool execution retains its framework error format.
+Remote Odoo errors are not assigned a guessed input parameter. A successful page
+whose count lookup fails retains its existing `total_count_error` behavior.
+
 ### Write & Operate (5)
 
 | Tool | Purpose |

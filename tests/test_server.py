@@ -1556,6 +1556,129 @@ def test_search_records_rejects_unknown_explicit_fields_before_rpc():
     text = json.dumps(result)
     assert "planned_date_end" in text
     assert "planned_date_begin" in text  # close-match hint
+    assert isinstance(result["error"], str)
+    assert result["error_type"] == "request"
+    assert result["retryable"] is False
+    details = result["error_details"]
+    assert details["reason_code"] == "invalid_field"
+    assert details["invalid_parameter"] == "fields"
+    assert details["message"] == result["error"]
+    assert details["retryable"] is False
+    assert details["expected_schema"]["type"] == "array"
+    assert "corrected_request_example" not in text
+    assert "domain_item_index" not in details
+
+
+@pytest.mark.parametrize(
+    ("domain", "expected_index"),
+    [
+        ("def x():", None),
+        (42, None),
+        ({"conditions": "invalid"}, None),
+        ([["name", "=", "Ada"], ["id", 42]], 1),
+        ({"conditions": [
+            {"field": "name", "operator": "=", "value": "Ada"},
+            {"field": "id", "operator": "="},
+        ]}, 1),
+    ],
+)
+def test_search_input_domain_error_preserves_legacy_and_position(domain, expected_index):
+    server = importlib.import_module("odoo_mcp.server")
+    with pytest.raises(ValueError, match="Invalid domain"):
+        server.normalize_domain_input(domain)
+
+    client = _SmartFieldsClient()
+    result = server.search_records(FakeCtx(client), "res.partner", domain=domain)
+
+    assert result["success"] is False
+    assert result["error_type"] == "request"
+    assert client.search_read_calls == []
+    details = result["error_details"]
+    assert details["reason_code"] == "invalid_domain"
+    assert details["invalid_parameter"] == "domain"
+    assert details["message"] == result["error"]
+    assert details["retryable"] is False
+    assert details["expected_schema"]["type"] == "array"
+    if expected_index is None:
+        assert "domain_item_index" not in details
+    else:
+        assert details["domain_item_index"] == expected_index
+    assert "corrected_request_example" not in json.dumps(result)
+
+
+def test_search_rpc_error_does_not_guess_parameter_or_retry_business_failure():
+    server = importlib.import_module("odoo_mcp.server")
+
+    class BrokenClient(_SmartFieldsClient):
+        def search_read(self, *args, **kwargs):
+            self.search_read_calls.append(kwargs)
+            raise xmlrpc.client.Fault(1, "Invalid field on a related model")
+
+    client = BrokenClient()
+    result = server.search_records(FakeCtx(client), "res.partner", fields=["name"])
+
+    assert result["success"] is False
+    assert len(client.search_read_calls) == 1
+    assert result["error_type"] == "odoo_error"
+    assert result["error_details"] == {
+        "reason_code": "odoo_error",
+        "message": result["error"],
+        "invalid_parameter": None,
+        "retryable": False,
+    }
+
+
+@pytest.mark.parametrize("field_name", ["timeout", "connection refused", "service unavailable"])
+def test_search_invalid_field_transport_words_never_make_input_retryable(field_name):
+    server = importlib.import_module("odoo_mcp.server")
+    client = _SmartFieldsClient()
+
+    result = server.search_records(FakeCtx(client), "res.partner", fields=[field_name])
+
+    assert result["success"] is False
+    assert result["error_type"] == "request"
+    assert result["retryable"] is False
+    assert result["error_details"]["reason_code"] == "invalid_field"
+    assert result["error_details"]["retryable"] is False
+    assert client.search_read_calls == []
+
+
+def test_search_success_pagination_has_no_error_details():
+    server = importlib.import_module("odoo_mcp.server")
+
+    class PagedClient(_SmartFieldsClient):
+        def execute_method(self, model, method, *args, **kwargs):
+            assert method == "search_count"
+            return 12
+
+    client = PagedClient(records=[{"id": 6}, {"id": 7}])
+    result = server.search_records(
+        FakeCtx(client), "res.partner", fields=["id"], limit=2, offset=5,
+    )
+
+    assert result["success"] is True
+    assert result["result"] == [{"id": 6}, {"id": 7}]
+    assert result["count"] == 2
+    assert result["total_count"] == 12
+    assert result["has_more"] is True
+    assert result["next_offset"] == 7
+    assert "error_details" not in result
+
+
+def test_read_tool_descriptions_expose_selection_and_error_contract():
+    server = importlib.import_module("odoo_mcp.server")
+    tools = {tool.name: tool for tool in asyncio.run(server.mcp.list_tools())}
+
+    for name in ("search_records", "read_record", "read_records"):
+        description = tools[name].description
+        if name != "search_records":
+            assert "search_records" in description
+        assert "read_record" in description
+        assert "fields" in description
+        assert "next_offset" in description
+    search_description = tools["search_records"].description
+    for key in ("error_details", "reason_code", "invalid_parameter", "expected_schema"):
+        assert key in search_description
 
 
 def test_search_records_unknown_field_check_fails_open_without_metadata():
