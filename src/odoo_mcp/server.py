@@ -1483,6 +1483,84 @@ def _unknown_fields_message(
     )
 
 
+def _domain_leaf_fields(domain: List[Any]) -> List[tuple[int, str]]:
+    """``(item_index, root_field_name)`` for every leaf of a normalized domain.
+
+    Dotted paths (``partner_id.name``) are checked on their first segment
+    only; the relation itself must exist and be searchable, the remainder is
+    resolved by Odoo on the target model.
+    """
+    leaves: List[tuple[int, str]] = []
+    for item_index, cond in enumerate(domain):
+        if isinstance(cond, (list, tuple)) and len(cond) == 3 and isinstance(cond[0], str):
+            root = cond[0].split(".", 1)[0]
+            if root:
+                leaves.append((item_index, root))
+    return leaves
+
+
+def validate_domain_fields(
+    app_context: AppContext, odoo: OdooClient, model: str, domain: List[Any]
+) -> None:
+    """Refuse a domain whose leaves name unknown or unsearchable fields.
+
+    Checked BEFORE the RPC (NESA, incident
+    ``mcp-odoo:invalid-field-false-success`` 2026-09): a domain on
+    ``ir.attachment.res_name`` — computed, not stored, ``searchable=False``
+    — reached Odoo, which logged an ``Invalid field`` ERROR traceback per
+    call while the XML-RPC fault still travelled as HTTP 200.  Unknown names
+    are re-checked once against fresh metadata (Studio fields, new modules).
+    Fails open without metadata so a metadata outage never blocks reads.
+    """
+    leaves = _domain_leaf_fields(domain)
+    if not leaves:
+        return
+    names = sorted({name for _, name in leaves if name != "id"})
+    if not names:
+        return
+    try:
+        unknown = _unknown_field_names(app_context, odoo, model, names)
+        metadata = {} if unknown else _cached_fields_metadata(app_context, odoo, model)
+    except Exception as exc:  # noqa: BLE001 — metadata is advisory here
+        logger.warning(
+            "[validate_domain_fields] metadata unavailable for %s, "
+            "domain passed through unchecked: %s", model, exc,
+        )
+        return
+    if unknown:
+        first_index = next(i for i, n in leaves if n in unknown)
+        raise SearchInputError(
+            _unknown_fields_message(app_context, odoo, model, unknown),
+            reason_code="invalid_field",
+            invalid_parameter="domain",
+            expected_schema={"type": "array", "description": DOMAIN_FORMAT_HINT},
+            domain_item_index=first_index,
+        )
+    if not metadata:
+        return
+    unsearchable = [
+        name for name in names
+        if isinstance(metadata.get(name), dict)
+        and metadata[name].get("searchable") is False
+    ]
+    if not unsearchable:
+        return
+    first_index = next(i for i, n in leaves if n in unsearchable)
+    raise SearchInputError(
+        f"Field(s) not searchable on {model}: {', '.join(repr(n) for n in unsearchable)}. "
+        "They are computed without a stored value, so Odoo cannot filter on "
+        "them and the domain would silently match nothing. Resolve the "
+        "related record first (name_search on its model) and filter by the "
+        "id-bearing field instead, e.g. for ir.attachment use "
+        '[["res_model", "=", "<model>"], ["res_id", "in", [<ids>]]] '
+        "rather than res_name.",
+        reason_code="unsearchable_field",
+        invalid_parameter="domain",
+        expected_schema={"type": "array", "description": DOMAIN_FORMAT_HINT},
+        domain_item_index=first_index,
+    )
+
+
 DOMAIN_FORMAT_HINT = (
     "Pass the domain as a JSON list of [field, operator, value] triples, "
     'e.g. [["state", "=", "sale"], ["partner_id", "in", [7, 9]]]; the prefix '
@@ -3698,6 +3776,9 @@ def execute_method(
 
             if len(normalized_args) > 0:
                 normalized_args[0] = normalize_domain_input(normalized_args[0])
+                validate_domain_fields(
+                    app_context, app_context.odoo, model, normalized_args[0]
+                )
                 args = normalized_args
 
         odoo = app_context.odoo
@@ -4061,6 +4142,7 @@ def search_records(
             app_context, odoo, model, fields
         )
         normalized_domain = normalize_domain_input(domain)
+        validate_domain_fields(app_context, odoo, model, normalized_domain)
         # NESA A4: an unordered search_read has no total order, so offset
         # paging can repeat or skip rows without anybody noticing.
         order_used = order or DEFAULT_SEARCH_ORDER
@@ -4339,6 +4421,9 @@ def aggregate_records(
             raise ValueError("offset must be greater than or equal to 0")
         clamped_limit = clamp_limit(limit if limit is not None else MAX_SEARCH_LIMIT)
         normalized_domain = normalize_domain_input(domain)
+        validate_domain_fields(
+            ctx.request_context.lifespan_context, odoo, model, normalized_domain
+        )
         normalized_measures: List[str] = []
         parsed_measures: List[tuple[str, str]] = []
         for spec in measures or []:
@@ -4649,6 +4734,9 @@ def name_search(
         if operator not in {"ilike", "=", "=ilike", "not ilike", "like", "=like"}:
             raise ValueError("operator must be one of ilike, =, =ilike, not ilike, like, =like")
         normalized_domain = normalize_domain_input(domain)
+        validate_domain_fields(
+            ctx.request_context.lifespan_context, odoo, model, normalized_domain
+        )
         audit_odoo_execution("name_search", model, "name_search")
         pairs = call_with_transport_retry(
             # Odoo 18 signature: name_search(name='', args=None, operator='ilike', limit=100)

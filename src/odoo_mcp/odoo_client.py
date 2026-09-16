@@ -37,6 +37,10 @@ FIELD_METADATA_RPC_ATTRIBUTES = (
     "automatic",
     "help",
     "groups",
+    # Needed by the MCP-side domain check: a computed, unstored field such as
+    # ir.attachment.res_name reports searchable=False and must be refused
+    # before the RPC instead of producing an Odoo ERROR traceback.
+    "searchable",
 )
 
 

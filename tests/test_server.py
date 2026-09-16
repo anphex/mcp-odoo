@@ -5003,3 +5003,102 @@ def test_call_tool_logs_even_when_the_tool_raises(monkeypatch, caplog):
             asyncio.run(probe.call_tool("list_models", {}))
     lines = [r.getMessage() for r in caplog.records if "[mcp_call]" in r.getMessage()]
     assert lines and "tool=list_models" in lines[0] and lines[0].endswith("error=RuntimeError")
+
+
+# ---------------------------------------------------------------------------
+# NESA 2026-09-16: domain leaves are validated against fields_get before the
+# RPC (incident mcp-odoo:invalid-field-false-success — ir.attachment.res_name).
+# ---------------------------------------------------------------------------
+
+_ATTACHMENT_META = {
+    "id": {"type": "integer", "searchable": True},
+    "name": {"type": "char", "searchable": True},
+    "res_model": {"type": "char", "searchable": True},
+    "res_id": {"type": "integer", "searchable": True},
+    "res_name": {"type": "char", "store": False, "searchable": False},
+}
+
+
+def test_search_records_rejects_unsearchable_domain_field_before_rpc():
+    server = importlib.import_module("odoo_mcp.server")
+    client = _SmartFieldsClient(fields_meta=_ATTACHMENT_META)
+
+    result = server.search_records(
+        FakeCtx(client), "ir.attachment",
+        domain=[["res_model", "=", "project.task"], ["res_name", "ilike", "TGZ-61488"]],
+        fields=["name"],
+    )
+
+    assert result["success"] is False
+    assert client.search_read_calls == []
+    details = result["error_details"]
+    assert details["reason_code"] == "unsearchable_field"
+    assert details["invalid_parameter"] == "domain"
+    assert details["domain_item_index"] == 1
+    assert "res_name" in result["error"]
+    assert "res_id" in result["error"]
+
+
+def test_search_records_rejects_unknown_domain_field_with_hint():
+    server = importlib.import_module("odoo_mcp.server")
+    client = _SmartFieldsClient(fields_meta=_ATTACHMENT_META)
+
+    result = server.search_records(
+        FakeCtx(client), "ir.attachment", domain=[["res_modle", "=", "x"]], fields=["name"],
+    )
+
+    assert result["success"] is False
+    assert client.search_read_calls == []
+    details = result["error_details"]
+    assert details["reason_code"] == "invalid_field"
+    assert details["invalid_parameter"] == "domain"
+    assert details["domain_item_index"] == 0
+    assert "res_model" in result["error"]  # close-match hint
+
+
+def test_search_records_domain_check_accepts_searchable_paths_and_prefix_ops():
+    server = importlib.import_module("odoo_mcp.server")
+    client = _SmartFieldsClient(fields_meta=_ATTACHMENT_META)
+
+    result = server.search_records(
+        FakeCtx(client), "ir.attachment",
+        domain=["|", ["res_id", "in", [1, 2]], ["id", "=", 3]],
+        fields=["name"],
+    )
+
+    assert result["success"] is True
+    assert len(client.search_read_calls) == 1
+
+
+def test_search_records_domain_check_fails_open_without_metadata():
+    server = importlib.import_module("odoo_mcp.server")
+    client = _SmartFieldsClient(fields_meta={"error": "boom"})
+
+    result = server.search_records(
+        FakeCtx(client), "ir.attachment", domain=[["res_name", "=", "x"]], fields=["name"],
+    )
+
+    assert result["success"] is True
+    assert len(client.search_read_calls) == 1  # reached Odoo unchanged
+
+
+def test_search_records_domain_check_uses_fresh_metadata_for_new_field():
+    """A field that appeared after the cache was filled is re-read once."""
+    server = importlib.import_module("odoo_mcp.server")
+
+    class _GrowingClient(_SmartFieldsClient):
+        def get_model_fields(self, model):
+            self.fields_get_calls += 1
+            if self.fields_get_calls >= 2:
+                return {**_ATTACHMENT_META, "x_studio_new": {"type": "char", "searchable": True}}
+            return dict(_ATTACHMENT_META)
+
+    client = _GrowingClient()
+    ctx = FakeCtx(client)
+    server.search_records(ctx, "ir.attachment", fields=["name"])  # fills cache
+    result = server.search_records(
+        ctx, "ir.attachment", domain=[["x_studio_new", "=", "v"]], fields=["name"],
+    )
+
+    assert result["success"] is True
+    assert client.fields_get_calls == 2
