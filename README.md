@@ -178,12 +178,53 @@ odoo-mcp --health
 | `get_model_fields` | Read field metadata for one model. |
 | `search_records` | Run bounded read-only `search_read`. Smart-field selection when caller omits `fields`. |
 | `read_record` | Read one record by model and ID. Smart-field selection when caller omits `fields`. |
+| `inspect_record_form` | Effective form view of a model/record for the calling user: every field occurrence in form order with label, type, value, required/readonly and visibility (`visible`/`hidden`/`conditional`/`unknown`). Use first when checking, creating or changing a record. |
 | `aggregate_records` | Server-side groupby/aggregation via `formatted_read_group` (Odoo 19+) or `read_group` (16-18). |
 | `search_employee` | Search employees by name. |
 | `search_holidays` | Search leave records by date range. |
 | `get_odoo_profile` | Read server version, user context, transport, database, and installed module summary. |
 | `schema_catalog` | Build a bounded model catalog with optional field metadata. |
 | `build_domain` | Build and validate an Odoo domain from structured conditions. |
+
+#### Form reconciliation with `inspect_record_form`
+
+`inspect_record_form(model, record_id=None, view_id=None, context=None,
+include_empty=True, max_relational_rows=20)` answers "which fields does this
+user get in the effective form of this record, and what do they hold?".
+
+- The arch comes from `get_view`, i.e. after all inherited and custom views
+  and after Odoo removed nodes the user's groups may not see. Only the field
+  names found there are looked up in the (cached) field metadata.
+- `meta`: `model`, `record_id`, `view_id`, `view_name`, `user_context`,
+  `values_source` (`record`/`defaults`/`none`), `warnings`, `truncated`.
+  `sections[]`: `section_label`, `section_path`, `fields[]` with `name`,
+  `label`, `type`, `value`, `display_value`, `relation`, `required`,
+  `readonly`, `visibility`, `visibility_condition`, `inherited_conditions`,
+  `section_path`, `occurrence` (`"2/3"` = second of three occurrences).
+  Keys that do not apply to a field are left out.
+- A modifier that cannot be decided is never reported as plain
+  visible/hidden: without a record it is `conditional`, with a record but an
+  undecidable expression (`context`, `parent`, calls, mixed types) `unknown`.
+  The same applies to `required`/`readonly` (`true`/`false`/`"conditional"`/
+  `"unknown"` plus `*_condition`).
+- Binary and image fields are read with `bin_size` and report only
+  `{present, size}`. x2many fields return `count`, `ids` and at most
+  `max_relational_rows` (cap 100) rows of the inline list columns — one level,
+  never recursive.
+- Nothing is shortened silently: clipped text (2000 chars), cut rows, capped
+  columns and the answer budget (`ODOO_MCP_FORM_INSPECT_MAX_CHARS`, default
+  60000) all set `meta.truncated=true` and add a concrete warning; sections
+  dropped for the budget are listed in `meta.omitted_sections`/`omitted_fields`.
+- Limits: the default form is resolved without an action — pass `view_id` or
+  `context.form_view_ref` for an action-specific form; defaults shown without
+  `record_id` do not include onchange results; widget-side logic (JS) is not
+  evaluated.
+
+Agent workflow: inspect first; before a write compare the empty visible or
+conditional fields with the evidence, write only proven values and name the
+gaps; after the write read the changed fields back. If the tool is
+unavailable: `execute_method get_view` → extract the XML fields →
+`get_model_fields` → `read_record`.
 
 #### Choosing a read tool
 

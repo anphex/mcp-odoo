@@ -45,6 +45,7 @@ from .diagnostics import (
     sanitize_odoo_error,
     upgrade_risk_report as build_upgrade_risk_report,
 )
+from . import form_inspect
 from ._nesa_file_intake import FileIntakeError, fetch_allowlisted_url
 from .odoo_client import (
     FIELD_METADATA_RPC_ATTRIBUTES,
@@ -223,6 +224,14 @@ SERVER_INSTRUCTIONS = (
     "get_model_fields before guessing a field "
     "name; list_models to find a model. Never use execute_method for "
     "plain reads.\n"
+    "RECORD CHECK/CREATE/CHANGE: call inspect_record_form first — it returns "
+    "the user's effective form (inherited and custom fields, in order) with "
+    "values, required/readonly and visibility. Do not judge a record complete "
+    "from an ad-hoc field list. Before a write compare the empty visible or "
+    "conditional fields with your evidence; write only proven values, name "
+    "the gaps, never guess; after the write read the changed fields back. "
+    "Fallback if the tool is unavailable: execute_method get_view -> extract "
+    "the XML fields -> get_model_fields -> read_record.\n"
     "WRITE: validate_write -> execute_approved_write (preview_write is an "
     "optional dry run). execute_method runs business methods "
     "(action_confirm, action_done, ...); CRUD on persistent models is "
@@ -4352,6 +4361,780 @@ def read_records(
         return response
     except Exception as e:
         return error_response("read_records", e, model=model)
+
+
+# ----- inspect_record_form -------------------------------------------------
+
+FORM_INSPECT_READ_CHUNK = 40
+FORM_INSPECT_MAX_ROWS = 100
+FORM_INSPECT_MAX_COLUMNS = 15
+FORM_INSPECT_TEXT_LIMIT = 2000
+FORM_INSPECT_DEGRADED_TEXT_LIMIT = 300
+FORM_INSPECT_DEGRADED_ROWS = 5
+FORM_INSPECT_DEFAULT_MAX_CHARS = 60000
+
+
+class FormRecordNotFound(Exception):
+    """read() answered with no row for the requested id."""
+
+
+def form_inspect_max_chars() -> int:
+    """Answer budget of inspect_record_form (ODOO_MCP_FORM_INSPECT_MAX_CHARS)."""
+    raw = os.environ.get("ODOO_MCP_FORM_INSPECT_MAX_CHARS", "").strip()
+    try:
+        value = int(raw) if raw else FORM_INSPECT_DEFAULT_MAX_CHARS
+    except ValueError:
+        value = FORM_INSPECT_DEFAULT_MAX_CHARS
+    return max(4000, value)
+
+
+def _form_inspect_context(
+    odoo: OdooClient, context: Optional[Dict[str, Any]], warnings: List[str]
+) -> Dict[str, Any]:
+    """User context (lang, tz, uid) overlaid with the caller's context."""
+    effective: Dict[str, Any] = {}
+    try:
+        user_context = odoo.get_user_context()
+        if isinstance(user_context, dict) and "error" not in user_context:
+            effective.update(user_context)
+    except Exception as exc:  # noqa: BLE001 — the view call still decides
+        warnings.append(f"User context could not be read: {compact_error_message(exc)[0]}")
+    if context is not None and not isinstance(context, dict):
+        raise ValueError("context must be a JSON object")
+    sanitized, removed = sanitized_execution_kwargs({"context": context or {}})
+    for key, value in sanitized["context"].items():
+        if key in ("bin_size", "uid"):
+            # bin_size is owned by this tool (binary content must never be
+            # transferred); uid feeds modifier evaluation and must stay the
+            # authenticated user's.
+            removed.append(key)
+            continue
+        effective[key] = value
+    # Defence in depth: even a field mis-typed in the cached metadata cannot
+    # return binary content.
+    effective["bin_size"] = True
+    if removed:
+        warnings.append("Ignored context keys: " + ", ".join(sorted(set(removed))))
+    return effective
+
+
+def _form_inspect_read_values(
+    odoo: OdooClient,
+    model: str,
+    record_id: int,
+    names: List[str],
+    context: Dict[str, Any],
+) -> tuple[Dict[str, Any], Dict[str, str]]:
+    """Read ``names`` in bounded blocks; isolate a failing field instead of
+    losing the whole block."""
+    values: Dict[str, Any] = {}
+    errors: Dict[str, str] = {}
+
+    def read(block: List[str]) -> Dict[str, Any]:
+        rows = call_with_transport_retry(
+            lambda: odoo.execute_method(
+                model, "read", [record_id], fields=block, context=context
+            ),
+            label=f"read({model})",
+        )
+        if not rows:
+            raise FormRecordNotFound(f"Record not found: {model} ID {record_id}")
+        return rows[0]
+
+    for block in form_inspect.chunked(names, FORM_INSPECT_READ_CHUNK):
+        try:
+            values.update(read(block))
+            continue
+        except FormRecordNotFound:
+            raise
+        except Exception as block_exc:  # noqa: BLE001 — retried per field below
+            if classify_call_error(block_exc)["retryable"]:
+                raise
+        for name in block:
+            try:
+                values.update(read([name]))
+            except FormRecordNotFound:
+                raise
+            except Exception as field_exc:  # noqa: BLE001 — reported per field
+                errors[name] = compact_error_message(field_exc)[0]
+    return values, errors
+
+
+def _form_inspect_clip_text(value: Any, limit: int) -> tuple[Any, Optional[int]]:
+    """Bound one value. Returns (value, original size) — the size is set
+    whenever the value was shortened in any way, so the caller can say so."""
+    if isinstance(value, str):
+        scrubbed, replaced = form_inspect.scrub_inline_base64(value)
+        if len(scrubbed) > limit:
+            return scrubbed[:limit], len(value)
+        return (scrubbed, len(value)) if replaced else (value, None)
+    if isinstance(value, (list, dict)):
+        # properties/json values or long id lists inside rows.
+        chars = form_inspect.payload_chars(value)
+        if chars > limit:
+            return {"omitted": True, "chars": chars}, chars
+    return value, None
+
+
+def _form_inspect_x2many(
+    app_context: AppContext,
+    odoo: OdooClient,
+    metadata: Dict[str, Any],
+    ids: List[int],
+    occurrence: "form_inspect.Occurrence",
+    max_rows: int,
+    context: Dict[str, Any],
+    warnings: List[str],
+) -> tuple[Dict[str, Any], bool]:
+    """Bounded rows of one x2many field: one level deep, never recursive."""
+    truncated = False
+    shown = ids[:max_rows]
+    shaped: Dict[str, Any] = {"count": len(ids), "ids": shown}
+    if len(ids) > len(shown):
+        shaped["truncated"] = True
+        truncated = True
+        warnings.append(
+            f"{occurrence.name}: {len(shown)} of {len(ids)} rows returned "
+            "(max_relational_rows)."
+        )
+    comodel = str(metadata.get("relation") or "")
+    if not shown or not comodel:
+        return shaped, truncated
+    comodel_fields = _cached_fields_metadata(app_context, odoo, comodel)
+    if not isinstance(comodel_fields, dict) or "error" in comodel_fields:
+        comodel_fields = {}
+    columns: List[str] = []
+    skipped: List[str] = []
+    unavailable: List[str] = []
+    for column in occurrence.subview_columns:
+        name = column["name"]
+        column_meta = comodel_fields.get(name)
+        if column["static_hidden"]:
+            continue
+        if not isinstance(column_meta, dict):
+            unavailable.append(name)
+            continue
+        if column_meta.get("type") == "binary":
+            skipped.append(name)
+            continue
+        columns.append(name)
+    if len(columns) > FORM_INSPECT_MAX_COLUMNS:
+        dropped = columns[FORM_INSPECT_MAX_COLUMNS:]
+        columns = columns[:FORM_INSPECT_MAX_COLUMNS]
+        shaped["columns_omitted"] = dropped
+        truncated = True
+        warnings.append(
+            f"{occurrence.name}: row columns limited to {FORM_INSPECT_MAX_COLUMNS}; "
+            "omitted: " + ", ".join(dropped)
+        )
+    if skipped:
+        shaped["binary_columns_skipped"] = skipped
+    if unavailable:
+        shaped["columns_unavailable"] = unavailable
+        truncated = True
+        warnings.append(
+            f"{occurrence.name}: no field metadata of {comodel} for row columns: "
+            + ", ".join(unavailable)
+        )
+    read_fields = ["display_name"] + [c for c in columns if c != "display_name"]
+    try:
+        rows = call_with_transport_retry(
+            lambda: odoo.execute_method(
+                comodel, "read", shown, fields=read_fields, context=context
+            ),
+            label=f"read({comodel})",
+        )
+    except Exception as exc:  # noqa: BLE001 — ids stay usable without rows
+        warnings.append(
+            f"{occurrence.name}: rows of {comodel} could not be read: "
+            f"{compact_error_message(exc)[0]}"
+        )
+        return shaped, truncated
+    clipped_any = False
+    shaped_rows: List[Dict[str, Any]] = []
+    for row in rows or []:
+        shaped_row: Dict[str, Any] = {}
+        for key, value in row.items():
+            column_meta = comodel_fields.get(key) or {}
+            if column_meta.get("type") in form_inspect.X2MANY_TYPES:
+                shaped_row[key] = {"count": len(value) if isinstance(value, list) else 0}
+                continue
+            if (
+                isinstance(value, list) and len(value) == 2
+                and isinstance(value[0], int) and isinstance(value[1], str)
+            ):
+                # many2one: the id must survive, only the name may be clipped.
+                name_text, original = _form_inspect_clip_text(
+                    value[1], FORM_INSPECT_DEGRADED_TEXT_LIMIT
+                )
+                if original is not None:
+                    clipped_any = True
+                shaped_row[key] = [value[0], name_text]
+                continue
+            clipped, original = _form_inspect_clip_text(value, FORM_INSPECT_DEGRADED_TEXT_LIMIT)
+            if original is not None:
+                clipped_any = True
+            shaped_row[key] = clipped
+        shaped_rows.append(shaped_row)
+    shaped["rows"] = shaped_rows
+    if clipped_any:
+        shaped["row_text_clipped_at"] = FORM_INSPECT_DEGRADED_TEXT_LIMIT
+        truncated = True
+        warnings.append(
+            f"{occurrence.name}: values in rows shortened (clipped at "
+            f"{FORM_INSPECT_DEGRADED_TEXT_LIMIT} characters or inline base64 removed)."
+        )
+    return shaped, truncated
+
+
+def _form_inspect_enforce_budget(response: Dict[str, Any], max_chars: int) -> None:
+    """Shrink an oversized answer step by step — every step is announced."""
+    meta = response["meta"]
+
+    def over() -> bool:
+        return form_inspect.payload_chars(response) > max_chars
+
+    def all_fields() -> List[Dict[str, Any]]:
+        return [f for section in response["sections"] for f in section["fields"]]
+
+    def statically_hidden(entry: Dict[str, Any]) -> bool:
+        return (
+            entry["visibility"] == form_inspect.HIDDEN
+            and "visibility_condition" not in entry
+            and "inherited_conditions" not in entry
+        )
+
+    if not over():
+        return
+    meta["truncated"] = True
+    # Technical fields the user never sees go first: they are about half of a
+    # typical Odoo 18 form and matter least for a form reconciliation.
+    compacted = 0
+    for entry in all_fields():
+        if statically_hidden(entry):
+            for key in ("label", "required", "readonly", "section_path", "relation",
+                        "widget", "required_condition", "readonly_condition",
+                        "required_source", "display_value"):
+                entry.pop(key, None)
+            compacted += 1
+    if compacted:
+        meta["warnings"].append(
+            f"Answer budget ({max_chars} chars): {compacted} statically hidden "
+            "field(s) reduced to name, type, value, visibility, occurrence."
+        )
+    if not over():
+        return
+    touched = []
+    for entry in all_fields():
+        value = entry.get("value")
+        if isinstance(value, dict) and len(value.get("rows") or []) > FORM_INSPECT_DEGRADED_ROWS:
+            value["rows"] = value["rows"][:FORM_INSPECT_DEGRADED_ROWS]
+            value["truncated"] = True
+            touched.append(entry["name"])
+    if touched:
+        meta["warnings"].append(
+            f"Answer budget ({max_chars} chars): x2many rows cut to "
+            f"{FORM_INSPECT_DEGRADED_ROWS} for: " + ", ".join(sorted(set(touched)))
+        )
+    if not over():
+        return
+    touched = []
+    for entry in all_fields():
+        value = entry.get("value")
+        if isinstance(value, dict) and value.get("rows"):
+            value.pop("rows")
+            value["truncated"] = True
+            touched.append(entry["name"])
+    if touched:
+        meta["warnings"].append(
+            "Answer budget: x2many rows removed (count and ids kept) for: "
+            + ", ".join(sorted(set(touched)))
+        )
+    if not over():
+        return
+    touched = []
+    for entry in all_fields():
+        if entry["type"] in form_inspect.X2MANY_TYPES or entry["type"] == "binary":
+            continue
+        clipped, original = _form_inspect_clip_text(
+            entry.get("value"), FORM_INSPECT_DEGRADED_TEXT_LIMIT
+        )
+        if original is not None:
+            entry["value"] = clipped
+            entry["value_truncated"] = True
+            entry["value_length"] = entry.get("value_length") or original
+            touched.append(entry["name"])
+    if touched:
+        meta["warnings"].append(
+            f"Answer budget: text values clipped at {FORM_INSPECT_DEGRADED_TEXT_LIMIT} "
+            "characters for: " + ", ".join(sorted(set(touched)))
+        )
+    if not over():
+        return
+    hidden_names: List[str] = []
+    for section in response["sections"]:
+        kept = []
+        for entry in section["fields"]:
+            if statically_hidden(entry):
+                hidden_names.append(entry["name"])
+            else:
+                kept.append(entry)
+        section["fields"] = kept
+    if hidden_names:
+        response["sections"] = [s for s in response["sections"] if s["fields"]]
+        meta["omitted_hidden_fields"] = sorted(set(hidden_names))
+        meta["warnings"].append(
+            f"Answer budget: {len(hidden_names)} statically hidden field "
+            "occurrence(s) omitted — names in meta.omitted_hidden_fields."
+        )
+    if not over():
+        return
+    # The bookkeeping lives in meta while sections are dropped, so its own
+    # size counts against the budget it is enforcing.
+    omitted: List[str] = []
+    omitted_sections: List[str] = []
+    meta["omitted_sections"] = omitted_sections
+    meta["omitted_fields"] = omitted
+    meta["warnings"].append(
+        "Answer budget: trailing sections omitted — see meta.omitted_sections/"
+        "omitted_fields and read those fields with read_record, or call again "
+        "with include_empty=false / max_relational_rows=0."
+    )
+    while over() and response["sections"]:
+        section = response["sections"].pop()
+        omitted_sections.insert(0, section["section_path"])
+        omitted[0:0] = [f["name"] for f in section["fields"]]
+    meta["omitted_field_occurrences"] = len(omitted)
+    if over():
+        # Even the name lists do not fit: keep counts, say so.
+        meta["omitted_sections_count"] = len(omitted_sections)
+        meta["omitted_sections"] = omitted_sections[:20]
+        meta["omitted_fields"] = sorted(set(omitted))[:100]
+        meta["warnings"].append(
+            "Answer budget: omitted_sections/omitted_fields are themselves cut "
+            "(first 20 sections, first 100 distinct field names); the counts "
+            "are complete."
+        )
+    if over():
+        meta["warnings"].append(
+            f"Answer budget of {max_chars} chars could not be met "
+            f"({form_inspect.payload_chars(response)} chars remain)."
+        )
+
+
+@mcp.tool(
+    description=(
+        "Inspect the effective form view of a model or record in ONE call: which "
+        "fields the authenticated user gets in the fully combined form (all "
+        "inherited and custom views applied, group-restricted nodes already "
+        "removed by Odoo), in form order, with label, type, current value, "
+        "required/readonly and visibility. Use this FIRST when checking, "
+        "completing, creating or changing a record, and before every write to "
+        "compare empty visible/conditional fields against your evidence — do not "
+        "rely on an ad-hoc field list. visibility is 'visible', 'hidden', "
+        "'conditional' (dynamic, no record to evaluate) or 'unknown' (not "
+        "decidable); the expression is in visibility_condition / "
+        "inherited_conditions. required/readonly are true, false, 'conditional' "
+        "or 'unknown'. Without record_id the values are default_get defaults. "
+        "Binary/image fields report only presence and size; x2many fields "
+        "return count, ids and at most max_relational_rows rows of the inline "
+        "list columns (one level, never recursive). Every shortening sets "
+        "meta.truncated=true with a concrete entry in meta.warnings. The default "
+        "form is resolved like Odoo does without an action; pass view_id or "
+        "context.form_view_ref for an action-specific form. Datetimes are naive "
+        "UTC. Read-only."
+    ),
+    annotations=READ_ONLY_TOOL,
+    structured_output=True,
+)
+def inspect_record_form(
+    ctx: Context,
+    model: Annotated[str, Field(description="Technical model name, e.g. 'res.partner'.")],
+    record_id: Annotated[
+        Optional[int],
+        Field(description="Database id of an existing record. Omit to inspect the empty form with defaults.", ge=1),
+    ] = None,
+    view_id: Annotated[
+        Optional[int],
+        Field(description="Explicit form view id (ir.ui.view). Omit for the default form view.", ge=1),
+    ] = None,
+    context: Annotated[
+        Optional[Dict[str, Any]],
+        Field(
+            description=(
+                "Odoo context, e.g. {\"lang\": \"de_DE\", \"allowed_company_ids\": [1], "
+                "\"default_partner_id\": 42, \"form_view_ref\": \"module.view_xmlid\"}. "
+                "Merged over the user's own context."
+            )
+        ),
+    ] = None,
+    include_empty: Annotated[
+        bool, Field(description="Also return form fields whose value is empty.")
+    ] = True,
+    max_relational_rows: Annotated[
+        int,
+        Field(description="Maximum embedded rows per x2many field (0-100).", ge=0),
+    ] = 20,
+) -> Dict[str, Any]:
+    """
+    Combined form arch + field metadata + current values in one bounded answer.
+    """
+    app_context = ctx.request_context.lifespan_context
+    odoo = app_context.odoo
+    try:
+        validate_model_name(model)
+        warnings: List[str] = []
+        truncated = False
+        if max_relational_rows > FORM_INSPECT_MAX_ROWS:
+            warnings.append(
+                f"max_relational_rows capped at {FORM_INSPECT_MAX_ROWS} "
+                f"(requested {max_relational_rows})."
+            )
+            max_relational_rows = FORM_INSPECT_MAX_ROWS
+        effective_context = _form_inspect_context(odoo, context, warnings)
+
+        view_kwargs: Dict[str, Any] = {"view_type": "form", "context": effective_context}
+        if view_id is not None:
+            view_kwargs["view_id"] = view_id
+        view = call_with_transport_retry(
+            lambda: odoo.execute_method(model, "get_view", **view_kwargs),
+            label=f"get_view({model})",
+        )
+        if not isinstance(view, dict) or not view.get("arch"):
+            raise RuntimeError(f"get_view returned no form arch for {model}")
+        resolved_view_id = view.get("id") or None
+        view_name: Optional[str] = None
+        # Parsed before anything else: the arch root is the view-type check
+        # that works for every user (ir.ui.view is readable by admins only).
+        occurrences, form_attributes = form_inspect.parse_form_arch(view["arch"])
+        if resolved_view_id:
+            try:
+                view_rows = call_with_transport_retry(
+                    lambda: odoo.execute_method(
+                        "ir.ui.view", "read", [resolved_view_id],
+                        fields=["name", "model"], context=effective_context,
+                    ),
+                    label="read(ir.ui.view)",
+                )
+            except Exception:  # noqa: BLE001 — best effort, needs admin rights
+                view_rows = []
+            if view_rows:
+                view_name = view_rows[0].get("name") or None
+                view_model = view_rows[0].get("model")
+                # get_view echoes the model it was called on, so only the
+                # view record itself proves a foreign view_id.
+                if view_model and view_model != model:
+                    raise ValueError(
+                        f"view_id {resolved_view_id} is a form of {view_model}, "
+                        f"not of {model}"
+                    )
+        else:
+            warnings.append(
+                "No stored form view exists for this model; Odoo generated a "
+                "default form."
+            )
+
+        all_metadata = _cached_fields_metadata(app_context, odoo, model)
+        if not all_metadata:
+            all_metadata = app_context.schema_cache.pop(
+                _fields_cache_key(model) + ":error", None
+            ) or {}
+        if "error" in all_metadata:
+            raise RuntimeError(str(all_metadata["error"]))
+
+        view_field_names: List[str] = []
+        for occurrence in occurrences:
+            if occurrence.name not in view_field_names:
+                view_field_names.append(occurrence.name)
+        unknown_in_model = [n for n in view_field_names if n not in all_metadata]
+        if unknown_in_model:
+            warnings.append(
+                "Fields in the view without accessible field metadata (type and "
+                "value unknown): " + ", ".join(unknown_in_model)
+            )
+            if view_id is not None and view_name is None:
+                warnings.append(
+                    f"view_id {view_id} could not be verified to belong to {model} "
+                    "and contains fields this model does not have — it may be a "
+                    "form of another model."
+                )
+        modifier_names = [
+            name for name in form_inspect.referenced_names(occurrences)
+            if name in all_metadata
+        ]
+        readable = [n for n in view_field_names if n in all_metadata]
+        for name in modifier_names:
+            if name not in readable:
+                readable.append(name)
+        # The schema cache is shared and language-neutral; labels and selection
+        # texts of exactly the form's fields are fetched in the user's language.
+        localized: Dict[str, Any] = {}
+        if readable:
+            try:
+                fetched = call_with_transport_retry(
+                    lambda: odoo.execute_method(
+                        model, "fields_get", readable,
+                        attributes=["string", "selection"], context=effective_context,
+                    ),
+                    label=f"fields_get({model})",
+                )
+                if isinstance(fetched, dict):
+                    localized = fetched
+            except Exception as exc:  # noqa: BLE001 — cached labels still serve
+                warnings.append(
+                    "Localized labels could not be read, labels may be English: "
+                    f"{compact_error_message(exc)[0]}"
+                )
+        binary_names = [n for n in readable if all_metadata[n].get("type") == "binary"]
+        plain_names = [n for n in readable if n not in binary_names]
+
+        values: Dict[str, Any] = {}
+        value_errors: Dict[str, str] = {}
+        record_display_name: Optional[str] = None
+        values_source = "none"
+        if record_id is not None:
+            values_source = "record"
+            # Existence and record access are decided here, before any
+            # per-field fallback could blur a MissingError/AccessError.
+            head = call_with_transport_retry(
+                lambda: odoo.execute_method(
+                    model, "read", [record_id],
+                    fields=["display_name"], context=effective_context,
+                ),
+                label=f"read({model})",
+            )
+            if not head:
+                raise FormRecordNotFound(f"Record not found: {model} ID {record_id}")
+            record_display_name = head[0].get("display_name") or None
+            values, value_errors = _form_inspect_read_values(
+                odoo, model, record_id, plain_names, effective_context
+            )
+            if binary_names:
+                binary_values, binary_errors = _form_inspect_read_values(
+                    odoo, model, record_id, binary_names,
+                    {**effective_context, "bin_size": True},
+                )
+                values.update(binary_values)
+                value_errors.update(binary_errors)
+            if value_errors:
+                warnings.append(
+                    "Values could not be read for: " + ", ".join(sorted(value_errors))
+                )
+        else:
+            try:
+                defaults = call_with_transport_retry(
+                    # Positional: overrides name the argument differently
+                    # (fields_list, default_fields, fields).
+                    lambda: odoo.execute_method(
+                        model, "default_get", plain_names, context=effective_context,
+                    ),
+                    label=f"default_get({model})",
+                )
+                if isinstance(defaults, dict):
+                    values = defaults
+                    values_source = "defaults"
+                warnings.append(
+                    "No record_id: values are default_get defaults; onchange "
+                    "results are not included."
+                )
+            except Exception as exc:  # noqa: BLE001 — the layout is still valid
+                warnings.append(
+                    f"Defaults could not be read: {compact_error_message(exc)[0]}"
+                )
+
+        evaluation_names: Optional[Dict[str, Any]] = None
+        if record_id is not None:
+            evaluation_names = {"id": record_id, "active_id": record_id}
+            if isinstance(effective_context.get("uid"), int):
+                evaluation_names["uid"] = effective_context["uid"]
+            for name in plain_names:
+                if name in values and name not in value_errors:
+                    evaluation_names[name] = form_inspect.evaluation_value(
+                        str(all_metadata[name].get("type")), values[name]
+                    )
+
+        sections: List[Dict[str, Any]] = []
+        omitted_empty: List[str] = []
+        x2many_cache: Dict[tuple, tuple] = {}
+        for occurrence in occurrences:
+            metadata = all_metadata.get(occurrence.name)
+            known = isinstance(metadata, dict)
+            metadata = dict(metadata) if known else {}
+            local = localized.get(occurrence.name)
+            if isinstance(local, dict):
+                for key in ("string", "selection"):
+                    if local.get(key):
+                        metadata[key] = local[key]
+            field_type = str(metadata.get("type") or "unknown")
+            visibility, own_condition, inherited = form_inspect.occurrence_visibility(
+                occurrence, evaluation_names
+            )
+            required, required_condition = form_inspect.resolve_required(
+                occurrence.attrs.get("required"),
+                bool(metadata.get("required")), evaluation_names,
+            )
+            readonly, readonly_condition = form_inspect.resolve_readonly(
+                occurrence.attrs.get("readonly"),
+                bool(metadata.get("readonly")), evaluation_names,
+            )
+            section_path = " / ".join(occurrence.section_path)
+            entry: Dict[str, Any] = {
+                "name": occurrence.name,
+                "label": occurrence.attrs.get("string") or metadata.get("string"),
+                "type": field_type,
+                "value": None,
+                "required": required,
+                "readonly": readonly,
+                "visibility": visibility,
+                "section_path": section_path,
+                "occurrence": f"{occurrence.index}/{occurrence.total}",
+            }
+            if metadata.get("relation"):
+                entry["relation"] = metadata["relation"]
+            if own_condition:
+                entry["visibility_condition"] = own_condition
+            if inherited:
+                entry["inherited_conditions"] = inherited
+            if required_condition:
+                entry["required_condition"] = required_condition
+            if metadata.get("required") and occurrence.attrs.get("required") is not None:
+                entry["required_source"] = "model"
+            if readonly_condition:
+                entry["readonly_condition"] = readonly_condition
+            for attribute in ("widget", "groups"):
+                if occurrence.attrs.get(attribute):
+                    entry[attribute] = occurrence.attrs[attribute]
+
+            raw = values.get(occurrence.name)
+            if occurrence.name in value_errors:
+                entry["value_error"] = value_errors[occurrence.name]
+            elif not known or values_source == "none":
+                entry["value_available"] = False
+            elif field_type == "binary":
+                if values_source == "record":
+                    entry["value"] = form_inspect.shape_binary(raw)
+                else:
+                    # Binary defaults are never requested from default_get.
+                    entry["value_available"] = False
+            elif field_type in form_inspect.X2MANY_TYPES:
+                if values_source != "record":
+                    ids, new_rows = form_inspect.decode_x2many_default(raw)
+                    shaped_default: Dict[str, Any] = {
+                        "count": len(ids), "ids": ids[:max_relational_rows],
+                    }
+                    if new_rows:
+                        shaped_default["new_rows"] = new_rows
+                    if len(ids) > max_relational_rows:
+                        shaped_default["truncated"] = True
+                        truncated = True
+                        warnings.append(
+                            f"{occurrence.name}: {max_relational_rows} of {len(ids)} "
+                            f"default ids returned (occurrence {entry['occurrence']})."
+                        )
+                    entry["value"] = shaped_default
+                else:
+                    ids = [i for i in (raw or []) if isinstance(i, int)]
+                    cache_key = (
+                        occurrence.name,
+                        tuple(c["name"] for c in occurrence.subview_columns),
+                    )
+                    if cache_key not in x2many_cache:
+                        x2many_cache[cache_key] = _form_inspect_x2many(
+                            app_context, odoo, metadata, ids, occurrence,
+                            max_relational_rows, effective_context, warnings,
+                        )
+                    shaped, was_truncated = x2many_cache[cache_key]
+                    entry["value"] = json.loads(json.dumps(shaped, default=str))
+                    truncated = truncated or was_truncated
+            elif field_type == "many2one":
+                if isinstance(raw, (list, tuple)) and raw:
+                    entry["value"] = raw[0]
+                    if len(raw) > 1:
+                        entry["display_value"] = raw[1]
+                else:
+                    entry["value"] = raw if isinstance(raw, int) and raw else False
+            else:
+                clipped, original = _form_inspect_clip_text(raw, FORM_INSPECT_TEXT_LIMIT)
+                entry["value"] = clipped
+                if original is not None:
+                    entry["value_truncated"] = True
+                    entry["value_length"] = original
+                    truncated = True
+                    warnings.append(
+                        f"{occurrence.name}: value shortened (limit "
+                        f"{FORM_INSPECT_TEXT_LIMIT} characters, inline base64 removed; "
+                        f"original {original}; occurrence {entry['occurrence']})."
+                    )
+                if field_type == "selection" and raw not in (False, None):
+                    label = form_inspect.selection_label(metadata, raw)
+                    if label is not None:
+                        entry["display_value"] = label
+
+            if (
+                not include_empty
+                and "value_error" not in entry
+                and entry.get("value_available", True)
+                and form_inspect.is_empty_value(field_type, entry["value"])
+            ):
+                omitted_empty.append(occurrence.name)
+                continue
+            if sections and sections[-1]["section_path"] == section_path:
+                sections[-1]["fields"].append(entry)
+            else:
+                sections.append({
+                    "section_label": occurrence.section_path[-1].split(":", 1)[-1],
+                    "section_path": section_path,
+                    "fields": [entry],
+                })
+
+        from ._nesa_per_user_auth import current_user_context
+
+        user = current_user_context()
+        # A fixed, small echo: the caller's own context must not eat the budget.
+        user_context: Dict[str, Any] = {
+            key: effective_context[key]
+            for key in ("lang", "tz", "uid", "allowed_company_ids", "form_view_ref")
+            if key in effective_context
+        }
+        user_context["login"] = user[0] if user else "<service-account>"
+        user_context["context_keys"] = sorted(effective_context)[:40]
+        meta: Dict[str, Any] = {
+            "model": model,
+            "record_id": record_id,
+            "record_display_name": record_display_name,
+            "view_id": resolved_view_id,
+            "view_name": view_name,
+            "user_context": user_context,
+            "values_source": values_source,
+            "field_occurrences": len(occurrences),
+            "distinct_fields": len(view_field_names),
+            "warnings": warnings,
+            "truncated": truncated,
+        }
+        interesting = {
+            key: form_attributes[key]
+            for key in ("create", "edit", "delete", "duplicate")
+            if key in form_attributes
+        }
+        if interesting:
+            meta["form_attributes"] = interesting
+        if not include_empty:
+            meta["omitted_empty_fields"] = omitted_empty
+        response: Dict[str, Any] = {"success": True, "meta": meta, "sections": sections}
+        _form_inspect_enforce_budget(response, form_inspect_max_chars())
+        return response
+    except FormRecordNotFound as e:
+        return {
+            "success": False,
+            "tool": "inspect_record_form",
+            "error": str(e),
+            "error_type": "not_found",
+            "retryable": False,
+        }
+    except Exception as e:
+        return error_response(
+            "inspect_record_form", e, model=model, record_id=record_id, view_id=view_id
+        )
 
 
 @mcp.tool(
