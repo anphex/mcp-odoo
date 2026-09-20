@@ -19,6 +19,10 @@ from pathlib import Path
 LOG = logging.getLogger(__name__)
 PARAMETERS = frozenset('model domain fields ids record_id limit offset order method args kwargs values context query report_name action confirm approval_token'.split())
 ERROR_CLASSES = frozenset('request transport odoo_error tool_error not_found not_configured not_readable'.split())
+# A tool's own reason_code is preferred over guessing a category from prose,
+# but it is bounded like every other recorded identifier so a relayed Odoo
+# string can never widen the taxonomy or the file size.
+REASON_CODE = re.compile(r'\A[a-z][a-z0-9_]{0,39}\Z')
 
 
 def argument_shape(arguments):
@@ -123,8 +127,20 @@ class Telemetry:
 
     def finish(self, event, elapsed, success, count, size, structured, exception=None):
         error = exception is not None or success is False or (isinstance(structured, dict) and bool(structured.get('error')))
+        # A tool that refuses a payload on purpose reports a verdict, not a
+        # fault, and must not inflate the error rate.  Only an explicit marker
+        # from the tool downgrades the status: an exception, or a failure that
+        # carries no marker, still counts as an error.
+        rejected = (exception is None and isinstance(structured, dict)
+                    and structured.get('outcome') == 'rejected')
+        if rejected and not error:
+            # A tool that claims a refusal while reporting no failure breaks the
+            # contract.  Book that as an error rather than let it disappear into
+            # 'success', where nobody would ever see it.
+            error, rejected = True, False
         event.update(end_at=datetime.now(timezone.utc).isoformat(), duration_ms=round(elapsed * 1000, 3),
-                     status='error' if error else 'success' if success is True else 'unknown',
+                     status=('rejected' if rejected else 'error') if error
+                     else 'success' if success is True else 'unknown',
                      record_count=count, result_bytes=size, error_class=None, error_code=None, error_fingerprint=None)
         if error:
             raw_class = structured.get('error_type') if isinstance(structured, dict) else None
@@ -135,7 +151,10 @@ class Telemetry:
                 message = message.get('message', '')
             message = message[:4096] if isinstance(message, str) else ''
             text = message.casefold()
-            code = next((code for marker, code in (
+            # The tool's own reason_code beats sniffing keywords out of prose.
+            reason = structured.get('reason_code') if isinstance(structured, dict) else None
+            reason = reason if isinstance(reason, str) and REASON_CODE.match(reason) else None
+            code = reason or next((code for marker, code in (
                 ('invalid field', 'invalid_field'), ('unknown field', 'invalid_field'),
                 ('access', 'access_denied'), ('not allowed', 'not_allowed'),
                 ('not found', 'not_found'), ('required', 'missing_parameter'),

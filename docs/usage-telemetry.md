@@ -27,7 +27,15 @@ Python creation modes alone cannot override a stricter umask.
 `schema_version`, `event_id`, `instance`, `tool`, `tool_version`, `code_version`, `start_at`,
 `end_at`, `duration_ms`, `status`, `record_count`, `result_bytes`, `error_class`,
 `error_code`, `error_fingerprint`, `model`, `argument_shape`, `correlation_id`,
-`correlation_quality`, `session_id`. Status is success/error/unknown/cancelled.
+`correlation_quality`, `session_id`. Status is
+success/error/rejected/unknown/cancelled. `rejected` means the tool deliberately
+refused the request — a verdict on the caller's payload, not a fault — and is
+recorded only when the tool marks its answer with `outcome: "rejected"`. An
+exception, or a failure without that marker, stays `error`. Rejections keep
+`error_class`, `error_code` and `error_fingerprint` so the cause stays
+analyzable; analyzers must count them apart from faults and must not read them
+as an outage. `error_code` is the tool's own `reason_code` when it publishes a
+bounded one (`[a-z][a-z0-9_]{0,39}`), otherwise a coarse keyword classification.
 No raw arguments, record IDs, responses, usernames, tokens or errors are stored.
 Argument shape records only approved parameter names, types and size buckets;
 same shape does **not** establish equal arguments.

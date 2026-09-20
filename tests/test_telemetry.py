@@ -142,3 +142,92 @@ def test_disabled_by_default_and_invalid_configuration(monkeypatch):
     monkeypatch.setenv('ODOO_MCP_TELEMETRY_ENABLED', '1')
     monkeypatch.delenv('ODOO_MCP_TELEMETRY_KEY_FILE', raising=False)
     assert module.get_telemetry() is None
+
+
+def read_events(telemetry):
+    telemetry.queue.join()
+    return [json.loads(line) for file in telemetry.directory.glob('events-*.jsonl')
+            for line in file.read_text().splitlines()]
+
+
+def test_deliberate_rejection_is_not_counted_as_error(telemetry):
+    telemetry.finish(begin(telemetry), .1, False, None, 40, {
+        'error_type': 'request', 'outcome': 'rejected', 'reason_code': 'unknown_field',
+        'error': "validate_write rejected the payload (unknown_field): 'ghost' is not present."})
+    event = read_events(telemetry)[0]
+    assert event['status'] == 'rejected'
+    # The cause stays analyzable even though the call was not a fault.
+    assert event['error_class'] == 'request'
+    assert event['error_code'] == 'unknown_field'
+    assert event['error_fingerprint']
+
+
+def test_failure_without_marker_stays_an_error(telemetry):
+    telemetry.finish(begin(telemetry), .1, False, None, 40,
+                     {'error_type': 'odoo_error', 'error': 'database is down'})
+    assert read_events(telemetry)[0]['status'] == 'error'
+
+
+def test_exception_is_never_downgraded_to_rejected(telemetry):
+    telemetry.finish(begin(telemetry), .1, False, None, 0,
+                     {'outcome': 'rejected', 'reason_code': 'unknown_field'},
+                     exception=RuntimeError('boom'))
+    assert read_events(telemetry)[0]['status'] == 'error'
+
+
+def test_reason_code_is_bounded_and_falls_back_to_keywords(telemetry):
+    telemetry.finish(begin(telemetry), .1, False, None, 10, {
+        'error_type': 'request', 'reason_code': 'NOT A CODE; drop table',
+        'error': "Invalid field 'x' for ID 1"})
+    assert read_events(telemetry)[0]['error_code'] == 'invalid_field'
+    raw = '\n'.join(file.read_text() for file in telemetry.directory.iterdir())
+    assert 'drop table' not in raw
+
+
+def test_distinct_reason_codes_split_fingerprints(telemetry):
+    for code in ('unknown_field', 'readonly_field'):
+        telemetry.finish(begin(telemetry), .1, False, None, 10, {
+            'error_type': 'request', 'outcome': 'rejected', 'reason_code': code,
+            'error': f'validate_write rejected the payload ({code}): see issues.'})
+    events = read_events(telemetry)
+    assert events[0]['error_fingerprint'] != events[1]['error_fingerprint']
+
+
+def test_real_validate_write_rejection_reaches_telemetry_as_rejected(telemetry, monkeypatch):
+    """End to end: the tool's own refusal payload must not book as a fault."""
+    from odoo_mcp import agent_tools, server
+    from odoo_mcp import telemetry as module
+    monkeypatch.setattr(module, 'get_telemetry', lambda: telemetry)
+    mcp = server.NesaFastMCP('test')
+
+    @mcp.tool()
+    async def validating_tool(model: str) -> Dict[str, Any]:
+        return agent_tools.validate_write_report(
+            model=model, operation='write', values={'ghost': 1}, record_ids=[7],
+            fields_metadata={'name': {'type': 'char'}}, metadata_source='server')
+
+    asyncio.run(mcp.call_tool('validating_tool', {'model': 'account.move'}))
+    event = read_events(telemetry)[0]
+    assert event['status'] == 'rejected'
+    assert event['error_class'] == 'request'
+    assert event['error_code'] == 'unknown_field'
+    # The refused field name never reaches the event stream.
+    assert 'ghost' not in json.dumps(event)
+
+
+def test_rejection_marker_without_failure_is_a_contract_violation(telemetry):
+    """A refusal claim on a successful answer must not vanish into 'success'."""
+    telemetry.finish(begin(telemetry), .1, True, 1, 10, {'outcome': 'rejected'})
+    assert read_events(telemetry)[0]['status'] == 'error'
+
+
+def test_rejections_of_one_cause_share_one_fingerprint(telemetry):
+    from odoo_mcp import agent_tools
+    for name in ("x_ghost", "a'b\"UNIQUE1", 'weird"quote'):
+        report = agent_tools.validate_write_report(
+            model='account.move', operation='write', values={name: 1},
+            record_ids=[7], fields_metadata={'name': {'type': 'char'}})
+        telemetry.finish(begin(telemetry), .1, report['success'], None, 40, report)
+    events = read_events(telemetry)
+    assert {event['status'] for event in events} == {'rejected'}
+    assert len({event['error_fingerprint'] for event in events}) == 1

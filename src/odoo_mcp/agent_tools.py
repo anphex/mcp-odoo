@@ -186,6 +186,94 @@ def verify_write_approval(approval: dict[str, Any]) -> tuple[bool, str]:
     return token == expected, expected
 
 
+# NESA A2: a refused payload is a verdict, not a crash.  It used to be reported
+# as ``success: False`` plus an ``issues`` list and nothing else, so a caller
+# branching on ``error`` saw an empty failure and the usage telemetry hashed
+# every single rejection into one fingerprint (audit 2026-09-20, marker
+# 83ebecad61eab2fc).  Rejections now carry the same machine-readable shape as
+# execute_approved_write's: error, reason_code, remedy, retryable.
+VALIDATE_WRITE_REMEDIES = {
+    "unsupported_write_operation": (
+        "Set operation to create, write, or unlink."
+    ),
+    "missing_create_values": (
+        "Pass the values dict the create needs; an empty create is refused."
+    ),
+    "missing_record_ids": (
+        "Pass record_ids naming the records this operation targets."
+    ),
+    "missing_write_values": (
+        "Pass the values dict this write applies; an empty write is refused."
+    ),
+    "unknown_field": (
+        "Call get_model_fields for this model and use only field names it "
+        "returns. Odoo 18 renamed several fields."
+    ),
+    "readonly_field": (
+        "Remove the readonly field from values and set it through the business "
+        "method that owns it, for example via execute_method."
+    ),
+}
+DEFAULT_VALIDATE_WRITE_REMEDY = (
+    "Correct the fields listed in 'issues' and call validate_write again."
+)
+# Which refusal names the verdict when a payload breaks several rules at once.
+# A fixed order keeps reason_code (and with it the telemetry fingerprint) out of
+# the caller's hands: without it the alphabetically first field name would pick
+# the code.  Shape problems outrank field problems because they describe the
+# call itself.
+VALIDATE_WRITE_REASON_PRIORITY = (
+    "unsupported_write_operation",
+    "missing_record_ids",
+    "missing_create_values",
+    "missing_write_values",
+    "readonly_field",
+    "unknown_field",
+)
+
+
+def write_rejection_details(error_issues: list[dict[str, str]]) -> dict[str, Any]:
+    """Machine-readable verdict for a payload validate_write refuses to approve."""
+    def rank(issue: dict[str, str]) -> int:
+        code = str(issue.get("code") or "")
+        return (VALIDATE_WRITE_REASON_PRIORITY.index(code)
+                if code in VALIDATE_WRITE_REASON_PRIORITY
+                else len(VALIDATE_WRITE_REASON_PRIORITY))
+
+    primary = min(error_issues, key=rank)
+    reason_code = str(primary.get("code") or "invalid_payload")
+    details: dict[str, Any] = {
+        # Deliberately free of caller-supplied text.  The message feeds the
+        # telemetry error fingerprint, whose normalizer strips quoted values
+        # only heuristically; an embedded field name would let a caller mint
+        # arbitrarily many fingerprints for one recurring cause.  The affected
+        # fields stay in 'issues' and 'invalid_parameters', which telemetry
+        # never reads.
+        "error": (
+            f"validate_write rejected the payload ({reason_code}); "
+            f"see 'issues' for the affected fields"
+        ),
+        # ``request`` is the telemetry error class for a caller-side payload
+        # problem; it is never a transport or Odoo fault, so a plain retry of
+        # the same arguments cannot help.
+        "error_type": "request",
+        "retryable": False,
+        "reason_code": reason_code,
+        "remedy": VALIDATE_WRITE_REMEDIES.get(
+            reason_code, DEFAULT_VALIDATE_WRITE_REMEDY
+        ),
+        # NESA A2: an intentional refusal is not an outage.  Telemetry reads
+        # this marker to record status 'rejected' instead of 'error'.
+        "outcome": "rejected",
+    }
+    invalid = sorted({
+        str(issue["field"]) for issue in error_issues if issue.get("field")
+    })
+    if invalid:
+        details["invalid_parameters"] = invalid
+    return details
+
+
 def validate_write_report(
     *,
     model: str,
@@ -215,6 +303,7 @@ def validate_write_report(
                     {
                         "code": "unknown_field",
                         "severity": "error",
+                        "field": field_name,
                         "message": f"{field_name!r} is not present in fields_get metadata.",
                     }
                 )
@@ -225,6 +314,7 @@ def validate_write_report(
                     {
                         "code": "readonly_field",
                         "severity": "error",
+                        "field": field_name,
                         "message": f"{field_name!r} is readonly in fields_get metadata.",
                     }
                 )
@@ -260,7 +350,8 @@ def validate_write_report(
                         }
                     )
 
-    success = not any(issue["severity"] == "error" for issue in issues)
+    error_issues = [issue for issue in issues if issue["severity"] == "error"]
+    success = not error_issues
     # NESA A2: validate_write is the only place that mints an approval token,
     # because it is the only place that checked the payload against live
     # fields_get metadata.  preview_write returns the same canonical payload
@@ -271,7 +362,7 @@ def validate_write_report(
         if success
         else None
     )
-    return {
+    report = {
         "success": success,
         "tool": "validate_write",
         "model": model,
@@ -284,6 +375,9 @@ def validate_write_report(
             "source": metadata_source,
         },
     }
+    if error_issues:
+        report.update(write_rejection_details(error_issues))
+    return report
 
 
 def _write_execute_method_args(payload: dict[str, Any]) -> dict[str, Any]:

@@ -330,6 +330,103 @@ def test_validate_write_skips_non_dict_metadata_entries_when_iterating_required(
     assert report["success"] is True
 
 
+# ----- validate_write_report rejection contract -----------------------------
+
+
+def test_validate_write_rejection_is_machine_readable():
+    report = agent_tools.validate_write_report(
+        model="account.move",
+        operation="write",
+        values={"ghost": "boo", "ref": "X"},
+        record_ids=[7],
+        fields_metadata={
+            "ref": {"type": "char", "readonly": True},
+            "name": {"type": "char", "readonly": False},
+        },
+        metadata_source="server",
+    )
+    assert report["success"] is False
+    assert report["reason_code"] in {"unknown_field", "readonly_field"}
+    assert report["error"].startswith("validate_write rejected the payload (")
+    assert report["error_type"] == "request"
+    assert report["retryable"] is False
+    assert report["remedy"]
+    assert report["invalid_parameters"] == ["ghost", "ref"]
+    # The deliberate refusal is marked so telemetry does not book it as a fault.
+    assert report["outcome"] == "rejected"
+    assert report["approval"] is None
+
+
+def test_validate_write_rejection_reason_code_follows_first_error_issue():
+    report = agent_tools.validate_write_report(
+        model="account.move",
+        operation="write",
+        values={},
+        record_ids=[],
+        fields_metadata={"name": {"type": "char", "readonly": False}},
+    )
+    assert report["reason_code"] == "missing_record_ids"
+    assert report["remedy"] == agent_tools.VALIDATE_WRITE_REMEDIES["missing_record_ids"]
+    assert "invalid_parameters" not in report
+
+
+def test_rejection_message_never_carries_caller_text():
+    # The message feeds the telemetry fingerprint: a caller must not be able to
+    # vary it, not even with quotes the normalizer strips only heuristically.
+    messages = set()
+    for name in ("x_ghost", "a'b\"UNIQUE1", 'weird"quote', "x" * 60):
+        report = agent_tools.validate_write_report(
+            model="account.move", operation="write", values={name: 1},
+            record_ids=[7], fields_metadata={"name": {"type": "char"}},
+        )
+        assert name not in report["error"]
+        assert report["invalid_parameters"] == [name]
+        messages.add(report["error"])
+    assert len(messages) == 1
+
+
+def test_reason_code_follows_fixed_priority_not_field_order():
+    # Field names are caller-chosen; the shape issue must win regardless.
+    report = agent_tools.validate_write_report(
+        model="account.move", operation="write", values={"aaa_ghost": 1},
+        record_ids=[], fields_metadata={"name": {"type": "char"}},
+    )
+    assert report["reason_code"] == "missing_record_ids"
+    readonly_first = agent_tools.validate_write_report(
+        model="account.move", operation="write",
+        values={"zzz_ro": 1, "aaa_ghost": 2}, record_ids=[7],
+        fields_metadata={"zzz_ro": {"type": "char", "readonly": True}},
+    )
+    assert readonly_first["reason_code"] == "readonly_field"
+
+
+def test_validate_write_success_carries_no_rejection_fields():
+    report = agent_tools.validate_write_report(
+        model="res.partner",
+        operation="write",
+        values={"name": "Ada"},
+        record_ids=[7],
+        fields_metadata={"name": {"type": "char", "readonly": False}},
+        metadata_source="server",
+    )
+    assert report["success"] is True
+    for key in ("error", "reason_code", "remedy", "outcome", "invalid_parameters"):
+        assert key not in report
+
+
+def test_validate_write_rejections_differ_by_cause():
+    unknown = agent_tools.validate_write_report(
+        model="account.move", operation="write", values={"ghost": 1},
+        record_ids=[7], fields_metadata={"name": {"type": "char"}},
+    )
+    missing = agent_tools.validate_write_report(
+        model="account.move", operation="write", values={"name": "x"},
+        record_ids=[], fields_metadata={"name": {"type": "char"}},
+    )
+    assert unknown["reason_code"] != missing["reason_code"]
+    assert unknown["error"] != missing["error"]
+
+
 # ----- build_domain_report error branches ----------------------------------
 
 

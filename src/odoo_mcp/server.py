@@ -3040,7 +3040,11 @@ def preview_write(
         "Validate a write payload against live fields_get metadata and mint the "
         "approval token for execute_approved_write. The token is valid for 600 "
         "seconds (approval_status.expires_at_iso) and is bound to this exact "
-        "payload — do not research or ask back between validate and execute."
+        "payload — do not research or ask back between validate and execute. "
+        "A refused payload answers with success=false plus reason_code, remedy, "
+        "retryable and the detailed issues list, and invalid_parameters "
+        "whenever the refusal is field-specific; correct those fields instead "
+        "of repeating the same call."
     ),
     annotations=READ_ONLY_TOOL,
     structured_output=True,
@@ -3068,10 +3072,18 @@ def validate_write(
                 ctx.request_context.lifespan_context.odoo.get_model_fields(model)
             )
             if "error" in fields_metadata:
+                # A missing schema is an infrastructure or permission problem,
+                # not a verdict on the payload: no 'rejected' marker here.
                 return {
                     "success": False,
                     "tool": "validate_write",
                     "error": fields_metadata["error"],
+                    "reason_code": "metadata_unavailable",
+                    "retryable": True,
+                    "remedy": (
+                        "Live fields_get failed. Check the model name and the "
+                        "Odoo connection, then repeat validate_write."
+                    ),
                     "metadata_used": {"fields_get": False, "source": metadata_source},
                 }
             if not fields_metadata:
@@ -3079,6 +3091,13 @@ def validate_write(
                     "success": False,
                     "tool": "validate_write",
                     "error": "live fields_get metadata was empty; refusing to approve writes",
+                    "reason_code": "metadata_empty",
+                    "retryable": False,
+                    "remedy": (
+                        "fields_get returned nothing for this model. Verify the "
+                        "technical model name with list_models and that this "
+                        "user may read its schema."
+                    ),
                     "metadata_used": {"fields_get": False, "source": metadata_source},
                     "approval_status": {
                         "stored": False,
