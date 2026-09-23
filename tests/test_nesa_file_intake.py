@@ -10,6 +10,7 @@ not at the happy path alone:
 * a checksum mismatch is reported as a failure, not as a filed document.
 """
 
+import asyncio
 import base64
 import hashlib
 import importlib
@@ -97,6 +98,10 @@ ARCHIVE_URL = (
     "https://openarchiver.nesa.de/oa-download-nesa/"
     "AbCdEfGhIjKlMnOpQrStUvWxYz01"
 )
+# Synthetic 43-char token in the shape create_media_download hands out.
+WA_TOKEN = "Synthetic_Test-Token_0123456789abcdefghijkl"
+WA_NESA_URL = f"https://whatsapp-mcp.nesa.de/wa-dl-test-konto/{WA_TOKEN}"
+WA_NEESE_URL = f"https://whatsapp-mcp.neese.one/wa-dl-demo/{WA_TOKEN}"
 
 
 @pytest.fixture
@@ -112,9 +117,73 @@ def server():
 # ----- allowlist ----------------------------------------------------------
 
 
-@pytest.mark.parametrize("url", [ALLOWED_URL, ARCHIVE_URL])
+@pytest.mark.parametrize("url", [ALLOWED_URL, ARCHIVE_URL, WA_NESA_URL, WA_NEESE_URL])
 def test_allowlisted_urls_pass(intake, url):
     intake.assert_url_allowed(url)
+
+
+def test_whatsapp_token_length_bounds(intake):
+    assert len(WA_TOKEN) == 43
+    for host in ("whatsapp-mcp.nesa.de", "whatsapp-mcp.neese.one"):
+        intake.assert_url_allowed(f"https://{host}/wa-dl-x/{'A' * 20}")
+        intake.assert_url_allowed(f"https://{host}/wa-dl-x/{'A' * 128}")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"http://whatsapp-mcp.nesa.de/wa-dl-x/{WA_TOKEN}",
+        f"http://whatsapp-mcp.neese.one/wa-dl-x/{WA_TOKEN}",
+        f"https://evil.example/wa-dl-x/{WA_TOKEN}",
+        f"https://whatsapp-mcp.neese.de/wa-dl-x/{WA_TOKEN}",
+        f"https://whatsapp-mcp.neese.one.evil.tld/wa-dl-x/{WA_TOKEN}",
+        f"https://whatsapp-mcp.nesa.de.evil.tld/wa-dl-x/{WA_TOKEN}",
+        f"https://whatsapp-mcp.neese.one:8443/wa-dl-x/{WA_TOKEN}",
+        f"https://whatsapp-mcp.nesa.de:8443/wa-dl-x/{WA_TOKEN}",
+        f"https://whatsapp-mcp.neese.one/wa-dl-x/{WA_TOKEN}/file.pdf",
+        f"https://whatsapp-mcp.nesa.de/wa-dl-x/{WA_TOKEN}/extra",
+        f"https://whatsapp-mcp.neese.one/wa-dl-x/{WA_TOKEN}/",
+        f"https://whatsapp-mcp.neese.one/wa-dl-x/{'A' * 19}",
+        f"https://whatsapp-mcp.nesa.de/wa-dl-x/{'A' * 129}",
+        f"https://whatsapp-mcp.neese.one/wa-dl-x/{WA_TOKEN}?x=1",
+        f"https://whatsapp-mcp.nesa.de/wa-dl-x/{WA_TOKEN}#frag",
+        f"https://whatsapp-mcp.neese.one/wa-dl-x/../{WA_TOKEN}",
+        "https://whatsapp-mcp.neese.one/wa-dl-x/../",
+        f"https://whatsapp-mcp.nesa.de/wa-dl-x/{WA_TOKEN}/../etc",
+        f"https://whatsapp-mcp.neese.one/wa-dl-X/{WA_TOKEN}",
+        f"https://whatsapp-mcp.neese.one/wa-dl-/{WA_TOKEN}",
+        f"https://whatsapp-mcp.nesa.de/mail-dl-x/{WA_TOKEN}",
+        f"https://mail-mcp.nesa.de/wa-dl-x/{WA_TOKEN}",
+        f"https://user:pw@whatsapp-mcp.neese.one/wa-dl-x/{WA_TOKEN}",
+        f"{WA_NEESE_URL}\n",
+        f" {WA_NEESE_URL}",
+        f"https://WHATSAPP-MCP.NEESE.ONE/wa-dl-x/{WA_TOKEN}",
+        f"https://whatsapp-mcp.neese.one./wa-dl-x/{WA_TOKEN}",
+        f"https://whatsapp-mcp．neese.one/wa-dl-x/{WA_TOKEN}",
+        f"https://whatsapp-mcp.nеese.one/wa-dl-x/{WA_TOKEN}",
+        f"https://evil.example\\@whatsapp-mcp.neese.one/wa-dl-x/{WA_TOKEN}",
+        f"https://whatsapp-mcp.neese.one/wa-dl-x/%41{WA_TOKEN}",
+        f"https://whatsapp-mcp.neese.one/wa-dl-x/{WA_TOKEN[:-1]}١",
+    ],
+)
+def test_whatsapp_lookalikes_are_denied(intake, url):
+    with pytest.raises(intake.FileIntakeError) as excinfo:
+        intake.assert_url_allowed(url)
+    assert excinfo.value.error_type == "url_denied"
+
+
+def test_denial_names_the_whatsapp_source(intake):
+    with pytest.raises(intake.FileIntakeError) as excinfo:
+        intake.assert_url_allowed("https://evil.example/x")
+    assert "create_media_download (WhatsApp MCP)" in str(excinfo.value)
+
+
+def test_tool_description_names_the_whatsapp_source(server):
+    tools = {tool.name: tool for tool in asyncio.run(server.mcp.list_tools())}
+    description = tools["create_attachment_from_url"].description
+    assert "create_media_download (WhatsApp MCP)" in description
+    assert "whatsapp-mcp.nesa.de" in description
+    assert "whatsapp-mcp.neese.one" in description
 
 
 @pytest.mark.parametrize(

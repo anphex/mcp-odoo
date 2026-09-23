@@ -248,13 +248,13 @@ sudo -u odoo git merge upstream/main  # ggf. Konflikte lösen
 
 ## 7. Datei-EMPFANG (`create_attachment_from_url`, `create_attachment_upload`)
 
-**Stand 2026-08-29.** Gegenstueck zu `create_attachment_download`: bisher konnte
+**Stand 2026-08-29, WhatsApp-Quellen 2026-09-23.** Gegenstueck zu `create_attachment_download`: bisher konnte
 der Agent Dateien nur ausgeben. Zwei Wege zurueck, in beiden laeuft kein Byte
 durch das Kontextfenster.
 
 | Tool | Weg | Grenze |
 | ---- | --- | ------ |
-| `create_attachment_from_url(url, model, res_id, filename=None)` | Der MCP-Prozess holt die Datei und reicht sie per XML-RPC an `nesa.mcp.doc.helper.mcp_store_attachment` | Hartkodierte URL-Allowlist (zwei Regexes, HTTPS-only), keine Redirects, 30 s Timeout, 40 MB Cap gegen `Content-Length` UND beim Streamen |
+| `create_attachment_from_url(url, model, res_id, filename=None)` | Der MCP-Prozess holt die Datei und reicht sie per XML-RPC an `nesa.mcp.doc.helper.mcp_store_attachment` | Hartkodierte URL-Allowlist (je Host eine Regex: `mail-mcp.nesa.de`, `openarchiver.nesa.de`, seit 2026-09-23 `whatsapp-mcp.nesa.de` und `whatsapp-mcp.neese.one` fuer `create_media_download`; HTTPS-only), keine Redirects, 30 s Timeout, 40 MB Cap gegen `Content-Length` UND beim Streamen |
 | `create_attachment_upload(model, res_id, filename, ttl_seconds=900)` | Odoo praegt einen Einmal-Token; der Agent laedt per `curl -T` gegen `PUT /nesa/mcp/upload/<token>` | Token einmalig + TTL, Ziel/Name/Mimetype beim Praegen fixiert, Cap 40 MB, GC-Cron |
 
 Der Fetch liegt bewusst hier und nicht in Odoo: die URL kommt aus einer Mail,

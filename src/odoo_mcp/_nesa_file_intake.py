@@ -1,9 +1,9 @@
-"""NESA Patch 7 — Datei-EMPFANG aus zwei fest verdrahteten Quellen.
+"""NESA Patch 7 — Datei-EMPFANG aus fest verdrahteten Quellen.
 
 Warum der Fetch hier passiert und nicht in Odoo
 -----------------------------------------------
-``create_attachment_from_url`` bekommt seine URL aus einer Mail oder aus einem
-Archiv-Treffer, also aus fremder Hand. Wuerde Odoo sie abrufen, waere der
+``create_attachment_from_url`` bekommt seine URL aus einer Mail, aus einem
+Archiv-Treffer oder aus einer WhatsApp-Nachricht, also aus fremder Hand. Wuerde Odoo sie abrufen, waere der
 ERP-Prozess der SSRF-Proxy: er sitzt im internen Netz, hat die DB-Verbindung
 und den Filestore. Der MCP-Serverprozess ist der richtige Ort — er darf nach
 aussen, kennt aber nur XML-RPC zurueck nach Odoo.
@@ -13,8 +13,8 @@ Warum die Allowlist im Code steht
 Sie ist die einzige Grenze zwischen "Agent laedt einen Mailanhang" und "Agent
 laedt, was in der Mail steht". Eine per Tool-Parameter, ENV oder Odoo-Parameter
 konfigurierbare Allowlist waere genau so weit weg vom Review wie der Angreifer:
-wer den Prompt beeinflusst, beeinflusst dann auch das Ziel. Zwei Regexes,
-hartkodiert, HTTPS-only, keine Wildcards, kein Schalter.
+wer den Prompt beeinflusst, beeinflusst dann auch das Ziel. Eine Regex je
+Host, hartkodiert, HTTPS-only, keine Wildcards, kein Schalter.
 
 Grenzen des Abrufs (alle drei zusammen, nicht wahlweise):
 
@@ -48,7 +48,9 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# Genau zwei Quellen. Der Pfad traegt bei beiden einen kurzlebigen Token, den
+# Genau diese Quellen: Mail-MCP, Open Archiver und die beiden WhatsApp-MCP-Hosts
+# (``create_media_download``, Links 60 min gueltig, Dateiname kommt per
+# Content-Disposition). Der Pfad traegt bei allen einen kurzlebigen Token, den
 # die Gegenseite ausgestellt hat; er wird hier nur weitergereicht, nie geloggt.
 ALLOWED_URL_PATTERNS = (
     re.compile(
@@ -57,6 +59,14 @@ ALLOWED_URL_PATTERNS = (
     re.compile(
         r"^https://openarchiver\.nesa\.de/oa-download-[a-z0-9-]{1,64}/"
         r"[A-Za-z0-9_-]{20,}$"
+    ),
+    re.compile(
+        r"^https://whatsapp-mcp\.nesa\.de/wa-dl-[a-z0-9-]{1,64}/"
+        r"[A-Za-z0-9_-]{20,128}$"
+    ),
+    re.compile(
+        r"^https://whatsapp-mcp\.neese\.one/wa-dl-[a-z0-9-]{1,64}/"
+        r"[A-Za-z0-9_-]{20,128}$"
     ),
 )
 
@@ -106,15 +116,17 @@ class FetchedFile:
 
 
 def assert_url_allowed(url: str) -> None:
-    """Wirf, wenn die URL nicht exakt einem der beiden Muster entspricht."""
+    """Wirf, wenn die URL nicht exakt einem der Muster entspricht."""
     if not isinstance(url, str) or not url:
         raise FileIntakeError("url must be a non-empty string.", error_type="url_denied")
     if not any(pattern.fullmatch(url) for pattern in ALLOWED_URL_PATTERNS):
         raise FileIntakeError(
             "This URL is not on the hard-wired download allowlist. Only "
-            "short-lived links from mail-mcp.nesa.de and openarchiver.nesa.de "
-            "can be fetched, and only over HTTPS. The allowlist is code-owned "
-            "and cannot be widened from a tool call.",
+            "short-lived links from mail-mcp.nesa.de, openarchiver.nesa.de "
+            "and create_media_download (WhatsApp MCP) on whatsapp-mcp.nesa.de "
+            "or whatsapp-mcp.neese.one can be fetched, and only over HTTPS. "
+            "The allowlist is code-owned and cannot be widened from a tool "
+            "call.",
             error_type="url_denied",
         )
 

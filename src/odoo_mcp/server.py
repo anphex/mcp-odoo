@@ -6014,11 +6014,13 @@ def create_attachment_download(
 
 @mcp.tool(
     description=(
-        "Fetch a file from a short-lived NESA download link (mail-mcp.nesa.de "
-        "or openarchiver.nesa.de) and attach it to an Odoo record. Use it to "
-        "put a mail attachment onto a partner, a sales order or a task without "
-        "the file ever passing through the conversation. Any other URL is "
-        "refused: the allowlist is code-owned and cannot be widened."
+        "Fetch a file from a short-lived NESA download link (mail-mcp.nesa.de, "
+        "openarchiver.nesa.de, or create_media_download (WhatsApp MCP) on "
+        "whatsapp-mcp.nesa.de / whatsapp-mcp.neese.one) and attach it to an "
+        "Odoo record. Use it to put a mail or WhatsApp attachment onto a "
+        "partner, a sales order or a task without the file ever passing "
+        "through the conversation. Any other URL is refused: the allowlist is "
+        "code-owned and cannot be widened."
     ),
     annotations=SIDE_EFFECT_TOOL,
     structured_output=True,
@@ -6033,7 +6035,8 @@ def create_attachment_from_url(
     """Pull one allowlisted file into Odoo as an ``ir.attachment``.
 
     The download happens in this server process, never in Odoo: the URL comes
-    out of a mail and is therefore attacker-influenced, and Odoo is the process
+    out of a mail, an archive hit or a WhatsApp message and is therefore
+    attacker-influenced, and Odoo is the process
     with the database and the filestore.  HTTPS only, no redirects, 30 s
     timeout, hard 40 MB cap checked against ``Content-Length`` *and* while
     streaming.
