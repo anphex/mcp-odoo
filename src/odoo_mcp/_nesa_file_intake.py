@@ -3,10 +3,11 @@
 Warum der Fetch hier passiert und nicht in Odoo
 -----------------------------------------------
 ``create_attachment_from_url`` bekommt seine URL aus einer Mail, aus einem
-Archiv-Treffer oder aus einer WhatsApp-Nachricht, also aus fremder Hand. Wuerde Odoo sie abrufen, waere der
-ERP-Prozess der SSRF-Proxy: er sitzt im internen Netz, hat die DB-Verbindung
-und den Filestore. Der MCP-Serverprozess ist der richtige Ort — er darf nach
-aussen, kennt aber nur XML-RPC zurueck nach Odoo.
+Archiv-Treffer, aus einer WhatsApp-Nachricht oder vom Nextcloud-MCP, also aus
+fremder Hand. Wuerde Odoo sie abrufen, waere der ERP-Prozess der SSRF-Proxy:
+er sitzt im internen Netz, hat die DB-Verbindung und den Filestore. Der
+MCP-Serverprozess ist der richtige Ort — er darf nach aussen, kennt aber nur
+XML-RPC zurueck nach Odoo.
 
 Warum die Allowlist im Code steht
 ---------------------------------
@@ -48,9 +49,13 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# Genau diese Quellen: Mail-MCP, Open Archiver und die beiden WhatsApp-MCP-Hosts
+# Genau diese Quellen: Mail-MCP, Open Archiver, die beiden WhatsApp-MCP-Hosts
 # (``create_media_download``, Links 60 min gueltig, Dateiname kommt per
-# Content-Disposition). Der Pfad traegt bei allen einen kurzlebigen Token, den
+# Content-Disposition) und der Nextcloud-MCP auf ``cloud-mcp.nesa.de``
+# (``/nc-dl-<instanz>/<token>``, Token ``secrets.token_urlsafe(32)`` = genau
+# 43 Zeichen, 60 min gueltig, Dateiname per ``filename*``). ``cloud.nesa.de``
+# selbst sowie die Upload-Links ``/nc-ul-*`` und der MCP-Pfad ``/mcp-nc-*``
+# bleiben draussen. Der Pfad traegt bei allen einen kurzlebigen Token, den
 # die Gegenseite ausgestellt hat; er wird hier nur weitergereicht, nie geloggt.
 ALLOWED_URL_PATTERNS = (
     re.compile(
@@ -67,6 +72,10 @@ ALLOWED_URL_PATTERNS = (
     re.compile(
         r"^https://whatsapp-mcp\.neese\.one/wa-dl-[a-z0-9-]{1,64}/"
         r"[A-Za-z0-9_-]{20,128}$"
+    ),
+    re.compile(
+        r"^https://cloud-mcp\.nesa\.de/nc-dl-[a-z0-9][a-z0-9-]{0,47}/"
+        r"[A-Za-z0-9_-]{43}$"
     ),
 )
 
@@ -122,9 +131,10 @@ def assert_url_allowed(url: str) -> None:
     if not any(pattern.fullmatch(url) for pattern in ALLOWED_URL_PATTERNS):
         raise FileIntakeError(
             "This URL is not on the hard-wired download allowlist. Only "
-            "short-lived links from mail-mcp.nesa.de, openarchiver.nesa.de "
-            "and create_media_download (WhatsApp MCP) on whatsapp-mcp.nesa.de "
-            "or whatsapp-mcp.neese.one can be fetched, and only over HTTPS. "
+            "short-lived links from mail-mcp.nesa.de, openarchiver.nesa.de, "
+            "create_media_download (WhatsApp MCP) on whatsapp-mcp.nesa.de "
+            "or whatsapp-mcp.neese.one, and Nextcloud MCP download links "
+            "(nc-dl) on cloud-mcp.nesa.de can be fetched, and only over HTTPS. "
             "The allowlist is code-owned and cannot be widened from a tool "
             "call.",
             error_type="url_denied",

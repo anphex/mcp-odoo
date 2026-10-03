@@ -102,6 +102,9 @@ ARCHIVE_URL = (
 WA_TOKEN = "Synthetic_Test-Token_0123456789abcdefghijkl"
 WA_NESA_URL = f"https://whatsapp-mcp.nesa.de/wa-dl-test-konto/{WA_TOKEN}"
 WA_NEESE_URL = f"https://whatsapp-mcp.neese.one/wa-dl-demo/{WA_TOKEN}"
+# Synthetic token in the shape of secrets.token_urlsafe(32): exactly 43 chars.
+NC_TOKEN = "Synthetic-NC_Token_0123456789abcdefghijklmn"
+NC_URL = f"https://cloud-mcp.nesa.de/nc-dl-cneese/{NC_TOKEN}"
 
 
 @pytest.fixture
@@ -117,7 +120,9 @@ def server():
 # ----- allowlist ----------------------------------------------------------
 
 
-@pytest.mark.parametrize("url", [ALLOWED_URL, ARCHIVE_URL, WA_NESA_URL, WA_NEESE_URL])
+@pytest.mark.parametrize(
+    "url", [ALLOWED_URL, ARCHIVE_URL, WA_NESA_URL, WA_NEESE_URL, NC_URL],
+)
 def test_allowlisted_urls_pass(intake, url):
     intake.assert_url_allowed(url)
 
@@ -184,6 +189,131 @@ def test_tool_description_names_the_whatsapp_source(server):
     assert "create_media_download (WhatsApp MCP)" in description
     assert "whatsapp-mcp.nesa.de" in description
     assert "whatsapp-mcp.neese.one" in description
+
+
+def test_nextcloud_instance_and_token_bounds(intake):
+    assert len(NC_TOKEN) == 43
+    for instance in ("cneese", "mcp-test", "mcp-test2", "a", "0", "a" * 48):
+        intake.assert_url_allowed(
+            f"https://cloud-mcp.nesa.de/nc-dl-{instance}/{NC_TOKEN}"
+        )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"http://cloud-mcp.nesa.de/nc-dl-cneese/{NC_TOKEN}",
+        # The Nextcloud host itself is never a download source.
+        f"https://cloud.nesa.de/nc-dl-cneese/{NC_TOKEN}",
+        f"https://cloud.nesa.de/index.php/s/{NC_TOKEN}",
+        f"https://nextcloud-mcp.nesa.de/nc-dl-cneese/{NC_TOKEN}",
+        f"https://cloud-mcp.neese.one/nc-dl-cneese/{NC_TOKEN}",
+        f"https://evil.example/nc-dl-cneese/{NC_TOKEN}",
+        f"https://cloud-mcp.nesa.de.evil.tld/nc-dl-cneese/{NC_TOKEN}",
+        f"https://cloud-mcp.nesa.de:8443/nc-dl-cneese/{NC_TOKEN}",
+        # Upload links and the secret MCP path stay out.
+        f"https://cloud-mcp.nesa.de/nc-ul-cneese/{NC_TOKEN}",
+        f"https://cloud-mcp.nesa.de/mcp-nc-cneese/{NC_TOKEN}",
+        f"https://cloud-mcp.nesa.de/mcp-nc-{NC_TOKEN}",
+        f"https://cloud-mcp.nesa.de/wa-dl-cneese/{NC_TOKEN}",
+        f"https://whatsapp-mcp.nesa.de/nc-dl-cneese/{NC_TOKEN}",
+        # No query, fragment or extra path segment of any kind.
+        f"{NC_URL}?download=1",
+        f"{NC_URL}?",
+        f"{NC_URL}#frag",
+        f"{NC_URL}/",
+        f"{NC_URL}/file.pdf",
+        f"https://cloud-mcp.nesa.de/nc-dl-cneese/sub/{NC_TOKEN}",
+        f"https://cloud-mcp.nesa.de/nc-dl-cneese/../{NC_TOKEN}",
+        f"https://cloud-mcp.nesa.de/nc-dl-cneese/{NC_TOKEN}/../etc",
+        # Token is exactly 43 chars.
+        f"https://cloud-mcp.nesa.de/nc-dl-cneese/{NC_TOKEN[:-1]}",
+        f"https://cloud-mcp.nesa.de/nc-dl-cneese/{NC_TOKEN}A",
+        # Instance id: [a-z0-9][a-z0-9-]{0,47}.
+        f"https://cloud-mcp.nesa.de/nc-dl-/{NC_TOKEN}",
+        f"https://cloud-mcp.nesa.de/nc-dl--cneese/{NC_TOKEN}",
+        f"https://cloud-mcp.nesa.de/nc-dl-{'a' * 49}/{NC_TOKEN}",
+        f"https://cloud-mcp.nesa.de/nc-dl-CNeese/{NC_TOKEN}",
+        f"https://cloud-mcp.nesa.de/nc-dl-c_neese/{NC_TOKEN}",
+        f"https://cloud-mcp.nesa.de/nc-dl-c.neese/{NC_TOKEN}",
+        f"https://cloud-mcp.nesa.de/NC-DL-cneese/{NC_TOKEN}",
+        # Lookalikes and encodings.
+        f"https://user:pw@cloud-mcp.nesa.de/nc-dl-cneese/{NC_TOKEN}",
+        f"https://evil.example\\@cloud-mcp.nesa.de/nc-dl-cneese/{NC_TOKEN}",
+        f"https://CLOUD-MCP.NESA.DE/nc-dl-cneese/{NC_TOKEN}",
+        f"https://cloud-mcp.nesa.de./nc-dl-cneese/{NC_TOKEN}",
+        f"https://cloud-mcp．nesa.de/nc-dl-cneese/{NC_TOKEN}",
+        f"https://cloud-mcp.nеsa.de/nc-dl-cneese/{NC_TOKEN}",
+        f"https://cloud-mcp.nesa.de/nc-dl-cneese/%41{NC_TOKEN[1:]}",
+        f"https://cloud-mcp.nesa.de/nc-dl-cneese/{NC_TOKEN[:-1]}١",
+        f"{NC_URL}\n",
+        f" {NC_URL}",
+    ],
+)
+def test_nextcloud_lookalikes_are_denied(intake, url):
+    with pytest.raises(intake.FileIntakeError) as excinfo:
+        intake.assert_url_allowed(url)
+    assert excinfo.value.error_type == "url_denied"
+
+
+def test_denial_names_the_nextcloud_source(intake):
+    with pytest.raises(intake.FileIntakeError) as excinfo:
+        intake.assert_url_allowed("https://evil.example/x")
+    assert "Nextcloud MCP" in str(excinfo.value)
+    assert "cloud-mcp.nesa.de" in str(excinfo.value)
+
+
+def test_tool_description_names_the_nextcloud_source(server):
+    tools = {tool.name: tool for tool in asyncio.run(server.mcp.list_tools())}
+    description = tools["create_attachment_from_url"].description
+    assert "Nextcloud MCP" in description
+    assert "cloud-mcp.nesa.de" in description
+
+
+def test_nextcloud_utf8_filename_wins_over_the_ascii_fallback(intake, monkeypatch):
+    """Im ASCII-Ersatz fehlen Umlaute und das ß ganz — filename* gewinnt."""
+    monkeypatch.setattr(
+        intake.requests, "get",
+        lambda *a, **kw: _FakeResponse(
+            200,
+            {
+                "Content-Disposition": (
+                    'attachment; filename="Mae_Ubergabe.pdf"; '
+                    "filename*=UTF-8''Ma%C3%9Fe_%C3%9Cbergabe.pdf"
+                ),
+                "Content-Type": "application/pdf",
+                "Content-Length": "9",
+            },
+        ),
+    )
+    fetched = intake.fetch_allowlisted_url(NC_URL)
+    assert fetched.filename == "Maße_Übergabe.pdf"
+    assert fetched.mimetype == "application/pdf"
+
+
+@pytest.mark.parametrize(
+    ("status", "error_type"),
+    [
+        (404, "fetch_failed"),
+        (409, "fetch_failed"),
+        (502, "fetch_failed"),
+        (503, "fetch_failed"),
+        (302, "redirect_refused"),
+    ],
+)
+def test_nextcloud_error_statuses_never_store(
+    server, intake, monkeypatch, status, error_type,
+):
+    monkeypatch.setattr(
+        intake.requests, "get", lambda *a, **kw: _FakeResponse(status),
+    )
+    client = _StoreClient()
+    result = server.create_attachment_from_url(
+        _Ctx(client), NC_URL, "res.partner", 7,
+    )
+    assert result["success"] is False
+    assert result["error_type"] == error_type
+    assert client.calls == []
 
 
 @pytest.mark.parametrize(
