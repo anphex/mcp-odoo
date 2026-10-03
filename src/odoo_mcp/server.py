@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Annotated, Any, AsyncIterator, Callable, Dict, List, Optional, Union
 
 from mcp.server.fastmcp import Context, FastMCP, Image
-from mcp.types import Annotations, ToolAnnotations
+from mcp.types import Annotations, TextContent, ToolAnnotations
 from pydantic import BaseModel, Field
 
 from .agent_tools import (
@@ -339,6 +339,25 @@ def _structured_of(result: Any) -> Any:
     """
     structured = result[1] if isinstance(result, tuple) and len(result) == 2 else result
     if not isinstance(structured, dict):
+        # read_attachment deliberately has no structured output because it
+        # also returns images. FastMCP serializes its status dict into a text
+        # block instead. Read only its explicit envelope, with a bounded
+        # parser; never interpret image bytes or arbitrary document text.
+        blocks = result[0] if isinstance(result, tuple) and len(result) == 2 else result
+        if isinstance(blocks, (list, tuple)):
+            for block in blocks[:4]:
+                if not isinstance(block, TextContent) or len(block.text) > 1024 * 1024:
+                    continue
+                try:
+                    payload = json.loads(block.text)
+                except (ValueError, RecursionError):
+                    continue
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("tool") == "read_attachment"
+                    and isinstance(payload.get("success"), bool)
+                ):
+                    return payload
         return None
     inner = structured.get("result")
     if set(structured) == {"result"} and isinstance(inner, dict):
@@ -5707,6 +5726,34 @@ def _resolve_attachment_id(odoo: OdooClient, model: str, record_id: int) -> int:
     """Map a document-ish record onto its ir.attachment ID."""
     if model == "ir.attachment":
         return record_id
+    cache_key = _fields_cache_key(model)
+    cached_metadata = process_cache_get(cache_key)
+    metadata = cached_metadata
+    if not isinstance(metadata, dict):
+        metadata = odoo.get_model_fields(model)
+    # A real field named "error" has a metadata dict. The client's failure
+    # envelope contains a string instead; never expose that raw cause.
+    metadata_error = metadata.get("error") if isinstance(metadata, dict) else None
+    if not isinstance(metadata, dict) or isinstance(metadata_error, str):
+        if isinstance(metadata_error, str) and any(
+            marker in metadata_error.casefold() for marker in _TRANSPORT_ERROR_MARKERS
+        ):
+            raise ConnectionError("Cannot inspect attachment_id metadata: Odoo transport unavailable.")
+        raise RuntimeError("Cannot inspect attachment_id metadata: Odoo metadata unavailable.")
+    if not isinstance(cached_metadata, dict):
+        process_cache_set(cache_key, metadata)
+    attachment_field = metadata.get("attachment_id")
+    if (
+        not isinstance(attachment_field, dict)
+        or attachment_field.get("type") != "many2one"
+        or attachment_field.get("relation") != "ir.attachment"
+    ):
+        raise ValueError(
+            f"{model} has no visible Many2one attachment_id to ir.attachment. "
+            "For attachment-backed binary fields, find ir.attachment by "
+            "res_model, res_id and res_field (the binary field name), then "
+            "pass its id with model='ir.attachment'."
+        )
     rows = odoo.read_records(model, [record_id], fields=["attachment_id"])
     if not rows:
         raise ValueError(f"{model} {record_id} not found or not visible.")

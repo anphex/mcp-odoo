@@ -83,6 +83,18 @@ _session_bindings: dict[str, Tuple[CredentialIdentity, float]] = {}
 _SERVICE_ACCOUNT_IDENTITY: CredentialIdentity = ("<service-account>", b"")
 
 
+def _log_transport_event(category: str, status: int = 0) -> None:
+    """Log only code-owned categories/statuses, never request or session data."""
+    try:
+        _logger.log(
+            logging.WARNING if status >= 400 else logging.INFO,
+            "[mcp_transport] category=%s status=%d", category, status,
+        )
+    except Exception:
+        # Diagnostics must not change authentication or response delivery.
+        pass
+
+
 def _cache_ttl_seconds() -> int:
     raw = os.environ.get(_CACHE_TTL_ENV, "").strip()
     if not raw:
@@ -349,14 +361,16 @@ class NesaPerUserAuthMiddleware:
             return
 
         if scope.get("path") != self.mcp_path:
-            await self._send_error(send, 404, "Not Found.")
+            await self._send_error(send, 404, "Not Found.", category="route_not_found")
             return
 
         try:
             login, api_key = self._extract_headers(scope)
             session_id = self._extract_single_header(scope, _SESSION_HEADER)
         except ValueError:
-            await self._send_error(send, 400, "Duplicate authentication header.")
+            await self._send_error(
+                send, 400, "Duplicate authentication header.", category="duplicate_header",
+            )
             return
 
         if (login is None) != (api_key is None):
@@ -365,12 +379,14 @@ class NesaPerUserAuthMiddleware:
                 401,
                 "X-Odoo-User and X-Odoo-Api-Key must be supplied together.",
                 authenticate=True,
+                category="incomplete_credentials",
             )
             return
 
         if strict_mode_enabled() and not (login and api_key):
             await self._send_error(
                 send, 401, "Per-user authentication required.", authenticate=True,
+                category="credentials_required",
             )
             return
 
@@ -389,11 +405,13 @@ class NesaPerUserAuthMiddleware:
                 # "reconnect the connector" error on 403).
                 await self._send_error(
                     send, 404, "MCP session not found. Re-initialize to start a new session.",
+                    category="session_not_found",
                 )
                 return
             if binding_state == "mismatch":
                 await self._send_error(
                     send, 403, "MCP session is not bound to these credentials.",
+                    category="session_credentials_mismatch",
                 )
                 return
 
@@ -407,8 +425,12 @@ class NesaPerUserAuthMiddleware:
                 response_session_id = self._single_header_value(
                     message.get("headers", []) or [], _SESSION_HEADER,
                 )
+                if response_status >= 400:
+                    _log_transport_event("http_error", response_status)
                 if response_session_id:
                     self._bind_session(response_session_id, identity)
+                    if not session_id and 200 <= response_status < 300:
+                        _log_transport_event("session_initialized", response_status)
             await send(message)
 
         try:
@@ -422,6 +444,7 @@ class NesaPerUserAuthMiddleware:
             ):
                 with _session_lock:
                     _session_bindings.pop(session_id, None)
+                _log_transport_event("session_deleted", response_status)
 
     @staticmethod
     def _extract_headers(scope: dict) -> Tuple[Optional[str], Optional[str]]:
@@ -498,6 +521,7 @@ class NesaPerUserAuthMiddleware:
                     key=lambda key: _session_bindings[key][1],
                 )
                 _session_bindings.pop(oldest, None)
+                _log_transport_event("session_binding_evicted")
             _session_bindings[session_id] = (
                 identity, now + session_idle_timeout_seconds(),
             )
@@ -505,14 +529,20 @@ class NesaPerUserAuthMiddleware:
     @staticmethod
     def _evict_expired_sessions(now: float) -> None:
         """Remove idle bindings while the caller holds ``_session_lock``."""
+        expired = False
         for stale_id, (_identity, expires_at) in list(_session_bindings.items()):
             if expires_at <= now:
                 _session_bindings.pop(stale_id, None)
+                expired = True
+        if expired:
+            _log_transport_event("session_binding_expired")
 
     @staticmethod
     async def _send_error(
         send: Callable, status: int, body: str, *, authenticate: bool = False,
+        category: str = "http_error",
     ) -> None:
+        _log_transport_event(category, status)
         headers = [(b"content-type", b"text/plain; charset=utf-8")]
         if authenticate:
             headers.append((b"www-authenticate", b'Bearer realm="nesa-mcp"'))
