@@ -1,14 +1,19 @@
 """Regression tests for the MCP usage-audit follow-up fixes (2026-10-05).
 
-1. A write Odoo refuses with a business error releases its approval token.
+1. A write Odoo refuses with a business error releases its approval token,
+   but only when the bridge's commit marker shows nothing was committed.
 2. validate_write reports an already consumed token as a refusal.
 3. Transient wizards can be created through validate_write.
 4. read_records accepts ``ids`` as an alias of ``record_ids``.
 5. A model that is not installed is reported as ``unknown_model``.
+
+Faults use the integer codes of /xmlrpc/2 (odoo/addons/base/controllers/
+rpc.py xmlrpc_handle_exception_int), the endpoint the client talks to.
 """
 
 import asyncio
 import hashlib
+import http.client
 import importlib
 import json
 import xmlrpc.client
@@ -38,13 +43,21 @@ class _Odoo:
     """Odoo double with the bridge's token-store semantics.
 
     ``write_outcomes`` is consumed per business call: an exception instance is
-    raised, anything else is returned.  ``release_supported=False`` imitates a
-    bridge that predates mcp_release_approval.
+    raised, a ``_Committed`` sets the commit marker and then raises its fault,
+    anything else commits and is returned.  ``consume_ids=False`` imitates a
+    bridge before 18.0.1.7.5 (no consume_id, no release);
+    ``release_supported=False`` a release call that fails.
     """
 
-    def __init__(self, write_outcomes=(), release_supported=True, fields=None):
+    def __init__(
+        self, write_outcomes=(), release_supported=True, fields=None,
+        consume_ids=True,
+    ):
         self.write_outcomes = list(write_outcomes)
         self.release_supported = release_supported
+        self.consume_ids = consume_ids
+        self.consume_counter = 0
+        self.write_contexts = []
         self.tokens = {}
         self.calls = []
         self.fields = fields or {
@@ -77,9 +90,25 @@ class _Odoo:
                 "overrides": [],
                 "inverse_fields": [],
             }
+        return self._business(kwargs)
+
+    def execute_method_once(self, model, method, *args, **kwargs):
+        self.calls.append(("once", model, method))
+        return self._business(kwargs)
+
+    def _business(self, kwargs):
+        context = dict(kwargs.get("context") or {})
+        self.write_contexts.append(context)
         outcome = self.write_outcomes.pop(0) if self.write_outcomes else 1
         if isinstance(outcome, BaseException):
             raise outcome
+        # Like the bridge's base hook: the marker commits with the write.
+        consume_id = context.get("nesa_mcp_approval_consume_id")
+        for record in self.tokens.values():
+            if consume_id and record.get("consume_id") == consume_id:
+                record["executed"] = True
+        if isinstance(outcome, _Committed):
+            raise outcome.fault
         return outcome
 
     def _token(self, method, args):
@@ -111,21 +140,33 @@ class _Odoo:
             if record["hash"] != expected_hash:
                 return {"success": False, "error": "approval payload does not match"}
             record["consumed"] = True
-            return {"success": True, "payload": record["payload"]}
+            reply = {"success": True, "payload": record["payload"]}
+            if self.consume_ids:
+                self.consume_counter += 1
+                record["consume_id"] = f"{self.consume_counter:032x}"
+                reply["consume_id"] = record["consume_id"]
+            return reply
         if method == "mcp_revoke_approval":
             return {"success": True, "revoked": True}
         if method == "mcp_release_approval":
             if not self.release_supported:
-                raise xmlrpc.client.Fault(
-                    "'nesa.mcp.approval.token' object has no attribute "
-                    "'mcp_release_approval'",
-                    "Traceback (most recent call last): ...",
-                )
-            token, expected_hash = args
+                raise xmlrpc.client.Fault(1, "Traceback (most recent call last): ...")
+            token, expected_hash, consume_id = args
             record = self.tokens.get(token)
-            if not record or record["hash"] != expected_hash or not record["consumed"]:
+            if (
+                not record or record["hash"] != expected_hash
+                or not record["consumed"]
+                or record.get("consume_id") != consume_id
+            ):
                 return {"success": False, "error": "not releasable"}
+            if record.get("executed"):
+                return {
+                    "success": False,
+                    "error": "approved write was committed",
+                    "write_committed": True,
+                }
             record["consumed"] = False
+            record["consume_id"] = None
             return {"success": True, "released": True}
         raise AssertionError(f"unexpected token-store method {method!r}")
 
@@ -136,8 +177,19 @@ def server(monkeypatch):
     return importlib.import_module("odoo_mcp.server")
 
 
+class _Committed:
+    """Write outcome: the transaction commits, then Odoo answers with a fault.
+
+    Covers a post-commit callback raising UserError and a transport replay
+    whose second attempt fails after the first one committed.
+    """
+
+    def __init__(self, fault):
+        self.fault = fault
+
+
 def _user_error(text="Der Datensatz ist gesperrt."):
-    return xmlrpc.client.Fault(f"warning -- UserError\n\n{text}", "")
+    return xmlrpc.client.Fault(2, text)
 
 
 def _approve(server, ctx, **kwargs):
@@ -171,6 +223,7 @@ def test_business_error_releases_token_and_same_approval_runs_after_fix(server):
     assert refused["approval_released"] is True
     assert "nothing was written" in refused["remedy"]
     assert "gesperrt" in refused["error"]
+    assert "consume_id" not in json.dumps(refused)
 
     retried = server.execute_approved_write(ctx, approval, confirm=True)
     assert retried["success"] is True
@@ -180,29 +233,69 @@ def test_business_error_releases_token_and_same_approval_runs_after_fix(server):
     assert third["reason_code"] == "token_already_consumed"
 
 
-@pytest.mark.parametrize("fault_code", [
-    "warning -- AccessError\n\nKein Zugriff",
-    "warning -- MissingError\n\nDatensatz fehlt",
-    "warning -- Warning\n\nWeiterleitung",
-    "AccessDenied",
+def test_approved_write_carries_consume_id_and_skips_transport_replay(server):
+    odoo = _Odoo(write_outcomes=[True])
+    ctx = _Ctx(odoo)
+    approval = _approve(server, ctx, context={
+        "lang": "de_DE", "nesa_mcp_approval_consume_id": "forged",
+    })
+
+    assert server.execute_approved_write(ctx, approval, confirm=True)["success"]
+    assert ("once", "res.partner", "write") in odoo.calls
+    assert ("res.partner", "write") not in odoo.calls
+    context = odoo.write_contexts[-1]
+    assert context["lang"] == "de_DE"
+    assert context["nesa_mcp_approval_consume_id"] == f"{1:032x}"
+
+
+@pytest.mark.parametrize("fault", [
+    xmlrpc.client.Fault(2, "Validierungsfehler"),
+    xmlrpc.client.Fault(3, "Access Denied"),
+    xmlrpc.client.Fault(4, "Kein Zugriff"),
 ])
-def test_every_pre_commit_fault_releases(server, fault_code):
-    odoo = _Odoo(write_outcomes=[xmlrpc.client.Fault(fault_code, "")])
+def test_every_business_fault_code_releases(server, fault):
+    odoo = _Odoo(write_outcomes=[fault])
     ctx = _Ctx(odoo)
     result = server.execute_approved_write(ctx, _approve(server, ctx), confirm=True)
     assert result["approval_released"] is True
+    assert result["write_executed"] is False
     assert len(_release_calls(odoo)) == 1
+
+
+@pytest.mark.parametrize("fault", [
+    _user_error("Postcommit-Callback warf UserError"),
+    xmlrpc.client.Fault(
+        2,
+        "The operation cannot be completed: duplicate key value violates "
+        "unique constraint (second attempt after a lost answer)",
+    ),
+])
+def test_business_fault_after_commit_keeps_token_consumed(server, fault):
+    odoo = _Odoo(write_outcomes=[_Committed(fault)])
+    ctx = _Ctx(odoo)
+    approval = _approve(server, ctx)
+
+    result = server.execute_approved_write(ctx, approval, confirm=True)
+    assert result["success"] is False
+    assert result["reason_code"] == "odoo_error_after_commit"
+    assert result["write_executed"] is True
+    assert result["approval_released"] is False
+    assert "do not repeat" in result["remedy"]
+    assert len(_release_calls(odoo)) == 1
+
+    again = server.execute_approved_write(ctx, approval, confirm=True)
+    assert again["reason_code"] == "token_already_consumed"
 
 
 @pytest.mark.parametrize("exc", [
     xmlrpc.client.Fault(
-        "KeyError: 'x'",
-        "Traceback (most recent call last):\n  ...\nKeyError: 'x'",
+        1, "Traceback (most recent call last):\n  ...\nKeyError: 'x'",
     ),
-    xmlrpc.client.Fault(1, "int fault code from /xmlrpc/ v1"),
-    ConnectionError("connection reset by peer"),
+    xmlrpc.client.Fault("warning -- UserError\n\nlegacy /xmlrpc/ string code", ""),
+    http.client.RemoteDisconnected("Remote end closed connection without response"),
+    ConnectionResetError(104, "Connection reset by peer"),
     TimeoutError("timed out"),
-    RuntimeError("warning -- UserError looks alike but is no Fault"),
+    RuntimeError("Fault 2 looks alike but is no Fault"),
 ])
 def test_unproven_failures_keep_the_token_consumed(server, exc):
     odoo = _Odoo(write_outcomes=[exc])
@@ -218,27 +311,98 @@ def test_unproven_failures_keep_the_token_consumed(server, exc):
     assert again["reason_code"] == "token_already_consumed"
 
 
-def test_bridge_without_release_method_keeps_old_behaviour(server):
+def test_failed_release_reports_unknown_outcome(server):
     odoo = _Odoo(write_outcomes=[_user_error()], release_supported=False)
     ctx = _Ctx(odoo)
     approval = _approve(server, ctx)
 
     result = server.execute_approved_write(ctx, approval, confirm=True)
+    assert result["reason_code"] == "odoo_write_outcome_unknown"
     assert result["approval_released"] is False
-    assert result["write_executed"] is False
+    assert "write_executed" not in result
     assert "stays consumed" in result["remedy"]
 
     again = server.execute_approved_write(ctx, approval, confirm=True)
     assert again["reason_code"] == "token_already_consumed"
 
 
-def test_odoo_rejected_before_commit_only_accepts_string_fault_codes(server):
-    check = server.odoo_rejected_before_commit
-    assert check(_user_error()) is True
-    assert check(xmlrpc.client.Fault("AccessDenied", "")) is True
-    assert check(xmlrpc.client.Fault("ValueError: x", "Traceback ...")) is False
-    assert check(xmlrpc.client.Fault(2, "warning -- UserError")) is False
-    assert check(ValueError("warning -- UserError")) is False
+def test_bridge_without_consume_id_keeps_old_behaviour(server):
+    odoo = _Odoo(write_outcomes=[_user_error()], consume_ids=False)
+    ctx = _Ctx(odoo)
+    approval = _approve(server, ctx)
+
+    result = server.execute_approved_write(ctx, approval, confirm=True)
+    assert result["success"] is False
+    assert "approval_released" not in result
+    assert _release_calls(odoo) == []
+    assert ("res.partner", "write") in odoo.calls
+    assert "nesa_mcp_approval_consume_id" not in odoo.write_contexts[-1]
+
+    again = server.execute_approved_write(ctx, approval, confirm=True)
+    assert again["reason_code"] == "token_already_consumed"
+
+
+def test_odoo_business_fault_matches_xmlrpc2_codes_only(server):
+    check = server.odoo_business_fault
+    assert check(xmlrpc.client.Fault(2, "UserError")) is True
+    assert check(xmlrpc.client.Fault(3, "AccessDenied")) is True
+    assert check(xmlrpc.client.Fault(4, "AccessError")) is True
+    assert check(xmlrpc.client.Fault(1, "Traceback ...")) is False
+    assert check(xmlrpc.client.Fault("warning -- UserError\n\nx", "")) is False
+    assert check(ValueError("Fault 2")) is False
+
+
+# ----- 1b. no transport replay for the approved write -----------------------
+
+
+def _bare_client(odoo_client_module):
+    client = odoo_client_module.OdooClient.__new__(odoo_client_module.OdooClient)
+    client.transport = "xmlrpc"
+    client.url = "http://odoo.invalid"
+    client.db = "db"
+    client.uid = 2
+    client.password = "secret"
+    client.timeout = 5
+    client.verify_ssl = True
+    client.lang = None
+    return client
+
+
+def _count_single_requests(monkeypatch, odoo_client_module):
+    sent = []
+
+    def lost_answer(self, host, handler, request_body, verbose=False):
+        sent.append(handler)
+        raise http.client.RemoteDisconnected(
+            "Remote end closed connection without response",
+        )
+
+    monkeypatch.setattr(
+        odoo_client_module.RedirectTransport, "single_request", lost_answer,
+    )
+    return sent
+
+
+def test_execute_method_once_does_not_resend_after_lost_answer(monkeypatch):
+    odoo_client = importlib.import_module("odoo_mcp.odoo_client")
+    sent = _count_single_requests(monkeypatch, odoo_client)
+
+    with pytest.raises(http.client.RemoteDisconnected):
+        _bare_client(odoo_client).execute_method_once(
+            "res.partner", "create", {"name": "Ada"},
+        )
+    assert sent == ["/xmlrpc/2/object"]
+
+
+def test_default_transport_still_resends_once(monkeypatch):
+    # Documents the stdlib behaviour execute_method_once switches off.
+    odoo_client = importlib.import_module("odoo_mcp.odoo_client")
+    sent = _count_single_requests(monkeypatch, odoo_client)
+    transport = odoo_client.RedirectTransport(timeout=5, use_https=False)
+
+    with pytest.raises(http.client.RemoteDisconnected):
+        transport.request("odoo.invalid", "/xmlrpc/2/object", b"<x/>")
+    assert len(sent) == 2
 
 
 # ----- 2. validate_write and a consumed token -------------------------------
@@ -408,9 +572,7 @@ def test_read_records_schema_lists_alias(server):
 
 
 def test_unknown_model_fault_is_a_request_error(server):
-    fault = xmlrpc.client.Fault(
-        "warning -- UserError\n\nObject fleet.vehicle doesn't exist", "",
-    )
+    fault = xmlrpc.client.Fault(2, "Object fleet.vehicle doesn't exist")
     response = server.error_response("read_record", fault)
     assert response["error_type"] == "request"
     assert response["reason_code"] == "unknown_model"

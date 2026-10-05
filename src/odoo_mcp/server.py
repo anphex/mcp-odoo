@@ -237,10 +237,10 @@ SERVER_INSTRUCTIONS = (
     "optional dry run). execute_method runs business methods "
     "(action_confirm, action_done, ...); CRUD on persistent models is "
     "refused there. list_allowed_methods explains the policy instead of "
-    "probing. If Odoo refuses an approved write with a business error, "
-    "nothing was written and the answer says whether the approval is "
-    "reusable. 'already consumed' means the write ran or its outcome was "
-    "lost: read the record back, do not repeat blindly.\n"
+    "probing. If Odoo answers an approved write with a business error, "
+    "write_executed says whether anything was written and approval_released "
+    "whether the approval is reusable. 'already consumed' means the write ran "
+    "or its outcome was lost: read the record back, do not repeat blindly.\n"
     "FORMATS: domain = JSON list of [field, operator, value] triples, e.g. "
     "[[\"partner_id\", \"=\", 42], [\"state\", \"in\", [\"sale\", \"done\"]]]; "
     "prefix operators \"&\"/\"|\"/\"!\" are allowed. Dates are "
@@ -2077,12 +2077,16 @@ def require_validated_write_approval(
         }
 
     payload = result.get("payload") or {}
+    consume_id = result.get("consume_id")
     return {
         "ok": True,
         "approval": dict(approval),
         "payload": payload,
         "validated_at_iso": result.get("validated_at_iso"),
         "expires_at_iso": result.get("expires_at_iso"),
+        # Bridge >= 18.0.1.7.5: identifies this consumption for the
+        # commit marker and mcp_release_approval.  Never shown to the agent.
+        "consume_id": consume_id if isinstance(consume_id, str) else None,
     }
 
 
@@ -2133,40 +2137,49 @@ def revoke_write_approval(app_context: AppContext, token: str) -> None:
         )
 
 
-# Odoo answers these exceptions on /xmlrpc/2 with a fixed fault code
-# (odoo/addons/base/controllers/rpc.py xmlrpc_handle_exception_string):
-# UserError and its subclasses (ValidationError, also IntegrityError converted
-# by retrying), AccessError, MissingError, RedirectWarning and AccessDenied.
-# They are raised before odoo.service.model.retrying reaches cr.commit(), so
-# the transaction was rolled back.  Any other fault carries a traceback and
-# may stem from a post-commit hook, so it proves nothing.
-_PRE_COMMIT_FAULT_PREFIX = "warning -- "
-_PRE_COMMIT_FAULT_CODES = frozenset({"AccessDenied"})
+# Context key of the approved write.  The bridge's base hook marks the
+# consumed token inside the write transaction, so the marker exists exactly
+# when the write committed.  Sync with nesa_mcp_bridge
+# models/_approval_token_utils.py:APPROVAL_CONSUME_CONTEXT_KEY.
+APPROVAL_CONSUME_CONTEXT_KEY = "nesa_mcp_approval_consume_id"
+
+# /xmlrpc/2 answers business errors with integer fault codes
+# (odoo/addons/base/controllers/rpc.py xmlrpc_handle_exception_int):
+# 2 = UserError and subclasses (ValidationError, MissingError,
+# RedirectWarning, IntegrityError converted by retrying), 3 = AccessDenied,
+# 4 = AccessError.  Code 1 is any other server error.  The fault code alone
+# proves nothing about a rollback: the bridge's commit marker decides.
+_ODOO_BUSINESS_FAULT_CODES = frozenset({2, 3, 4})
+
+RELEASED = "released"
+WRITE_COMMITTED = "write_committed"
+RELEASE_FAILED = "failed"
 
 
-def odoo_rejected_before_commit(exc: BaseException) -> bool:
-    """True when Odoo refused the call with a business error before commit."""
+def odoo_business_fault(exc: BaseException) -> bool:
+    """True when Odoo answered the call with a business-error fault."""
     import xmlrpc.client
 
-    if not isinstance(exc, xmlrpc.client.Fault):
-        return False
-    code = exc.faultCode
-    return isinstance(code, str) and (
-        code.startswith(_PRE_COMMIT_FAULT_PREFIX) or code in _PRE_COMMIT_FAULT_CODES
+    return (
+        isinstance(exc, xmlrpc.client.Fault)
+        and isinstance(exc.faultCode, int)
+        and exc.faultCode in _ODOO_BUSINESS_FAULT_CODES
     )
 
 
-def release_write_approval(app_context: AppContext, approval: Dict[str, Any]) -> bool:
-    """Undo the token consumption after Odoo rejected the write before commit.
+def release_write_approval(
+    app_context: AppContext, approval: Dict[str, Any], consume_id: str,
+) -> str:
+    """Undo the token consumption after Odoo answered with a business error.
 
-    Only for odoo_rejected_before_commit() failures.  The bridge checks user,
-    payload hash and that the consumption is recent.  A bridge without
-    mcp_release_approval answers with a fault, which keeps the old behaviour:
-    the token stays consumed until cleanup.
+    The bridge releases only this consumption (consume_id) and only when its
+    commit marker is absent, i.e. the write transaction did not commit.
+    Returns RELEASED, WRITE_COMMITTED (the write ran despite the error) or
+    RELEASE_FAILED (outcome unknown, token stays consumed).
     """
     token = str(approval.get("token", ""))
-    if not token:
-        return False
+    if not token or not consume_id:
+        return RELEASE_FAILED
     expected_hash = _canonical_payload_hash(write_approval_payload(approval))
     try:
         result = app_context.odoo.execute_method(
@@ -2174,21 +2187,29 @@ def release_write_approval(app_context: AppContext, approval: Dict[str, Any]) ->
             "mcp_release_approval",
             token,
             expected_hash,
+            consume_id,
         )
     except Exception:  # noqa: BLE001 — release is best effort
         logger.warning(
             "[approval-token] release failed for token=%s — token stays consumed",
             token,
         )
-        return False
-    if not isinstance(result, dict) or not result.get("success"):
-        logger.info(
-            "[approval-token] release rejected token=%s reason=%s",
+        return RELEASE_FAILED
+    if isinstance(result, dict) and result.get("success"):
+        return RELEASED
+    if isinstance(result, dict) and result.get("write_committed") is True:
+        logger.warning(
+            "[approval-token] write committed although Odoo answered with an "
+            "error, token=%s stays consumed",
             token,
-            result.get("error") if isinstance(result, dict) else "non-dict reply",
         )
-        return False
-    return True
+        return WRITE_COMMITTED
+    logger.info(
+        "[approval-token] release rejected token=%s reason=%s",
+        token,
+        result.get("error") if isinstance(result, dict) else "non-dict reply",
+    )
+    return RELEASE_FAILED
 
 
 def write_approval_payload(approval: Dict[str, Any]) -> Dict[str, Any]:
@@ -3461,6 +3482,14 @@ def execute_approved_write(
             {"context": context} if context else {}
         )
         kwargs = sanitized_kwargs
+        consume_id = validation_record.get("consume_id")
+        if consume_id:
+            # Set last so a caller-supplied value can never replace it.
+            kwargs = dict(kwargs)
+            kwargs["context"] = {
+                **(kwargs.get("context") or {}),
+                APPROVAL_CONSUME_CONTEXT_KEY: consume_id,
+            }
         if operation == "create":
             args: List[Any] = [values]
         elif operation == "write":
@@ -3470,30 +3499,48 @@ def execute_approved_write(
 
         audit_odoo_execution("execute_approved_write", model, operation)
         try:
-            result = app_context.odoo.execute_method(model, operation, *args, **kwargs)
+            if consume_id:
+                # No silent transport resend: a lost answer must stay unknown.
+                result = app_context.odoo.execute_method_once(
+                    model, operation, *args, **kwargs
+                )
+            else:
+                result = app_context.odoo.execute_method(
+                    model, operation, *args, **kwargs
+                )
         except Exception as write_exc:
-            if not odoo_rejected_before_commit(write_exc):
+            if not consume_id or not odoo_business_fault(write_exc):
                 raise
             # Audit 2026-10-05: a business-rule refusal used to leave the
             # deterministic token consumed, so the same corrected attempt was
-            # blocked for about 70 minutes.
-            released = release_write_approval(app_context, approval)
+            # blocked for about 70 minutes.  The bridge releases it only when
+            # its commit marker shows the write transaction did not commit.
+            release = release_write_approval(app_context, approval, consume_id)
             response = error_response("execute_approved_write", write_exc)
-            response["reason_code"] = "odoo_rejected_write"
-            response["write_executed"] = False
-            response["approval_released"] = released
-            response["remedy"] = (
-                "Odoo refused the write with a business error and rolled it "
-                "back; nothing was written. "
-                + (
-                    "The approval is reusable until it expires: fix the cause "
-                    "and repeat execute_approved_write with the same approval, "
-                    "or run validate_write again if the values change."
-                    if released
-                    else "The approval stays consumed: run validate_write "
-                    "again with changed values."
+            response["approval_released"] = release == RELEASED
+            if release == RELEASED:
+                response["reason_code"] = "odoo_rejected_write"
+                response["write_executed"] = False
+                response["remedy"] = (
+                    "Odoo refused the write and rolled it back; nothing was "
+                    "written. The approval is reusable until it expires: fix "
+                    "the cause and repeat execute_approved_write with the same "
+                    "approval, or run validate_write again if the values change."
                 )
-            )
+            elif release == WRITE_COMMITTED:
+                response["reason_code"] = "odoo_error_after_commit"
+                response["write_executed"] = True
+                response["remedy"] = (
+                    "Odoo reported an error, but the write was committed. Read "
+                    "the record back; do not repeat the write."
+                )
+            else:
+                response["reason_code"] = "odoo_write_outcome_unknown"
+                response["remedy"] = (
+                    "Odoo reported an error; whether the write was committed "
+                    "could not be confirmed. The approval stays consumed. Read "
+                    "the record back before running validate_write again."
+                )
             return response
         # NESA Patch 3 — DB-backed token revocation (replaces in-memory pop).
         revoke_write_approval(app_context, str(approval.get("token", "")))

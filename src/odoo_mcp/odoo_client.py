@@ -326,6 +326,34 @@ class OdooClient:
         """
         return self._execute(model, method, *args, **kwargs)
 
+    def execute_method_once(self, model: str, method: str, *args: Any, **kwargs: Any) -> Any:
+        """Execute a method without the automatic XML-RPC replay.
+
+        ``xmlrpc.client.Transport.request`` sends a request a second time when
+        the connection drops (RemoteDisconnected, ECONNRESET, EPIPE).  For a
+        mutation whose answer was lost that replays a committed write.  This
+        call uses its own fresh connection and raises instead, so the caller
+        treats the outcome as unknown.  JSON-2 (urllib) never replays.
+        """
+        if self.transport == "json2":
+            return self._execute(model, method, *args, **kwargs)
+        kwargs = self._apply_lang_context(kwargs)
+        transport = RedirectTransport(
+            timeout=self.timeout,
+            use_https=self.url.startswith("https://"),
+            verify_ssl=self.verify_ssl,
+            single_attempt=True,
+        )
+        proxy = xmlrpc.client.ServerProxy(
+            f"{self.url}/xmlrpc/2/object", transport=transport
+        )
+        try:
+            return proxy.execute_kw(
+                self.db, self.uid, self.password, model, method, list(args), kwargs
+            )
+        finally:
+            transport.close()
+
     def get_server_version(self) -> dict[str, Any]:
         """Return Odoo server version metadata using the safest available route."""
         try:
@@ -611,6 +639,7 @@ class RedirectTransport(xmlrpc.client.Transport):
         verify_ssl: bool = True,
         max_redirects: int = 5,
         proxy: str | None = None,
+        single_attempt: bool = False,
     ) -> None:
         super().__init__()
         self.timeout = timeout
@@ -618,6 +647,8 @@ class RedirectTransport(xmlrpc.client.Transport):
         self.verify_ssl = verify_ssl
         self.max_redirects = max_redirects
         self.proxy = proxy or os.environ.get("HTTP_PROXY")
+        # True: skip the stdlib's silent resend after a dropped connection.
+        self.single_attempt = single_attempt
         self.context: Any = None
 
         if use_https and not verify_ssl:
@@ -657,10 +688,11 @@ class RedirectTransport(xmlrpc.client.Transport):
     ) -> Any:
         """Send HTTP request with retry for redirects"""
         redirects = 0
+        send = self.single_request if self.single_attempt else super().request
         while redirects < self.max_redirects:
             try:
                 _logger.debug("XML-RPC request to %s%s", host, handler)
-                return super().request(host, handler, request_body, verbose)
+                return send(host, handler, request_body, verbose)
             except xmlrpc.client.ProtocolError as err:
                 if err.errcode in (301, 302, 303, 307, 308) and err.headers.get(
                     "location"
