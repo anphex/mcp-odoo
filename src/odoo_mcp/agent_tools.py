@@ -274,6 +274,42 @@ def write_rejection_details(error_issues: list[dict[str, str]]) -> dict[str, Any
     return details
 
 
+def _context_default_fields(
+    context: dict[str, Any] | None, fields_metadata: dict[str, Any]
+) -> list[str]:
+    """Fields that a ``default_<field>`` context key fills on create."""
+    prefix = "default_"
+    return sorted(
+        key[len(prefix):]
+        for key in (context or {})
+        if isinstance(key, str)
+        and key.startswith(prefix)
+        and isinstance(fields_metadata.get(key[len(prefix):]), dict)
+    )
+
+
+def create_needs_transient_check(
+    values: dict[str, Any] | None,
+    context: dict[str, Any] | None,
+    fields_metadata: dict[str, Any] | None,
+) -> bool:
+    """True when only the transient-wizard rules could approve this create.
+
+    Saves the transient-profile lookup for the ordinary create that passes
+    without them.
+    """
+    if not isinstance(fields_metadata, dict):
+        return False
+    normalized_values = dict(values or {})
+    if not normalized_values:
+        return bool(_context_default_fields(context, fields_metadata))
+    return any(
+        isinstance(fields_metadata.get(name), dict)
+        and fields_metadata[name].get("readonly")
+        for name in normalized_values
+    )
+
+
 def validate_write_report(
     *,
     model: str,
@@ -283,8 +319,15 @@ def validate_write_report(
     context: dict[str, Any] | None = None,
     fields_metadata: dict[str, Any] | None = None,
     metadata_source: str = "none",
+    transient_create: bool = False,
 ) -> dict[str, Any]:
-    """Validate write payload shape against optional fields_get metadata."""
+    """Validate write payload shape against optional fields_get metadata.
+
+    ``transient_create`` must only be set after Odoo confirmed the model is
+    transient.  A wizard create then accepts readonly fields (the target the
+    calling action would set) and empty values filled by ``default_*``
+    context keys.  Persistent models keep both refusals.
+    """
     preview = build_write_preview_report(
         model=model,
         operation=operation,
@@ -295,6 +338,21 @@ def validate_write_report(
     issues: list[dict[str, str]] = list(preview["issues"])
     field_hints: list[dict[str, str]] = []
     normalized_values = dict(values or {})
+    transient_create = transient_create and preview["operation"] == "create"
+    if transient_create and not normalized_values and fields_metadata:
+        defaulted = _context_default_fields(context, fields_metadata)
+        if defaulted:
+            issues = [
+                issue for issue in issues
+                if issue.get("code") != "missing_create_values"
+            ]
+            field_hints.extend(
+                {
+                    "field": field_name,
+                    "hint": "filled from context default_ key on wizard create.",
+                }
+                for field_name in defaulted
+            )
     if fields_metadata is not None:
         for field_name in sorted(normalized_values):
             meta = fields_metadata.get(field_name)
@@ -309,7 +367,17 @@ def validate_write_report(
                 )
                 continue
             field_type = str(meta.get("type", ""))
-            if meta.get("readonly"):
+            if meta.get("readonly") and transient_create:
+                field_hints.append(
+                    {
+                        "field": field_name,
+                        "hint": (
+                            "readonly in the wizard form; accepted on create "
+                            "of a transient wizard."
+                        ),
+                    }
+                )
+            elif meta.get("readonly"):
                 issues.append(
                     {
                         "code": "readonly_field",

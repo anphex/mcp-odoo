@@ -30,6 +30,7 @@ from .agent_tools import (
     build_domain_report,
     build_write_preview_report,
     business_pack_report as build_business_pack_report,
+    create_needs_transient_check as _create_needs_transient_check,
     scan_addons_source_report,
     select_smart_fields,
     validate_write_report,
@@ -236,8 +237,10 @@ SERVER_INSTRUCTIONS = (
     "optional dry run). execute_method runs business methods "
     "(action_confirm, action_done, ...); CRUD on persistent models is "
     "refused there. list_allowed_methods explains the policy instead of "
-    "probing. A rejected approval token that was 'already consumed' means "
-    "the write DID run: read the record back, do not repeat.\n"
+    "probing. If Odoo refuses an approved write with a business error, "
+    "nothing was written and the answer says whether the approval is "
+    "reusable. 'already consumed' means the write ran or its outcome was "
+    "lost: read the record back, do not repeat blindly.\n"
     "FORMATS: domain = JSON list of [field, operator, value] triples, e.g. "
     "[[\"partner_id\", \"=\", 42], [\"state\", \"in\", [\"sale\", \"done\"]]]; "
     "prefix operators \"&\"/\"|\"/\"!\" are allowed. Dates are "
@@ -1017,6 +1020,12 @@ _TRANSPORT_ERROR_MARKERS = (
 )
 
 
+# odoo/service/model.py execute_cr: env context is empty there, so the message
+# is never translated.  Some tools re-wrap the fault text in another exception,
+# hence a text match instead of an isinstance check on Fault.
+_UNKNOWN_MODEL_RE = re.compile(r"Object [\w.]+ doesn't exist")
+
+
 def classify_call_error(exc: BaseException) -> Dict[str, Any]:
     """Classify why an Odoo call failed, and whether a retry can help.
 
@@ -1033,6 +1042,15 @@ def classify_call_error(exc: BaseException) -> Dict[str, Any]:
         # Input values may themselves contain words such as "timeout".
         # A diagnosed schema error is never a transient transport failure.
         return {"error_type": "request", "retryable": False, "detail": {"message": text}}
+    if _UNKNOWN_MODEL_RE.search(text):
+        # A model that is not installed is a wrong request, not an Odoo
+        # malfunction (audit 2026-10-05: fleet.vehicle, planning.slot, ...).
+        return {
+            "error_type": "request",
+            "retryable": False,
+            "detail": sanitize_odoo_error(text),
+            "reason_code": "unknown_model",
+        }
     if isinstance(exc, xmlrpc.client.Fault):
         return {
             "error_type": "odoo_error",
@@ -1209,6 +1227,12 @@ def error_response(tool: str, exc: BaseException, **extra: Any) -> Dict[str, Any
         response["remedy"] = (
             "Read the affected record back before repeating this call."
         )
+    if classification.get("reason_code") == "unknown_model":
+        response["reason_code"] = "unknown_model"
+        response["remedy"] = (
+            "This model is not installed in this Odoo database. Call "
+            "list_models to find the technical name of an installed model."
+        )
     if full_traceback:
         error_ref = uuid.uuid4().hex[:12]
         response["error_ref"] = error_ref
@@ -1218,7 +1242,7 @@ def error_response(tool: str, exc: BaseException, **extra: Any) -> Dict[str, Any
         )
     if tool == "search_records":
         response["error_details"] = {
-            "reason_code": response["error_type"],
+            "reason_code": response.get("reason_code", response["error_type"]),
             "message": message,
             "invalid_parameter": None,
             "retryable": response["retryable"],
@@ -1938,15 +1962,27 @@ def register_write_approval(app_context: AppContext, report: Dict[str, Any]) -> 
     Begrundung siehe AppContext-Docstring + Modul-Datei
     nesa_mcp_approval_token.py.
 
-    Aufrufer behaelt boolean-API. Erfolgs/Fehler-Branch identisch zum
-    Vorgaenger — Caller (validate_write) annotiert ``approval_status.stored``.
+    Aufrufer behaelt boolean-API; den Ablehnungsgrund liefert
+    ``register_write_approval_status``.
+    """
+    return register_write_approval_status(app_context, report)["stored"]
+
+
+def register_write_approval_status(
+    app_context: AppContext, report: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Register the approval token and return ``{"stored": bool, "error": str|None}``.
+
+    The store's refusal text matters to validate_write: a token that is
+    already consumed must not be presented as a successful validation
+    (audit 2026-10-05).
     """
     approval = report.get("approval")
     if not report.get("success") or not isinstance(approval, dict):
-        return False
+        return {"stored": False, "error": None}
     token = str(approval.get("token", ""))
     if not token:
-        return False
+        return {"stored": False, "error": None}
 
     payload = write_approval_payload(approval)
     now = time.time()
@@ -1964,20 +2000,24 @@ def register_write_approval(app_context: AppContext, report: Dict[str, Any]) -> 
         )
     except Exception:  # noqa: BLE001 — odoo_client wraps multiple xmlrpc/json2 errors
         logger.exception("[approval-token] DB register failed for token=%s", token)
-        return False
+        return {"stored": False, "error": "the approval-token store could not be reached"}
 
     if not isinstance(result, dict) or not result.get("success"):
-        logger.warning(
-            "[approval-token] DB register rejected token=%s reason=%s",
-            token, (result or {}).get("error") if isinstance(result, dict) else "non-dict reply",
+        error = (
+            str(result.get("error"))
+            if isinstance(result, dict) and result.get("error")
+            else "the approval-token store returned an unexpected reply"
         )
-        return False
+        logger.warning(
+            "[approval-token] DB register rejected token=%s reason=%s", token, error,
+        )
+        return {"stored": False, "error": error}
 
     # Surface validated_at + expires_at back to the LLM via the report —
     # downstream prompt-engineering refers to expires_at_iso for retry windows.
     approval["validated_at"] = now
     approval["expires_at"] = now + WRITE_APPROVAL_TTL_SECONDS
-    return True
+    return {"stored": True, "error": None}
 
 
 def require_validated_write_approval(
@@ -2091,6 +2131,64 @@ def revoke_write_approval(app_context: AppContext, token: str) -> None:
             "[approval-token] revoke failed for token=%s — cleanup-cron will sweep",
             token,
         )
+
+
+# Odoo answers these exceptions on /xmlrpc/2 with a fixed fault code
+# (odoo/addons/base/controllers/rpc.py xmlrpc_handle_exception_string):
+# UserError and its subclasses (ValidationError, also IntegrityError converted
+# by retrying), AccessError, MissingError, RedirectWarning and AccessDenied.
+# They are raised before odoo.service.model.retrying reaches cr.commit(), so
+# the transaction was rolled back.  Any other fault carries a traceback and
+# may stem from a post-commit hook, so it proves nothing.
+_PRE_COMMIT_FAULT_PREFIX = "warning -- "
+_PRE_COMMIT_FAULT_CODES = frozenset({"AccessDenied"})
+
+
+def odoo_rejected_before_commit(exc: BaseException) -> bool:
+    """True when Odoo refused the call with a business error before commit."""
+    import xmlrpc.client
+
+    if not isinstance(exc, xmlrpc.client.Fault):
+        return False
+    code = exc.faultCode
+    return isinstance(code, str) and (
+        code.startswith(_PRE_COMMIT_FAULT_PREFIX) or code in _PRE_COMMIT_FAULT_CODES
+    )
+
+
+def release_write_approval(app_context: AppContext, approval: Dict[str, Any]) -> bool:
+    """Undo the token consumption after Odoo rejected the write before commit.
+
+    Only for odoo_rejected_before_commit() failures.  The bridge checks user,
+    payload hash and that the consumption is recent.  A bridge without
+    mcp_release_approval answers with a fault, which keeps the old behaviour:
+    the token stays consumed until cleanup.
+    """
+    token = str(approval.get("token", ""))
+    if not token:
+        return False
+    expected_hash = _canonical_payload_hash(write_approval_payload(approval))
+    try:
+        result = app_context.odoo.execute_method(
+            "nesa.mcp.approval.token",
+            "mcp_release_approval",
+            token,
+            expected_hash,
+        )
+    except Exception:  # noqa: BLE001 — release is best effort
+        logger.warning(
+            "[approval-token] release failed for token=%s — token stays consumed",
+            token,
+        )
+        return False
+    if not isinstance(result, dict) or not result.get("success"):
+        logger.info(
+            "[approval-token] release rejected token=%s reason=%s",
+            token,
+            result.get("error") if isinstance(result, dict) else "non-dict reply",
+        )
+        return False
+    return True
 
 
 def write_approval_payload(approval: Dict[str, Any]) -> Dict[str, Any]:
@@ -3124,6 +3222,23 @@ def validate_write(
                         "reason": "trusted live metadata was empty",
                     },
                 }
+        trusted_live_metadata = (
+            metadata_source == "server"
+            and isinstance(fields_metadata, dict)
+            and bool(fields_metadata)
+        )
+        # Audit 2026-10-05: wizards opened by an action carry their target in
+        # readonly fields or only in default_* context keys.  Relaxed only for
+        # a create on a model Odoo itself reports as transient.
+        transient_create = False
+        if (
+            trusted_live_metadata
+            and str(operation).strip().lower() == "create"
+            and _create_needs_transient_check(values, context, fields_metadata)
+        ):
+            app_context = ctx.request_context.lifespan_context
+            profile = transient_write_profile(app_context, app_context.odoo, model)
+            transient_create = bool((profile or {}).get("transient"))
         report = validate_write_report(
             model=model,
             operation=operation,
@@ -3132,16 +3247,47 @@ def validate_write(
             context=context,
             fields_metadata=fields_metadata,
             metadata_source=metadata_source,
-        )
-        trusted_live_metadata = (
-            metadata_source == "server"
-            and isinstance(fields_metadata, dict)
-            and bool(fields_metadata)
+            transient_create=transient_create,
         )
         if trusted_live_metadata:
-            stored = register_write_approval(
+            registration = register_write_approval_status(
                 ctx.request_context.lifespan_context, report
             )
+            stored = registration["stored"]
+            registration_error = registration.get("error")
+            if (
+                not stored
+                and registration_error
+                and _approval_reason_code(registration_error) == "token_already_consumed"
+            ):
+                # The identical payload was already executed with this
+                # deterministic token (or its outcome was lost).  Reporting
+                # success here sent agents into a guaranteed execute failure.
+                report.pop("approval", None)
+                report.update({
+                    "success": False,
+                    "error": (
+                        "validate_write rejected the payload "
+                        "(token_already_consumed); this exact write was "
+                        "already executed with its approval"
+                    ),
+                    "error_type": "request",
+                    "retryable": False,
+                    "reason_code": "token_already_consumed",
+                    "remedy": (
+                        "Read the record back: the identical write already "
+                        "ran or its outcome was lost. Do not repeat it "
+                        "blindly; the same approval stays blocked for about "
+                        "70 minutes."
+                    ),
+                    "outcome": "rejected",
+                    "approval_status": {
+                        "stored": False,
+                        "source": metadata_source,
+                        "reason": registration_error,
+                    },
+                })
+                return report
             approval = report.get("approval")
             expires_at = (
                 approval.get("expires_at") if isinstance(approval, dict) else None
@@ -3156,6 +3302,8 @@ def validate_write(
                 ),
                 "source": metadata_source,
             }
+            if registration_error:
+                report["approval_status"]["reason"] = registration_error
         else:
             report["approval_status"] = {
                 "stored": False,
@@ -3226,9 +3374,10 @@ def execute_approved_write(
         if denied:
             return denied
         # Both gates below are local and cost nothing, and consuming the token
-        # is irreversible: the store deliberately does not re-arm the same
-        # deterministic token.  Checking them first means a forgotten
-        # confirm=true no longer burns a valid approval.
+        # is irreversible unless Odoo refuses the write itself: the store
+        # deliberately does not re-arm the same deterministic token.  Checking
+        # them first means a forgotten confirm=true no longer burns a valid
+        # approval.
         if not confirm:
             return {
                 "success": False,
@@ -3266,8 +3415,8 @@ def execute_approved_write(
                     "seconds. Re-run validate_write directly before executing."
                 ),
                 "token_already_consumed": (
-                    "This token was already used — the write may have been "
-                    "executed. Verify the record before retrying."
+                    "This token was already used — the write ran or its "
+                    "outcome was lost. Read the record back before retrying."
                 ),
                 "token_foreign_user": (
                     "The token belongs to a different Odoo user. Re-run "
@@ -3320,7 +3469,32 @@ def execute_approved_write(
             args = [record_ids]
 
         audit_odoo_execution("execute_approved_write", model, operation)
-        result = app_context.odoo.execute_method(model, operation, *args, **kwargs)
+        try:
+            result = app_context.odoo.execute_method(model, operation, *args, **kwargs)
+        except Exception as write_exc:
+            if not odoo_rejected_before_commit(write_exc):
+                raise
+            # Audit 2026-10-05: a business-rule refusal used to leave the
+            # deterministic token consumed, so the same corrected attempt was
+            # blocked for about 70 minutes.
+            released = release_write_approval(app_context, approval)
+            response = error_response("execute_approved_write", write_exc)
+            response["reason_code"] = "odoo_rejected_write"
+            response["write_executed"] = False
+            response["approval_released"] = released
+            response["remedy"] = (
+                "Odoo refused the write with a business error and rolled it "
+                "back; nothing was written. "
+                + (
+                    "The approval is reusable until it expires: fix the cause "
+                    "and repeat execute_approved_write with the same approval, "
+                    "or run validate_write again if the values change."
+                    if released
+                    else "The approval stays consumed: run validate_write "
+                    "again with changed values."
+                )
+            )
+            return response
         # NESA Patch 3 — DB-backed token revocation (replaces in-memory pop).
         revoke_write_approval(app_context, str(approval.get("token", "")))
         response = {
@@ -4341,8 +4515,9 @@ def read_records(
     ctx: Context,
     model: Annotated[str, Field(description="Technical model name, e.g. 'res.partner'.")],
     record_ids: Annotated[
-        List[int], Field(description="Database ids, at most 100 per call.", min_length=1)
-    ],
+        Optional[List[int]],
+        Field(description="Database ids, at most 100 per call. Required.", min_length=1),
+    ] = None,
     fields: Annotated[
         Optional[List[str]],
         Field(
@@ -4352,6 +4527,10 @@ def read_records(
             )
         ),
     ] = None,
+    ids: Annotated[
+        Optional[List[int]],
+        Field(description="Alias of record_ids; prefer record_ids.", min_length=1),
+    ] = None,
 ) -> Dict[str, Any]:
     """Read many records by ID with the same field semantics as read_record.
 
@@ -4359,12 +4538,18 @@ def read_records(
     non-binary field. Missing IDs are reported in ``missing_ids`` instead of
     failing the whole call — a record can be absent because it was deleted or
     because a record rule hides it.
+
+    ``ids`` exists because callers kept sending it (audit 2026-10-05, 9 failed
+    calls a week); FastMCP silently drops unknown arguments, so the call used
+    to fail with a missing record_ids.
     """
     app_context = ctx.request_context.lifespan_context
     odoo = app_context.odoo
     try:
         validate_model_name(model)
-        normalized_ids = [int(record_id) for record_id in record_ids or []]
+        if record_ids and ids and list(record_ids) != list(ids):
+            raise ValueError("pass the ids once, as record_ids")
+        normalized_ids = [int(record_id) for record_id in record_ids or ids or []]
         if not normalized_ids:
             raise ValueError("record_ids must contain at least one ID")
         if any(record_id < 1 for record_id in normalized_ids):

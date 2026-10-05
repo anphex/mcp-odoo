@@ -237,6 +237,16 @@ Der Service-User `mcp` braucht dafür Lesezugriff auf dieses Verzeichnis
 (POSIX-ACL, nur `r-x`). Ohne die Variable bleibt `scan_addons_source`
 abgeschaltet und sagt das auch.
 
+## Patch 7 — Folgefixes aus dem Nutzungsaudit 2026-10-05
+
+| # | Änderung | Wo |
+|---|---|---|
+| F1 | Lehnt Odoo einen genehmigten Write mit einem Fault der UserError-Familie ab (`warning -- …`, `AccessDenied`; vor `cr.commit()` geworfen), gibt der Fork das verbrauchte Token über `nesa.mcp.approval.token.mcp_release_approval` frei. Antwort: `reason_code=odoo_rejected_write`, `write_executed=false`, `approval_released`. Traceback-Faults (auch Postcommit-Fehler), Transport- und JSON-2-Fehler lassen das Token verbraucht. Bridge ohne Methode → bisheriges Verhalten. Benötigt `nesa_mcp_bridge` ≥ 18.0.1.7.5. | `server.py execute_approved_write`, `odoo_rejected_before_commit`, `release_write_approval` |
+| F2 | `validate_write` meldet ein bereits verbrauchtes Token nicht mehr als Erfolg, sondern als `outcome=rejected`/`token_already_consumed` ohne `approval`. Andere Store-Ablehnungen stehen in `approval_status.reason`. Server-Anweisung korrigiert: „already consumed“ heißt „lief oder Ausgang unbekannt“. | `server.py validate_write`, `register_write_approval_status` |
+| F3 | Create auf einem von Odoo als transient gemeldeten Modell: Readonly-Felder sind Hinweis statt Fehler, leere Werte reichen, wenn `default_<feld>` im Kontext ein existierendes Feld füllt. Persistente Modelle und `write` unverändert; fehlendes Profil gilt als persistent. | `agent_tools.validate_write_report`, `create_needs_transient_check` |
+| F4 | `read_records` nimmt `ids` als Alias von `record_ids` (FastMCP verwarf das Argument bisher stillschweigend). | `server.py read_records` |
+| F5 | „Object X doesn't exist“ → `error_type=request`, `reason_code=unknown_model`, Remedy `list_models`. | `server.py classify_call_error`, `error_response` |
+
 ## Sync mit Upstream
 
 ```bash

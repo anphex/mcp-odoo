@@ -418,7 +418,11 @@ def test_a6_search_failure_is_not_reported_as_empty_result(server):
 
     result = server.search_records(_Ctx(_Broken()), "no.such.model")
     assert result["success"] is False
-    assert result["error_type"] == "odoo_error"
+    # Audit 2026-10-05: a model that is not installed is a wrong request.
+    assert result["error_type"] == "request"
+    assert result["reason_code"] == "unknown_model"
+    assert "list_models" in result["remedy"]
+    assert result["error_details"]["reason_code"] == "unknown_model"
 
 
 def test_a6_traceback_is_compacted_to_its_cause(server):
