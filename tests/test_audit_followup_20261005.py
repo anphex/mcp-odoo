@@ -311,6 +311,21 @@ def test_unproven_failures_keep_the_token_consumed(server, exc):
     assert again["reason_code"] == "token_already_consumed"
 
 
+@pytest.mark.parametrize("exc", [
+    http.client.RemoteDisconnected("Remote end closed connection without response"),
+    ConnectionResetError(104, "Connection reset by peer"),
+    TimeoutError("timed out"),
+    xmlrpc.client.ProtocolError("odoo/xmlrpc/2/object", 502, "Bad Gateway", {}),
+])
+def test_lost_write_answer_is_an_unknown_outcome(server, exc):
+    odoo = _Odoo(write_outcomes=[exc])
+    ctx = _Ctx(odoo)
+    result = server.execute_approved_write(ctx, _approve(server, ctx), confirm=True)
+    assert result["outcome_unknown"] is True
+    assert result["retryable"] is False
+    assert "Read the affected record back" in result["remedy"]
+
+
 def test_failed_release_reports_unknown_outcome(server):
     odoo = _Odoo(write_outcomes=[_user_error()], release_supported=False)
     ctx = _Ctx(odoo)

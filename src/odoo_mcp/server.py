@@ -3509,6 +3509,12 @@ def execute_approved_write(
                     model, operation, *args, **kwargs
                 )
         except Exception as write_exc:
+            if classify_call_error(write_exc)["retryable"]:
+                # The write was sent and the answer was lost: it may have
+                # committed, so never report it as a retryable failure.
+                raise UnknownOutcomeError(
+                    "execute_approved_write", write_exc,
+                ) from write_exc
             if not consume_id or not odoo_business_fault(write_exc):
                 raise
             # Audit 2026-10-05: a business-rule refusal used to leave the
