@@ -43,6 +43,31 @@ FIELD_METADATA_RPC_ATTRIBUTES = (
     "searchable",
 )
 
+# ORM entry points that only read.  A transport failure on one of these can
+# be retried safely; anything else may already have committed on the server.
+# OdooClient sends every other method with exactly one attempt, and
+# server.call_with_transport_retry never repeats it.
+IDEMPOTENT_READ_METHODS = frozenset({
+    "context_get",
+    "default_get",
+    "exists",
+    "fields_get",
+    "formatted_read_group",
+    "get_view",
+    "get_views",
+    "name_get",
+    "name_search",
+    "read",
+    "read_group",
+    "search",
+    "search_count",
+    "search_fetch",
+    "search_read",
+    "web_read",
+    "web_read_group",
+    "web_search_read",
+})
+
 
 class OdooJson2Error(ValueError):
     """Structured JSON-2 error with redacted debug details by default."""
@@ -202,15 +227,55 @@ class OdooClient:
         return merged
 
     def _execute(self, model: str, method: str, *args: Any, **kwargs: Any) -> Any:
-        """Execute a method on an Odoo model."""
+        """Execute a method on an Odoo model.
+
+        Reads use the shared keep-alive connection, whose transport resends a
+        request once when the connection drops.  Any other method may already
+        have committed when its answer is lost, so it is sent once over a
+        fresh connection instead (see ``_execute_kw_once``).
+        """
         kwargs = self._apply_lang_context(kwargs)
         if self.transport == "json2":
             payload = self._build_json2_payload(model, method, args, kwargs)
             return self._json2_call(model, method, payload)
 
+        if method not in IDEMPOTENT_READ_METHODS:
+            return self._execute_kw_once(model, method, args, kwargs)
         return self._models.execute_kw(
             self.db, self.uid, self.password, model, method, list(args), kwargs
         )
+
+    def _execute_kw_once(
+        self,
+        model: str,
+        method: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        """Send one XML-RPC ``execute_kw`` without the automatic replay.
+
+        ``xmlrpc.client.Transport.request`` sends a request a second time when
+        the connection drops (RemoteDisconnected, ECONNRESET, EPIPE).  For a
+        mutation whose answer was lost that replays a committed write.  A
+        fresh connection cannot be a stale keep-alive socket, so the replay
+        protects nothing here; the error is raised and the caller treats the
+        outcome as unknown.
+        """
+        transport = RedirectTransport(
+            timeout=self.timeout,
+            use_https=self.url.startswith("https://"),
+            verify_ssl=self.verify_ssl,
+            single_attempt=True,
+        )
+        proxy = xmlrpc.client.ServerProxy(
+            f"{self.url}/xmlrpc/2/object", transport=transport
+        )
+        try:
+            return proxy.execute_kw(
+                self.db, self.uid, self.password, model, method, list(args), kwargs
+            )
+        finally:
+            transport.close()
 
     def _build_json2_payload(
         self,
@@ -327,32 +392,17 @@ class OdooClient:
         return self._execute(model, method, *args, **kwargs)
 
     def execute_method_once(self, model: str, method: str, *args: Any, **kwargs: Any) -> Any:
-        """Execute a method without the automatic XML-RPC replay.
+        """Execute a method with exactly one attempt, even a read.
 
-        ``xmlrpc.client.Transport.request`` sends a request a second time when
-        the connection drops (RemoteDisconnected, ECONNRESET, EPIPE).  For a
-        mutation whose answer was lost that replays a committed write.  This
-        call uses its own fresh connection and raises instead, so the caller
-        treats the outcome as unknown.  JSON-2 (urllib) never replays.
+        ``execute_method`` already sends every non-read method this way; this
+        entry point makes the guarantee explicit for the approved write.
+        JSON-2 (urllib) never replays.
         """
         if self.transport == "json2":
             return self._execute(model, method, *args, **kwargs)
-        kwargs = self._apply_lang_context(kwargs)
-        transport = RedirectTransport(
-            timeout=self.timeout,
-            use_https=self.url.startswith("https://"),
-            verify_ssl=self.verify_ssl,
-            single_attempt=True,
+        return self._execute_kw_once(
+            model, method, args, self._apply_lang_context(kwargs)
         )
-        proxy = xmlrpc.client.ServerProxy(
-            f"{self.url}/xmlrpc/2/object", transport=transport
-        )
-        try:
-            return proxy.execute_kw(
-                self.db, self.uid, self.password, model, method, list(args), kwargs
-            )
-        finally:
-            transport.close()
 
     def get_server_version(self) -> dict[str, Any]:
         """Return Odoo server version metadata using the safest available route."""

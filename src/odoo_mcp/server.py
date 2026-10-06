@@ -50,6 +50,7 @@ from . import form_inspect
 from ._nesa_file_intake import FileIntakeError, fetch_allowlisted_url
 from .odoo_client import (
     FIELD_METADATA_RPC_ATTRIBUTES,
+    IDEMPOTENT_READ_METHODS,
     OdooClient,
     get_odoo_client,
 )
@@ -1076,27 +1077,6 @@ def classify_call_error(exc: BaseException) -> Dict[str, Any]:
         "retryable": False,
         "detail": sanitize_odoo_error(text),
     }
-
-
-# ORM entry points that only read.  A transport failure on one of these can
-# be retried safely; anything else may already have committed on the server.
-IDEMPOTENT_READ_METHODS = frozenset({
-    "default_get",
-    "exists",
-    "fields_get",
-    "get_views",
-    "name_get",
-    "name_search",
-    "read",
-    "read_group",
-    "search",
-    "search_count",
-    "search_fetch",
-    "search_read",
-    "web_read",
-    "web_read_group",
-    "web_search_read",
-})
 
 
 class UnknownOutcomeError(RuntimeError):

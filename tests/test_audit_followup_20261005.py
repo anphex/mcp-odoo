@@ -420,6 +420,71 @@ def test_default_transport_still_resends_once(monkeypatch):
     assert len(sent) == 2
 
 
+def _shared_proxy_client(odoo_client_module):
+    client = _bare_client(odoo_client_module)
+    client._models = xmlrpc.client.ServerProxy(
+        f"{client.url}/xmlrpc/2/object",
+        transport=odoo_client_module.RedirectTransport(timeout=5, use_https=False),
+    )
+    return client
+
+
+@pytest.mark.parametrize("model, method, args", [
+    ("sale.order", "action_confirm", [[5]]),
+    ("res.partner", "message_post", [[7]]),
+    ("nesa.mcp.doc.helper", "mcp_store_attachment", ["res.partner", 7]),
+    ("res.partner", "create", [{"name": "Ada"}]),
+])
+def test_execute_method_sends_non_read_methods_once(monkeypatch, model, method, args):
+    # Regression 2026-10-06: the stdlib transport replayed a committed
+    # action_confirm/message_post after a lost answer.
+    odoo_client = importlib.import_module("odoo_mcp.odoo_client")
+    sent = _count_single_requests(monkeypatch, odoo_client)
+
+    with pytest.raises(http.client.RemoteDisconnected):
+        _shared_proxy_client(odoo_client).execute_method(model, method, *args)
+    assert sent == ["/xmlrpc/2/object"]
+
+
+def test_execute_method_read_keeps_transport_resend(monkeypatch):
+    odoo_client = importlib.import_module("odoo_mcp.odoo_client")
+    sent = _count_single_requests(monkeypatch, odoo_client)
+
+    with pytest.raises(http.client.RemoteDisconnected):
+        _shared_proxy_client(odoo_client).execute_method(
+            "res.partner", "read", [7], fields=["name"],
+        )
+    assert len(sent) == 2
+
+
+def test_single_attempt_call_keeps_arguments_and_lang(monkeypatch):
+    odoo_client = importlib.import_module("odoo_mcp.odoo_client")
+    bodies = []
+
+    def answer(self, host, handler, request_body, verbose=False):
+        bodies.append(xmlrpc.client.loads(request_body))
+        return (True,)
+
+    monkeypatch.setattr(odoo_client.RedirectTransport, "single_request", answer)
+    client = _bare_client(odoo_client)
+    client.lang = "de_DE"
+
+    assert client.execute_method(
+        "sale.order", "action_confirm", [5], context={"tz": "Europe/Berlin"},
+    ) is True
+    (params, method_name), = bodies
+    assert method_name == "execute_kw"
+    assert params == (
+        "db", 2, "secret", "sale.order", "action_confirm", [[5]],
+        {"context": {"tz": "Europe/Berlin", "lang": "de_DE"}},
+    )
+
+
+def test_server_uses_the_client_read_method_set(server):
+    odoo_client = importlib.import_module("odoo_mcp.odoo_client")
+    assert server.IDEMPOTENT_READ_METHODS is odoo_client.IDEMPOTENT_READ_METHODS
+
+
 # ----- 2. validate_write and a consumed token -------------------------------
 
 

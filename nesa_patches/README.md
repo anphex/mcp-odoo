@@ -246,6 +246,7 @@ abgeschaltet und sagt das auch.
 | F3 | Create auf einem von Odoo als transient gemeldeten Modell: Readonly-Felder sind Hinweis statt Fehler, leere Werte reichen, wenn `default_<feld>` im Kontext ein existierendes Feld füllt. Persistente Modelle und `write` unverändert; fehlendes Profil gilt als persistent. | `agent_tools.validate_write_report`, `create_needs_transient_check` |
 | F4 | `read_records` nimmt `ids` als Alias von `record_ids` (FastMCP verwarf das Argument bisher stillschweigend). | `server.py read_records` |
 | F5 | „Object X doesn't exist“ → `error_type=request`, `reason_code=unknown_model`, Remedy `list_models`. | `server.py classify_call_error`, `error_response` |
+| F6 | Jede Methode außerhalb `IDEMPOTENT_READ_METHODS` geht über eine frische Verbindung mit genau einem Versuch, nicht nur der freigegebene Write: `execute_method`-Tool (`action_*`, `message_post` …), Doc-Helper-Writes, Approval-Token-RPCs. Die stdlib-Wiederholung nach `RemoteDisconnected`/`ECONNRESET`/`EPIPE` konnte eine committete Aktion still doppelt ausführen; jetzt meldet `call_with_transport_retry` den Ausgang als unbekannt. Reads behalten die Keep-Alive-Verbindung samt Wiederholung. Erweitert auf Freigabe Constantin 2026-10-06. | `odoo_client.py _execute`, `_execute_kw_once`, `IDEMPOTENT_READ_METHODS` (aus `server.py` hierher verschoben) |
 
 ## Sync mit Upstream
 
