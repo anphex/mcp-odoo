@@ -273,9 +273,17 @@ def test_custom_fields_appear_with_values_in_form_order(server):
 
 def test_customer_visible_hint_only_for_marked_help(server):
     result = server.inspect_record_form(_Ctx(_FormClient()), "res.partner", record_id=5)
-    assert _one(result, "ref")["customer_visible"].startswith("Kundensichtbar:")
+    assert _one(result, "ref")["customer_visible"] == (
+        "Kundensichtbar: wird als „Referenz“ gedruckt. Kurz halten."
+    )
     assert "customer_visible" not in _one(result, "x_heizungsanlage")
     assert "customer_visible" not in _one(result, "vat")
+
+
+@pytest.mark.parametrize("help_value", [False, None, 42, ["Kundensichtbar:"], ""])
+def test_customer_visible_hint_ignores_missing_or_non_string_help(server, help_value):
+    assert server._customer_visible_hint({"help": help_value}) is None
+    assert server._customer_visible_hint({}) is None
 
 
 def test_static_invisible_field_is_hidden(server):
