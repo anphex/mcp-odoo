@@ -67,10 +67,12 @@ PARTNER_FIELDS = {
                  "selection": [["herr", "Herr"], ["frau", "Frau"]]},
     "secret_code": {"type": "char", "string": "Code"},
     "vat": {"type": "char", "string": "USt-IdNr."},
-    "ref": {"type": "char", "string": "Referenz"},
+    "ref": {"type": "char", "string": "Referenz",
+            "help": "Kundensichtbar: wird als „Referenz“ gedruckt. Kurz halten."},
     "parent_id": {"type": "many2one", "string": "Firma", "relation": "res.partner"},
     "is_company": {"type": "boolean", "string": "Ist Firma"},
-    "x_heizungsanlage": {"type": "char", "string": "Heizungsanlage"},
+    "x_heizungsanlage": {"type": "char", "string": "Heizungsanlage",
+                         "help": "Hersteller und Typ der Anlage."},
     "line_ids": {"type": "one2many", "string": "Zeilen", "relation": "x.line"},
     "tag_ids": {"type": "many2many", "string": "Tags", "relation": "x.tag"},
     "comment": {"type": "html", "string": "Notiz"},
@@ -267,6 +269,13 @@ def test_custom_fields_appear_with_values_in_form_order(server):
     assert (parent["value"], parent["display_value"], parent["relation"]) == (
         7, "Holding AG", "res.partner",
     )
+
+
+def test_customer_visible_hint_only_for_marked_help(server):
+    result = server.inspect_record_form(_Ctx(_FormClient()), "res.partner", record_id=5)
+    assert _one(result, "ref")["customer_visible"].startswith("Kundensichtbar:")
+    assert "customer_visible" not in _one(result, "x_heizungsanlage")
+    assert "customer_visible" not in _one(result, "vat")
 
 
 def test_static_invisible_field_is_hidden(server):

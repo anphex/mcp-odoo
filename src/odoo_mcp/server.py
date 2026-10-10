@@ -4978,6 +4978,21 @@ def _form_inspect_enforce_budget(response: Dict[str, Any], max_chars: int) -> No
         )
 
 
+# NESA: fields whose value is printed on customer documents (quote, invoice,
+# work report) carry an Odoo help text starting with this marker. The Odoo
+# modules nesa_document_report and nesa_fsm_advanced_worksheet own the list;
+# the server only passes the hint on, so agents see it while editing.
+CUSTOMER_VISIBLE_HELP_PREFIX = "Kundensichtbar:"
+
+
+def _customer_visible_hint(metadata: Dict[str, Any]) -> Optional[str]:
+    """Return the field's customer-visible help text, or None."""
+    help_text = metadata.get("help")
+    if isinstance(help_text, str) and help_text.startswith(CUSTOMER_VISIBLE_HELP_PREFIX):
+        return help_text
+    return None
+
+
 @mcp.tool(
     description=(
         "Inspect the effective form view of a model or record in ONE call: which "
@@ -4994,7 +5009,10 @@ def _form_inspect_enforce_budget(response: Dict[str, Any], max_chars: int) -> No
         "or 'unknown'. Without record_id the values are default_get defaults. "
         "Binary/image fields report only presence and size; x2many fields "
         "return count, ids and at most max_relational_rows rows of the inline "
-        "list columns (one level, never recursive). Every shortening sets "
+        "list columns (one level, never recursive). A field with "
+        "customer_visible is printed on customer documents (the text says "
+        "where): write it short and factual — no phone numbers, person names, "
+        "addresses, internal notes or guesses. Every shortening sets "
         "meta.truncated=true with a concrete entry in meta.warnings. The default "
         "form is resolved like Odoo does without an action; pass view_id or "
         "context.form_view_ref for an action-specific form. Datetimes are naive "
@@ -5257,6 +5275,9 @@ def inspect_record_form(
                 entry["required_source"] = "model"
             if readonly_condition:
                 entry["readonly_condition"] = readonly_condition
+            customer_visible = _customer_visible_hint(metadata)
+            if customer_visible:
+                entry["customer_visible"] = customer_visible
             for attribute in ("widget", "groups"):
                 if occurrence.attrs.get(attribute):
                     entry[attribute] = occurrence.attrs[attribute]
