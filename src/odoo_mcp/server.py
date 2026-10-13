@@ -255,7 +255,18 @@ SERVER_INSTRUCTIONS = (
     "purchase_price), task effort is allocated_hours (no planned_hours), "
     "invoice payment reference is payment_reference. Legacy work "
     "reports are searched as 'TGZ-<nr>' in the task name, never as a bare "
-    "number. bank.rec.widget is a UI widget and cannot be driven over RPC."
+    "number. bank.rec.widget is a UI widget and cannot be driven over RPC.\n"
+    "SUPPLIER FACTS: res.partner.ref is NESA's own internal account number "
+    "for the contact (bookkeeping), never the customer number a supplier "
+    "assigned to NESA. NESA's customer number at a supplier and the "
+    "supplier's inside-sales (Innendienst) and field-sales (Außendienst) "
+    "contacts are kept in the internal note of the supplier's company "
+    "record: read_record on its commercial_partner_id with "
+    "fields=[\"comment\"] (tab 'Interne Notizen', block 'Lieferantendaten'). "
+    "Supplier invoices and documents are often not readable for the user, "
+    "so do not search them for it. If the note has no such value, say so "
+    "and refer the user to the office; never offer ref or any other number "
+    "as the customer number."
 )
 
 def _result_summary(result: Any) -> tuple[Optional[bool], Optional[int], int]:

@@ -145,6 +145,29 @@ def test_server_import_initializes_fastmcp_with_current_sdk_without_lifespan():
         assert marker in instructions
 
 
+def test_server_instructions_disambiguate_supplier_customer_number():
+    server = importlib.import_module("odoo_mcp.server")
+
+    instructions = server.mcp.instructions or ""
+    assert "SUPPLIER FACTS:" in instructions
+    section = instructions.split("SUPPLIER FACTS:", 1)[1]
+    # ref is NESA's internal number; the supplier-assigned number lives in
+    # the supplier's internal note (Monteure cannot read the invoices).
+    for marker in (
+        "res.partner.ref",
+        "never the customer number",
+        "Innendienst",
+        "Außendienst",
+        "commercial_partner_id",
+        "fields=[\"comment\"]",
+        "Lieferantendaten",
+        "do not search them",
+        "refer the user to the office",
+        "never offer ref or any other number",
+    ):
+        assert marker in section
+
+
 def test_server_registers_expected_tools_and_resources_without_lifespan():
     server = importlib.import_module("odoo_mcp.server")
 
