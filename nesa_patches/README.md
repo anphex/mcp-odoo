@@ -14,6 +14,8 @@ Patches sind bereits gelandet.
 | 4 | `doc/`-Endpoint via `nesa.mcp.doc.helper` | partial — Helper-Model existiert in `nesa_mcp_bridge`, Fork-Seite nicht verdrahtet | — |
 | 5 | Native Odoo-ACL-Parität für Per-User-Calls | **APPLIED** | Feature-Branch `feature/mcp-ui-parity` |
 | 6 | Agenten-Backlog 2026-08-22 (A1–A10, B1–B9) | **APPLIED** | siehe unten |
+| 7 | Folgefixes Nutzungsaudit 2026-10-05 | **APPLIED** | siehe unten |
+| 8 | Rechnungs-Tools je Nutzer aus `nesa_agent_invoice_mcp` | **APPLIED** (Staging zuerst) | siehe unten |
 
 ## Patch-Beschreibungen
 
@@ -247,6 +249,27 @@ abgeschaltet und sagt das auch.
 | F4 | `read_records` nimmt `ids` als Alias von `record_ids` (FastMCP verwarf das Argument bisher stillschweigend). | `server.py read_records` |
 | F5 | „Object X doesn't exist“ → `error_type=request`, `reason_code=unknown_model`, Remedy `list_models`. | `server.py classify_call_error`, `error_response` |
 | F6 | Jede Methode außerhalb `IDEMPOTENT_READ_METHODS` geht über eine frische Verbindung mit genau einem Versuch, nicht nur der freigegebene Write: `execute_method`-Tool (`action_*`, `message_post` …), Doc-Helper-Writes, Approval-Token-RPCs. Die stdlib-Wiederholung nach `RemoteDisconnected`/`ECONNRESET`/`EPIPE` konnte eine committete Aktion still doppelt ausführen; jetzt meldet `call_with_transport_retry` den Ausgang als unbekannt. Reads behalten die Keep-Alive-Verbindung samt Wiederholung. Erweitert auf Freigabe Constantin 2026-10-06. | `odoo_client.py _execute`, `_execute_kw_once`, `IDEMPOTENT_READ_METHODS` (aus `server.py` hierher verschoben) |
+
+## Patch 8 — Rechnungs-Tools je Nutzer (2026-10-25)
+
+Hybridkonzept Schritt 2: Ein lokaler Agent (Claude Code, Codex) nutzt per MCP
+dieselben Rechnungs-Tools wie der KI-Rechnungs-Agent in Odoo. Die Tools kommen
+nicht aus dem Fork, sondern aus dem Odoo-Modul `nesa_agent_invoice_mcp`
+(Modell `nesa.agent.invoice.mcp.gateway`, Details in dessen README).
+
+| Teil | Verhalten | Wo |
+|---|---|---|
+| Liste | `tools/list` hängt an die statischen Tools die Antwort von `mcp_list_tools()` an, abgefragt mit dem Odoo-Konto des Nutzers. Das Gateway entscheidet Sichtbarkeit (Gruppe „Rechnungsstellung“, Kill-Switch, Sync-Benutzer, Workflow-Freigabe). Der Fork prüft nur die Form: Name `^[A-Za-z0-9._-]{1,128}$`, keine Kollision mit statischen Tools, Objekt-Schema, höchstens 100 Tools. Cache je Login und Key-Hash, `ODOO_MCP_INVOICE_TOOLS_TTL` (Default 60 s), Fehler 10 s. | `_nesa_dynamic_tools.dynamic_tools`, `NesaFastMCP.list_tools` |
+| Fail-closed | Ohne Per-User-Kontext gibt es keine Rechnungs-Tools, das Servicekonto wird nie gefragt. Ein Fehler beim Abruf blendet nur die Rechnungs-Tools aus, die statische Liste bleibt. | `_nesa_dynamic_tools` |
+| Aufruf | Ein Name, der kein statisches Tool ist und in der Liste des Nutzers steht, geht an `mcp_call_tool(name=…, arguments=…, call_id=…)` mit frischer `call_id` (UUID). Keine Wiederholung bei Transportfehler (`idempotent=False`, `outcome_unknown` mit `call_id`). Eigener Client mit `ODOO_MCP_INVOICE_TOOLS_TIMEOUT` (Default 600 s, 60–900), weil ein Tool bis 150 s läuft und ein paralleler Aufruf auf dieselbe Rechnung vorher bis zur Lock-Wartezeit des Gateways wartet. | `call_dynamic_tool`, `NesaFastMCP._call_dynamic_tool` |
+| Ergebnis | `CallToolResult` mit Textinhalt, `structuredContent.result` = `success`, `is_error`, `session_id`, `run_id`, `workflow`. Log-Zeile und Telemetrie lesen dieses Format (`_unpack_call_result`); Telemetrie führt die Tools als `unknown`. | `server.py` |
+| Sperre | `nesa.agent.invoice.mcp.gateway.` steht in `NON_DELEGABLE_METHOD_PREFIXES`; über `execute_method` ist das Gateway nicht erreichbar. | `server.py` |
+
+Zeitgrenzen: Die HTTP-Anfrage des Clients muss die Tool-Laufzeit aushalten
+(nginx `proxy_read_timeout` der Capability-Location 720 s, Odoo
+`limit_time_real` Staging 600 s, Prod 3600 s).
+
+Tests: `tests/test_nesa_dynamic_tools.py`.
 
 ## Sync mit Upstream
 

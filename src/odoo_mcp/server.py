@@ -20,8 +20,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any, AsyncIterator, Callable, Dict, List, Optional, Union
 
+import anyio
 from mcp.server.fastmcp import Context, FastMCP, Image
-from mcp.types import Annotations, TextContent, ToolAnnotations
+from mcp.types import Annotations, CallToolResult, TextContent, ToolAnnotations
 from pydantic import BaseModel, Field
 
 from .agent_tools import (
@@ -138,6 +139,9 @@ WRITE_EQUIVALENT_METHODS = frozenset({
 # or malformed deployment env var cannot make the agent self-authorizing.
 NON_DELEGABLE_METHOD_PREFIXES = frozenset({
     "nesa.agent.definition.",
+    # Patch 8: the invoice gateway is reached only through its own dynamic
+    # tools, which add a fresh call id and the tool-name check.
+    "nesa.agent.invoice.mcp.gateway.",
     "nesa.agent.mcp.server.",
     "nesa.agent.pending.action.",
     "nesa.agent.run.",
@@ -269,8 +273,16 @@ SERVER_INSTRUCTIONS = (
     "as the customer number."
 )
 
+def _unpack_call_result(result: Any) -> Any:
+    """A ready ``CallToolResult`` (Patch 8 invoice tools) as FastMCP's tuple."""
+    if isinstance(result, CallToolResult):
+        return result.content, result.structuredContent
+    return result
+
+
 def _result_summary(result: Any) -> tuple[Optional[bool], Optional[int], int]:
     """(success, record_count, bytes) of a tool result as the agent sees it."""
+    result = _unpack_call_result(result)
     structured = _structured_of(result)
     size = 0
     blocks = result[0] if isinstance(result, tuple) else result
@@ -352,6 +364,7 @@ def _structured_of(result: Any) -> Any:
     Tools annotated ``Dict[str, Any]`` get ``wrap_output=True`` in the SDK, so
     the structured half is ``{"result": <our dict>}``; unwrap that layer.
     """
+    result = _unpack_call_result(result)
     structured = result[1] if isinstance(result, tuple) and len(result) == 2 else result
     if not isinstance(structured, dict):
         # read_attachment deliberately has no structured output because it
@@ -381,7 +394,37 @@ def _structured_of(result: Any) -> Any:
 
 
 class NesaFastMCP(FastMCP):
-    """FastMCP with a per-call log line (see ``log_tool_call``)."""
+    """FastMCP with a per-call log line (see ``log_tool_call``) and the
+    per-user invoice tools of Patch 8 (``_nesa_dynamic_tools``)."""
+
+    def _static_tool_names(self) -> set:
+        return {tool.name for tool in self._tool_manager.list_tools()}
+
+    async def list_tools(self) -> list:
+        tools = await super().list_tools()
+        from ._nesa_dynamic_tools import dynamic_tools
+
+        try:
+            # The worker thread inherits the request's per-user contextvar.
+            extra = await anyio.to_thread.run_sync(
+                dynamic_tools, {tool.name for tool in tools},
+            )
+        except Exception:  # noqa: BLE001 — never break the static tool list
+            logger.warning("[invoice_tools] dynamic tool listing failed", exc_info=True)
+            extra = []
+        return tools + extra
+
+    async def _call_dynamic_tool(
+        self, name: str, arguments: Dict[str, Any],
+    ) -> Optional[CallToolResult]:
+        if self._tool_manager.get_tool(name) is not None:
+            return None
+        from ._nesa_dynamic_tools import call_dynamic_tool, is_dynamic_tool
+
+        reserved = self._static_tool_names()
+        if not await anyio.to_thread.run_sync(is_dynamic_tool, name, reserved):
+            return None
+        return await anyio.to_thread.run_sync(call_dynamic_tool, name, arguments)
 
     async def call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
         started = time.perf_counter()
@@ -405,7 +448,9 @@ class NesaFastMCP(FastMCP):
         except Exception:
             logger.debug('MCP telemetry setup failed (details suppressed)')
         try:
-            result = await super().call_tool(name, arguments)
+            result = await self._call_dynamic_tool(name, arguments)
+            if result is None:
+                result = await super().call_tool(name, arguments)
             return result
         except BaseException as exc:
             exception = exc
