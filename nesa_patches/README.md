@@ -16,6 +16,7 @@ Patches sind bereits gelandet.
 | 6 | Agenten-Backlog 2026-08-22 (A1–A10, B1–B9) | **APPLIED** | siehe unten |
 | 7 | Folgefixes Nutzungsaudit 2026-10-05 | **APPLIED** | siehe unten |
 | 8 | Rechnungs-Tools je Nutzer aus `nesa_agent_invoice_mcp` | **APPLIED** (Staging zuerst) | siehe unten |
+| 9 | `chatter_post` sendet HTML mit `body_is_html=True` | **APPLIED** (Staging zuerst) | siehe unten |
 
 ## Patch-Beschreibungen
 
@@ -270,6 +271,22 @@ Zeitgrenzen: Die HTTP-Anfrage des Clients muss die Tool-Laufzeit aushalten
 `limit_time_real` Staging 600 s, Prod 3600 s).
 
 Tests: `tests/test_nesa_dynamic_tools.py`.
+
+## Patch 9 — Chatter-Body als HTML (2026-10-29)
+
+Odoo 18 escaped in `message_post` jeden str-Body, solange `body_is_html`
+fehlt; per RPC gibt es kein `Markup`. HTML-Notizen der Agenten standen
+deshalb als `<p><b>…` im Chatter. `chatter_post` sendet einen Body mit
+HTML-Tags jetzt unverändert mit `body_is_html=True` (Odoo sanitisiert
+`mail.message.body` und wertet das Flag nur für interne User aus);
+Klartext geht wie bisher ohne Flag. Die Tag-Erkennung verlangt einen
+Tagnamen-Abschluss (`<a@nesa.de>` bleibt Text) und läuft linear. Das
+Approval-Token deckt das Flag ab. Odoo loggt je Post mit `body_is_html` eine
+WARNING („use a Markup object instead“); das ist erwartet.
+
+| Wo | Tests |
+|---|---|
+| `server.py _chatter_body_is_html`, `_build_chatter_payload`, Tool-Beschreibung `chatter_post` | `tests/test_server.py` `test_chatter_post_sends_html_body_unescaped`, `test_chatter_post_leaves_plain_text_to_odoo_escaping`, `test_chatter_body_html_detection*` |
 
 ## Sync mit Upstream
 

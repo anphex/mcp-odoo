@@ -5680,6 +5680,28 @@ def _message_post_returning_id(odoo, model: str, record_id: int, kwargs: Dict[st
     )
 
 
+# Tag name must end in whitespace, "/" or ">" so "<a@nesa.de>" stays text;
+# [^<>]* keeps the scan linear.
+_CHATTER_HTML_TAG_RE = re.compile(
+    r"</?(?:blockquote|figcaption|colgroup|caption|details|summary|section|"
+    r"strong|strike|figure|thead|tbody|tfoot|table|small|span|code|font|mark|"
+    r"abbr|cite|pre|div|sup|sub|img|del|ins|col|h[1-6]|br|hr|em|li|ol|ul|"
+    r"dl|dt|dd|tr|td|th|p|b|i|u|s|a|q)(?=[\s/>])[^<>]*>",
+    re.IGNORECASE,
+)
+
+
+def _chatter_body_is_html(body: str) -> bool:
+    """Return True when the chatter body contains HTML tags.
+
+    Odoo 18 escapes a str body in message_post (RPC cannot send Markup), so
+    tags sent without body_is_html show up as literal text in the chatter.
+    Odoo honours the flag only for internal users and sanitizes
+    mail.message.body; plain text keeps Odoo's own escaping.
+    """
+    return bool(_CHATTER_HTML_TAG_RE.search(body))
+
+
 def _build_chatter_payload(
     *,
     model: str,
@@ -5692,6 +5714,8 @@ def _build_chatter_payload(
 ) -> Dict[str, Any]:
     """Build the canonical message_post call payload (deterministic ordering)."""
     kwargs: Dict[str, Any] = {"body": body, "message_type": message_type}
+    if _chatter_body_is_html(body):
+        kwargs["body_is_html"] = True
     if subtype_xmlid:
         kwargs["subtype_xmlid"] = subtype_xmlid
     if partner_ids:
@@ -5708,7 +5732,10 @@ def _build_chatter_payload(
 
 @mcp.tool(
     description=(
-        "Post a chatter message on a mail.thread record. Default mode requires "
+        "Post a chatter message on a mail.thread record. For formatting send "
+        "HTML (<p>, <b>/<strong>, <i>, <ul>/<ol> with <li>, <br>, <a href>), "
+        "not Markdown; it is posted with body_is_html=True and rendered. "
+        "Plain text without tags is posted as text. Default mode requires "
         "an approval token returned from a preview call; set MCP_CHATTER_DIRECT=1 "
         "to bypass and post immediately."
     ),
@@ -5737,6 +5764,9 @@ def chatter_post(
       call without a token.
 
     Allowed ``message_type`` values: ``comment`` (default), ``notification``.
+
+    An HTML ``body`` is sent with ``body_is_html=True`` (see
+    ``_chatter_body_is_html``).
     """
     odoo = ctx.request_context.lifespan_context.odoo
     try:

@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import json
 import logging
+import time
 import xmlrpc.client
 from pathlib import Path
 
@@ -1964,7 +1965,53 @@ def test_chatter_post_execute_with_valid_approval_posts(monkeypatch):
     assert client.calls[0][1] == "message_post"
     assert client.calls[0][2] == ([7],)
     assert client.calls[0][3]["body"] == "Hi"
+    assert "body_is_html" not in client.calls[0][3]
     assert client.calls[0][3]["message_type"] == "comment"
+
+
+def test_chatter_post_sends_html_body_unescaped(monkeypatch):
+    """Odoo 18 escapes a str body unless body_is_html=True; agents' HTML
+    notes then showed <p>/<b> as literal text in the chatter."""
+    server = importlib.import_module("odoo_mcp.server")
+    monkeypatch.setenv("MCP_CHATTER_DIRECT", "1")
+    client = _ChatterClient()
+    body = "<p><b>Prüfung 29.10.2026</b></p><ul><li>/01 ergänzt</li></ul>"
+
+    server.chatter_post(FakeCtx(client), model="res.partner", record_id=7, body=body)
+
+    assert client.calls[0][3]["body"] == body
+    assert client.calls[0][3]["body_is_html"] is True
+
+
+def test_chatter_post_leaves_plain_text_to_odoo_escaping(monkeypatch):
+    server = importlib.import_module("odoo_mcp.server")
+    monkeypatch.setenv("MCP_CHATTER_DIRECT", "1")
+    client = _ChatterClient()
+    body = "Druck < 1 bar & fallend\nKontakt: Anna <a@nesa.de>, <b.neese@nesa.de>"
+
+    server.chatter_post(FakeCtx(client), model="res.partner", record_id=7, body=body)
+
+    assert client.calls[0][3]["body"] == body
+    assert "body_is_html" not in client.calls[0][3]
+
+
+def test_chatter_body_html_detection():
+    server = importlib.import_module("odoo_mcp.server")
+
+    for body in ("<img src='x.png'/>", "<dl><dt>A</dt></dl>", "<del>x</del>",
+                 "<a href=\"https://nesa.de\">x</a>", "Text<br>mehr", "<P>x</P>"):
+        assert server._chatter_body_is_html(body), body
+    for body in ("Anna <a@nesa.de>", "<b.neese@nesa.de>", "1 < 2 > 0",
+                 "< p>", "<pre-text>", "<" + " " * 50000 + "z"):
+        assert not server._chatter_body_is_html(body), body[:20]
+
+
+def test_chatter_body_html_detection_is_linear():
+    server = importlib.import_module("odoo_mcp.server")
+    start = time.monotonic()
+    server._chatter_body_is_html("<" + " " * 200000 + "z")
+    server._chatter_body_is_html("<a " * 100000)
+    assert time.monotonic() - start < 1.0
 
 
 def test_chatter_post_rejects_token_mismatch(monkeypatch):
