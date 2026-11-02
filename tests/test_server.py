@@ -169,6 +169,42 @@ def test_server_instructions_disambiguate_supplier_customer_number():
         assert marker in section
 
 
+def test_server_instructions_name_the_public_bank_reconciliation_command():
+    server = importlib.import_module("odoo_mcp.server")
+
+    instructions = server.mcp.instructions or ""
+    # The old sentence claimed the widget cannot be driven over RPC, which is
+    # wrong: it works, but needs stateful onchange calls. Agents get the public
+    # command instead, and the rule for private methods.
+    assert "cannot be driven over RPC" not in instructions
+    assert "BANK RECONCILIATION:" in instructions
+    section = instructions.split("BANK RECONCILIATION:", 1)[1]
+    section = section.split("SUPPLIER FACTS:", 1)[0]
+    for marker in (
+        "bank.rec.widget",
+        "onchange",
+        "nesa.auto.reconcile.engine",
+        "reconcile_bank_line",
+        "args=[statement_line_id, invoice_ids, rest_lines]",
+        "invoice_ids is a flat list",
+        "args=[9856, [11055], [{",
+        "{\"preview\": true}",
+        "{\"preview\": false}",
+        "read the statement line and the invoices back",
+        "bank amount minus the signed amount_residual",
+        "open at -100 paid with -95 also needs +5",
+        "never from a guess",
+        "Partial payments, foreign currency and taxed rest lines",
+        "PRIVATE METHODS:",
+        "starting with '_'",
+        "execute_method cannot reach them",
+        "tell the user that one is missing",
+    ):
+        assert marker in section
+    # The command takes a flat id list; a nested one is rejected.
+    assert "[invoice_ids]" not in section
+
+
 def test_server_registers_expected_tools_and_resources_without_lifespan():
     server = importlib.import_module("odoo_mcp.server")
 

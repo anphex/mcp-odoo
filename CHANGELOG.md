@@ -11,6 +11,14 @@ All notable changes to this project will be documented in this file.
 - Added deployment hard-deny prefixes through
   `ODOO_MCP_DENIED_METHOD_PREFIXES`; they precede native parity, exact and
   broad method modes, and all three approved-write stages.
+- Server instructions now name the public bank reconciliation command
+  `nesa.auto.reconcile.engine.reconcile_bank_line` and state that private
+  underscore methods are refused by Odoo for the web client and RPC alike.
+
+### Fixed
+- Removed the wrong instruction that `bank.rec.widget` cannot be driven over
+  RPC. It can, through stateful `onchange` calls; agents should use the public
+  command instead.
 
 ### Changed
 - Private underscore methods remain unreachable through `execute_method`, and
