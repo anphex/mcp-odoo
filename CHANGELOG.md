@@ -11,6 +11,13 @@ All notable changes to this project will be documented in this file.
 - Added deployment hard-deny prefixes through
   `ODOO_MCP_DENIED_METHOD_PREFIXES`; they precede native parity, exact and
   broad method modes, and all three approved-write stages.
+- `inspect_record_form` now returns the form's own `object`/`action` buttons
+  (header, button box, sheet) with exact method name, label, evaluated
+  visibility and condition, static context or context expression, confirm text
+  and `mcp_call`, which walks the `execute_method` gates (private, hard deny,
+  write aliases, transient exemption, review policy) so agents no longer guess
+  method names. Statically hidden buttons are only counted; the answer budget
+  never strips call-relevant button keys and caps omitted-button names.
 - Server instructions now name the public bank reconciliation command
   `nesa.auto.reconcile.engine.reconcile_bank_line` and state that private
   underscore methods are refused by Odoo for the web client and RPC alike.

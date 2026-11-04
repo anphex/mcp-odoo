@@ -232,12 +232,15 @@ SERVER_INSTRUCTIONS = (
     "plain reads.\n"
     "RECORD CHECK/CREATE/CHANGE: call inspect_record_form first — it returns "
     "the user's effective form (inherited and custom fields, in order) with "
-    "values, required/readonly and visibility. Do not judge a record complete "
+    "values, required/readonly and visibility, plus the form's buttons with "
+    "their exact method names. To press a button, take its name from "
+    "inspect_record_form buttons and call execute_method; never guess a "
+    "method name. Do not judge a record complete "
     "from an ad-hoc field list. Before a write compare the empty visible or "
     "conditional fields with your evidence; write only proven values, name "
     "the gaps, never guess; after the write read the changed fields back. "
     "Fallback if the tool is unavailable: execute_method get_view -> extract "
-    "the XML fields -> get_model_fields -> read_record.\n"
+    "the XML fields and buttons -> get_model_fields -> read_record.\n"
     "WRITE: validate_write -> execute_approved_write (preview_write is an "
     "optional dry run). execute_method runs business methods "
     "(action_confirm, action_done, ...); CRUD on persistent models is "
@@ -5048,6 +5051,37 @@ def _form_inspect_enforce_budget(response: Dict[str, Any], max_chars: int) -> No
             "(first 20 sections, first 100 distinct field names); the counts "
             "are complete."
         )
+    buttons = response.get("buttons") or []
+    if over() and buttons:
+        # Only descriptive keys go; everything a call depends on (name,
+        # mcp_call, context, context_expression, args, confirm, action
+        # reference) stays with the button or the button goes as a whole.
+        for entry in buttons:
+            for key in ("section_path", "inherited_conditions", "help"):
+                entry.pop(key, None)
+        meta["warnings"].append(
+            "Answer budget: buttons reduced (section_path, inherited_conditions "
+            "and help removed; call-relevant keys are complete)."
+        )
+    if over() and buttons:
+        # Warning first: its own size counts against the budget it explains.
+        meta["warnings"].append(
+            "Answer budget: trailing buttons omitted — count in "
+            "meta.omitted_buttons_count, at most the first "
+            f"{MAX_OMITTED_BUTTON_NAMES} names (fewer when long) in "
+            "meta.omitted_buttons. An "
+            "omitted button has no call details here: do not press it from "
+            "its name alone; read its attributes from the form arch "
+            "(execute_method get_view) first."
+        )
+        omitted_buttons: List[str] = []
+        while over() and buttons:
+            omitted_buttons.insert(0, buttons.pop()["name"])
+            meta["omitted_buttons"] = omitted_buttons[:MAX_OMITTED_BUTTON_NAMES]
+            meta["omitted_buttons_count"] = len(omitted_buttons)
+        # Long names can still exceed the budget: cut the list, keep the count.
+        while over() and meta.get("omitted_buttons"):
+            meta["omitted_buttons"].pop()
     if over():
         meta["warnings"].append(
             f"Answer budget of {max_chars} chars could not be met "
@@ -5068,6 +5102,165 @@ def _customer_visible_hint(metadata: Dict[str, Any]) -> Optional[str]:
     if isinstance(help_text, str) and help_text.startswith(CUSTOMER_VISIBLE_HELP_PREFIX):
         return help_text
     return None
+
+
+# Answers of _form_button_route.  Only "execute_method" means a call this
+# server will run; every other value names why it will not.
+BUTTON_ROUTE_EXECUTE = "execute_method"
+BUTTON_ROUTE_APPROVED_WRITE = "approved_write_chain"
+BUTTON_ROUTE_ACTION = "action"
+BUTTON_ROUTE_WRITE_ALIAS = "not_supported_write_alias"
+BUTTON_ROUTE_NOT_REVIEWED = "not_reviewed"
+BUTTON_ROUTE_HARD_DENY = "blocked_hard_deny"
+BUTTON_ROUTE_PRIVATE = "not_callable_private"
+BUTTON_ROUTE_INVALID = "not_callable_invalid_name"
+
+# An action button names either a numeric id (get_view resolves
+# ``%(module.xmlid)d``) or an XML id the web client loads as it is.
+_ACTION_XMLID_RE = re.compile(r"^[A-Za-z0-9_]+\.[A-Za-z0-9_.]+$")
+
+# Above this many buttons the names of omitted ones are cut as well.
+MAX_OMITTED_BUTTON_NAMES = 50
+
+
+def _form_button_route(
+    app_context: Optional[AppContext],
+    model: str,
+    button: "form_inspect.ButtonOccurrence",
+) -> str:
+    """How an agent presses this button through this server.
+
+    Walks the gates of execute_method in the same order (private, hard deny,
+    CRUD and write aliases with the transient exemption, review policy), so
+    the answer never promises a call that execute_method would refuse and
+    never sends an allowed call to a chain that cannot take it.
+    """
+    if button.button_type == "action":
+        return BUTTON_ROUTE_ACTION
+    name = button.name
+    if name.startswith("_"):
+        return BUTTON_ROUTE_PRIVATE
+    if not METHOD_NAME_RE.fullmatch(name):
+        return BUTTON_ROUTE_INVALID
+    if denied_method_prefix(model, name):
+        return BUTTON_ROUTE_HARD_DENY
+    if name in WRITE_EQUIVALENT_METHODS:
+        # validate_write takes create/write/unlink only, and translating an
+        # alias into a field write is not equivalent (wizards archive more
+        # than the record itself), so no route exists here.
+        return BUTTON_ROUTE_WRITE_ALIAS
+    if name in DESTRUCTIVE_METHODS:
+        if name in TRANSIENT_EXEMPT_METHODS and app_context is not None:
+            exempt, _profile = transient_write_is_exempt(
+                app_context, app_context.odoo, model, name,
+            )
+            extra_args = _button_extra_args(button)
+            if exempt and extra_args is not None:
+                # The click sends [[res_id], *args]; execute_method checks
+                # those values with the same relation gate.
+                relation_block = x2many_commands_are_inert(
+                    app_context, app_context.odoo, model, name,
+                    [[0], *extra_args], None,
+                )
+                if not relation_block:
+                    return BUTTON_ROUTE_EXECUTE
+        return BUTTON_ROUTE_APPROVED_WRITE
+    safety = classify_method_safety(name)
+    if (
+        safety["safety"] in {"side_effect", "unknown"}
+        and not native_acl_parity_enabled()
+        and not side_effect_method_allowed(model, name)
+        and not truthy_env("ODOO_MCP_ALLOW_UNKNOWN_METHODS")
+    ):
+        return BUTTON_ROUTE_NOT_REVIEWED
+    return BUTTON_ROUTE_EXECUTE
+
+
+def _button_extra_args(button: "form_inspect.ButtonOccurrence") -> Optional[List[Any]]:
+    """Positional arguments the web client appends to a button call.
+
+    Parsed like action_service.js does (single quotes become double quotes,
+    then JSON).  None when the attribute cannot be parsed, so the caller can
+    stay conservative.
+    """
+    raw = (button.attrs.get("args") or "").strip()
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw.replace("'", '"'))
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, list) else [parsed]
+
+
+def _button_statically_hidden(button: "form_inspect.ButtonOccurrence") -> bool:
+    """True when the web client drops the button before any evaluation.
+
+    Odoo's view compiler removes a node whose own ``invisible`` is a literal
+    true, or that sits under such a node, regardless of other conditions.
+    """
+    if button.ancestor_static_hidden:
+        return True
+    return form_inspect.static_modifier(button.attrs.get("invisible")) is True
+
+
+def _form_inspect_buttons(
+    app_context: Optional[AppContext],
+    model: str,
+    buttons: List["form_inspect.ButtonOccurrence"],
+    names: Optional[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], int]:
+    """Shape the form's object/action buttons for an agent.
+
+    A button that is statically invisible (``invisible="1"`` on itself or on
+    an ancestor) is not part of the user's form and is only counted.  Every
+    other button is returned with its evaluated visibility, so an agent sees
+    both what it may press now and why a button is hidden for this record.
+    """
+    entries: List[Dict[str, Any]] = []
+    static_hidden = 0
+    for button in buttons:
+        if _button_statically_hidden(button):
+            static_hidden += 1
+            continue
+        visibility, own_condition, inherited = form_inspect.occurrence_visibility(
+            button, names
+        )
+        entry: Dict[str, Any] = {
+            "name": button.name,
+            "type": button.button_type,
+            "label": button.label,
+            "visibility": visibility,
+            "section_path": " / ".join(button.section_path),
+            "mcp_call": _form_button_route(app_context, model, button),
+        }
+        if own_condition:
+            entry["visibility_condition"] = own_condition
+        if inherited:
+            entry["inherited_conditions"] = inherited
+        if button.button_type == "action":
+            if button.name.isdigit():
+                entry["action_id"] = int(button.name)
+            elif _ACTION_XMLID_RE.fullmatch(button.name):
+                entry["action_xmlid"] = button.name
+        raw_context = button.attrs.get("context")
+        if raw_context:
+            literal = form_inspect.static_context(raw_context)
+            if literal is not None:
+                entry["context"] = literal
+                removed = sorted(set(literal) & AUDIT_SUPPRESSION_CONTEXT_KEYS)
+                if removed:
+                    # execute_method strips these keys, so the call differs
+                    # from the click in its chatter tracking.
+                    entry["context_keys_removed_by_server"] = removed
+            else:
+                entry["context_expression"] = raw_context
+        for attribute in ("confirm", "help", "args"):
+            value = (button.attrs.get(attribute) or "").strip()
+            if value:
+                entry[attribute] = value
+        entries.append(entry)
+    return entries, static_hidden
 
 
 @mcp.tool(
@@ -5093,7 +5286,23 @@ def _customer_visible_hint(metadata: Dict[str, Any]) -> Optional[str]:
         "meta.truncated=true with a concrete entry in meta.warnings. The default "
         "form is resolved like Odoo does without an action; pass view_id or "
         "context.form_view_ref for an action-specific form. Datetimes are naive "
-        "UTC. Read-only."
+        "UTC. buttons lists the form's own buttons (header, button box, sheet) "
+        "with the exact method name, label and visibility for this record: "
+        "mcp_call 'execute_method' means execute_method(model, name, "
+        "args=[[record_id]]) with context as kwargs {\"context\": ...} when "
+        "given (context_expression is evaluated by the web client against the "
+        "record: build that dict from the record's values); "
+        "'approved_write_chain' means validate_write -> execute_approved_write; "
+        "'action' is an ir.actions reference (action_id or action_xmlid) the "
+        "web client opens; 'not_reviewed' means this deployment has not "
+        "reviewed the method (list_allowed_methods); "
+        "'not_supported_write_alias', 'blocked_hard_deny', "
+        "'not_callable_private' and 'not_callable_invalid_name' cannot be "
+        "pressed here — tell the user to press it in the UI. Never guess a "
+        "button's method name — take it from buttons. A hidden button is not "
+        "pressable in the UI for this record either; the method usually "
+        "refuses with the same rule. A button with confirm asks the user in "
+        "the UI: get the user's explicit OK first. Read-only."
     ),
     annotations=READ_ONLY_TOOL,
     structured_output=True,
@@ -5157,7 +5366,10 @@ def inspect_record_form(
         view_name: Optional[str] = None
         # Parsed before anything else: the arch root is the view-type check
         # that works for every user (ir.ui.view is readable by admins only).
-        occurrences, form_attributes = form_inspect.parse_form_arch(view["arch"])
+        button_occurrences: List[form_inspect.ButtonOccurrence] = []
+        occurrences, form_attributes = form_inspect.parse_form_arch(
+            view["arch"], buttons=button_occurrences
+        )
         if resolved_view_id:
             try:
                 view_rows = call_with_transport_retry(
@@ -5210,7 +5422,9 @@ def inspect_record_form(
                     "form of another model."
                 )
         modifier_names = [
-            name for name in form_inspect.referenced_names(occurrences)
+            name for name in form_inspect.referenced_names(
+                [*occurrences, *button_occurrences]
+            )
             if name in all_metadata
         ]
         readable = [n for n in view_field_names if n in all_metadata]
@@ -5474,7 +5688,17 @@ def inspect_record_form(
             meta["form_attributes"] = interesting
         if not include_empty:
             meta["omitted_empty_fields"] = omitted_empty
-        response: Dict[str, Any] = {"success": True, "meta": meta, "sections": sections}
+        buttons, static_hidden_buttons = _form_inspect_buttons(
+            app_context, model, button_occurrences, evaluation_names
+        )
+        meta["button_count"] = len(buttons)
+        if static_hidden_buttons:
+            meta["static_hidden_buttons_skipped"] = static_hidden_buttons
+        # Buttons before sections: they are short and name the exact method an
+        # agent must call, so a client that clips the tail still gets them.
+        response: Dict[str, Any] = {
+            "success": True, "meta": meta, "buttons": buttons, "sections": sections,
+        }
         _form_inspect_enforce_budget(response, form_inspect_max_chars())
         return response
     except FormRecordNotFound as e:

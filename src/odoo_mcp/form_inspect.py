@@ -277,6 +277,55 @@ class Occurrence:
     total: int = 1
 
 
+# Button types an agent can act on.  ``special`` buttons (save/discard) and
+# buttons without a type only drive the web client.
+BUTTON_TYPES = ("object", "action")
+
+
+@dataclass
+class ButtonOccurrence:
+    """A form button of the inspected model (header, button box, sheet).
+
+    Buttons inside an x2many sub-view belong to the comodel and are never
+    collected, exactly like the sub-view's fields.
+    """
+
+    name: str
+    button_type: str
+    label: Optional[str]
+    section_path: List[str]
+    attrs: Dict[str, str]
+    ancestor_static_hidden: bool
+    ancestor_conditions: List[Condition]
+
+
+def _button_label(node: ET.Element) -> Optional[str]:
+    """What the user reads on the button: string, title, text or stat label."""
+    for key in ("string", "title"):
+        label = (node.get(key) or "").strip()
+        if label:
+            return label
+    text = " ".join(part.strip() for part in node.itertext() if part.strip())
+    if text:
+        return text
+    for inner in node.iter("field"):
+        label = (inner.get("string") or "").strip()
+        if label:
+            return label
+    return None
+
+
+def static_context(expression: Optional[str]) -> Optional[Dict[str, Any]]:
+    """The button context as a dict when it is a pure literal, else None."""
+    if not expression or len(expression) > MAX_EXPRESSION_CHARS:
+        return None
+    try:
+        value = ast.literal_eval(expression.strip())
+    except (*_PARSE_ERRORS, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def _section_token(node: ET.Element) -> Optional[str]:
     tag = node.tag
     label = (node.get("string") or "").strip()
@@ -317,12 +366,16 @@ def _subview_columns(list_node: ET.Element) -> List[Dict[str, Any]]:
     return columns
 
 
-def parse_form_arch(arch: str) -> Tuple[List[Occurrence], Dict[str, str]]:
+def parse_form_arch(
+    arch: str, buttons: Optional[List[ButtonOccurrence]] = None
+) -> Tuple[List[Occurrence], Dict[str, str]]:
     """Walk a combined form arch in document order.
 
     Returns the field occurrences (fields embedded in x2many sub-views are
     *not* occurrences of the parent model; their list columns are attached to
-    the x2many occurrence instead) and the root <form> attributes.
+    the x2many occurrence instead) and the root <form> attributes.  When a
+    ``buttons`` list is passed, the form's own object/action buttons are
+    appended to it in document order.
     """
     root = ET.fromstring(arch.encode("utf-8") if isinstance(arch, str) else arch)
     if root.tag != "form":
@@ -364,6 +417,22 @@ def parse_form_arch(arch: str) -> Tuple[List[Occurrence], Dict[str, str]]:
                             occurrence.subview_columns = _subview_columns(sub)
                 occurrences.append(occurrence)
                 continue
+            if (
+                child.tag == "button"
+                and buttons is not None
+                and child.get("type") in BUTTON_TYPES
+                and (child.get("name") or "").strip()
+                and not child.get("special")
+            ):
+                buttons.append(ButtonOccurrence(
+                    name=child.get("name").strip(),
+                    button_type=child.get("type"),
+                    label=_button_label(child),
+                    section_path=child_path,
+                    attrs=dict(child.attrib),
+                    ancestor_static_hidden=static_hidden,
+                    ancestor_conditions=list(conditions),
+                ))
             token = _section_token(child)
             next_path = child_path + [token] if token else child_path
             next_hidden = static_hidden
@@ -394,8 +463,10 @@ def parse_form_arch(arch: str) -> Tuple[List[Occurrence], Dict[str, str]]:
     return occurrences, dict(root.attrib)
 
 
-def referenced_names(occurrences: Iterable[Occurrence]) -> List[str]:
-    """Every name any modifier on or above a field occurrence reads."""
+def referenced_names(
+    occurrences: Iterable["Occurrence | ButtonOccurrence"],
+) -> List[str]:
+    """Every name any modifier on or above a field or button occurrence reads."""
     names: List[str] = []
     for occurrence in occurrences:
         expressions = [
@@ -412,7 +483,7 @@ def referenced_names(occurrences: Iterable[Occurrence]) -> List[str]:
 
 
 def occurrence_visibility(
-    occurrence: Occurrence, names: Optional[Dict[str, Any]]
+    occurrence: "Occurrence | ButtonOccurrence", names: Optional[Dict[str, Any]]
 ) -> Tuple[str, Optional[str], List[Dict[str, str]]]:
     """Combine the field's own and its ancestors' ``invisible`` modifiers.
 
