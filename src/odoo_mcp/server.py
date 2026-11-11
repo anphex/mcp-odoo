@@ -47,7 +47,7 @@ from .diagnostics import (
     sanitize_odoo_error,
     upgrade_risk_report as build_upgrade_risk_report,
 )
-from . import form_inspect
+from . import document_search, form_inspect
 from ._nesa_file_intake import FileIntakeError, fetch_allowlisted_url
 from .odoo_client import (
     FIELD_METADATA_RPC_ATTRIBUTES,
@@ -220,6 +220,36 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     yield AppContext()
 
 
+# The client cuts the server instructions after this many characters (measured
+# 2026-11-11 on the Claude connector: 4,694 characters were sent, the agent
+# saw 4,096 and lost the supplier rule at the end).  Guidance that only
+# matters for one tool therefore lives in that tool's description, which
+# arrives uncut; tests/test_server.py holds the instructions under the limit.
+SERVER_INSTRUCTIONS_MAX_CHARS = 4096
+
+# Moved verbatim out of SERVER_INSTRUCTIONS into the execute_method
+# description (Constantin 2026-11-11): it is needed exactly when that tool is
+# called, and at 1,200 characters it pushed later sections past the cut.
+BANK_RECONCILIATION_GUIDE = (
+    "BANK RECONCILIATION: bank.rec.widget has no table and keeps its state in "
+    "the client, so it can only be driven through many stateful onchange calls "
+    "that resend the whole state. Do not use it for this. To reconcile one bank "
+    "statement line use execute_method with model=\"nesa.auto.reconcile.engine\", "
+    "method=\"reconcile_bank_line\", args=[statement_line_id, invoice_ids, "
+    "rest_lines], kwargs={\"preview\": true}; invoice_ids is a flat list of "
+    "account.move ids and rest_lines a list of {\"account_id\", \"amount\", "
+    "\"label\"}, e.g. args=[9856, [11055], [{\"account_id\": 777, \"amount\": "
+    "15.0, \"label\": \"Mahnkosten\"}]]. Check status and problems in the "
+    "answer, repeat with {\"preview\": false} to book, then read the statement "
+    "line and the invoices back. To the cent, the sum of the rest amounts must "
+    "equal the bank amount minus the signed amount_residual of the open items: "
+    "a customer invoice open at +100 paid with +105 needs +5, a supplier invoice "
+    "open at -100 paid with -95 also needs +5. Rest lines carry no tax, and "
+    "their account_id comes only from the user's explicit instruction, never "
+    "from a guess. Partial payments, foreign currency and taxed rest lines stay "
+    "in the reconciliation screen: say so instead of working around it."
+)
+
 # Create MCP server
 SERVER_INSTRUCTIONS = (
     "Odoo 18 ERP of NESA Haustechnik, per-user: every call runs with the "
@@ -230,6 +260,12 @@ SERVER_INSTRUCTIONS = (
     "get_model_fields before guessing a field "
     "name; list_models to find a model. Never use execute_method for "
     "plain reads.\n"
+    "DOCUMENTS: find files with search_documents and never with one generic "
+    "word: over 100,000 files carry full text, so a lone brand or customer "
+    "name returns hundreds of hits. Pass 2-4 keywords that together identify "
+    "the document, e.g. [\"Tesla\", \"Zulassung\"]; all must match. Pick the "
+    "file from the returned snippets, then get_document_text or "
+    "read_attachment.\n"
     "RECORD CHECK/CREATE/CHANGE: call inspect_record_form first — it returns "
     "the user's effective form (inherited and custom fields, in order) with "
     "values, required/readonly and visibility, plus the form's buttons with "
@@ -263,23 +299,9 @@ SERVER_INSTRUCTIONS = (
     "invoice payment reference is payment_reference. Legacy work "
     "reports are searched as 'TGZ-<nr>' in the task name, never as a bare "
     "number.\n"
-    "BANK RECONCILIATION: bank.rec.widget has no table and keeps its state in "
-    "the client, so it can only be driven through many stateful onchange calls "
-    "that resend the whole state. Do not use it for this. To reconcile one bank "
-    "statement line use execute_method with model=\"nesa.auto.reconcile.engine\", "
-    "method=\"reconcile_bank_line\", args=[statement_line_id, invoice_ids, "
-    "rest_lines], kwargs={\"preview\": true}; invoice_ids is a flat list of "
-    "account.move ids and rest_lines a list of {\"account_id\", \"amount\", "
-    "\"label\"}, e.g. args=[9856, [11055], [{\"account_id\": 777, \"amount\": "
-    "15.0, \"label\": \"Mahnkosten\"}]]. Check status and problems in the "
-    "answer, repeat with {\"preview\": false} to book, then read the statement "
-    "line and the invoices back. To the cent, the sum of the rest amounts must "
-    "equal the bank amount minus the signed amount_residual of the open items: "
-    "a customer invoice open at +100 paid with +105 needs +5, a supplier invoice "
-    "open at -100 paid with -95 also needs +5. Rest lines carry no tax, and "
-    "their account_id comes only from the user's explicit instruction, never "
-    "from a guess. Partial payments, foreign currency and taxed rest lines stay "
-    "in the reconciliation screen: say so instead of working around it.\n"
+    "BANK RECONCILIATION: do not drive bank.rec.widget; reconcile a bank "
+    "statement line with nesa.auto.reconcile.engine reconcile_bank_line, "
+    "exactly as the execute_method tool description says.\n"
     "PRIVATE METHODS: Odoo refuses direct calls to every method starting with "
     "'_' for the web client and for RPC alike, so execute_method cannot reach "
     "them. Do not search for a workaround. If no public method covers the task, "
@@ -1119,7 +1141,7 @@ def classify_call_error(exc: BaseException) -> Dict[str, Any]:
 
     text = str(exc)
     lowered = text.casefold()
-    if isinstance(exc, SearchInputError):
+    if isinstance(exc, (SearchInputError, document_search.DocumentSearchInputError)):
         # Input values may themselves contain words such as "timeout".
         # A diagnosed schema error is never a transient transport failure.
         return {"error_type": "request", "retryable": False, "detail": {"message": text}}
@@ -1309,6 +1331,9 @@ def error_response(tool: str, exc: BaseException, **extra: Any) -> Dict[str, Any
         }
         if isinstance(exc, SearchInputError):
             response["error_details"].update(exc.details)
+    if isinstance(exc, document_search.DocumentSearchInputError):
+        response["reason_code"] = exc.details["reason_code"]
+        response["error_details"] = dict(exc.details)
     response.update(extra)
     return response
 
@@ -3907,7 +3932,8 @@ def is_unmarshallable_response_fault(exc: BaseException) -> bool:
         "reads (use search_records/read_records/aggregate_records) and not "
         "for create/write/unlink on persistent models (use validate_write -> "
         "execute_approved_write). Reads that still arrive here are capped at "
-        "100 rows and exclude binary fields unless named."
+        "100 rows and exclude binary fields unless named.\n"
+        + BANK_RECONCILIATION_GUIDE
     ),
     annotations=DESTRUCTIVE_TOOL,
     structured_output=True,
@@ -4399,6 +4425,28 @@ def get_model_fields(
         return error_response("get_model_fields", e, model=model)
 
 
+ATTACHMENT_TEXT_SEARCH_HINT = (
+    "This is a text search on attachments. search_documents does it in one "
+    "call: several keywords AND-combined over file name and text, identical "
+    "files merged, file-name matches first, a text snippet per hit."
+)
+
+_TEXT_MATCH_OPERATORS = frozenset({"ilike", "like", "=ilike", "=like"})
+
+
+def _is_attachment_text_search(domain: List[Any]) -> bool:
+    """True when a domain text-matches the name or indexed text of a file."""
+    for leaf in domain:
+        if (
+            isinstance(leaf, (list, tuple))
+            and len(leaf) == 3
+            and leaf[0] in ("name", "index_content")
+            and leaf[1] in _TEXT_MATCH_OPERATORS
+        ):
+            return True
+    return False
+
+
 @mcp.tool(
     description=(
         "Search Odoo records with read-only search_read. Returns the page in "
@@ -4411,6 +4459,13 @@ def get_model_fields(
         "records. For known IDs use read_record (one) or read_records (several). "
         "Use next_offset only for the next page of the same search; start a "
         "different search when the model, domain or ordering needs to change. "
+        "Text search: 'ilike' matches its value as ONE contiguous pattern "
+        "('%' and '_' in it are wildcards), so \"Tesla Zulassung\" only finds "
+        "that exact phrase — use one triple per "
+        "word to require several words. A total_count far above what you can "
+        "read means the domain is too broad: add a condition instead of "
+        "paging. To find files by name or content use search_documents, not "
+        "ilike on ir.attachment. "
         "Execution failures include error_details with reason_code, message, "
         "invalid_parameter (null if undiagnosed), retryable, and, for local "
         "input errors, expected_schema and an optional domain_item_index. "
@@ -4540,6 +4595,8 @@ def search_records(
         for key in ("excluded_binary_fields", "expanded_wildcard", "warning"):
             if key in field_notes:
                 response[key] = field_notes[key]
+        if model == "ir.attachment" and _is_attachment_text_search(normalized_domain):
+            response["hint"] = ATTACHMENT_TEXT_SEARCH_HINT
         return response
     except Exception as e:
         return error_response("search_records", e, model=model)
@@ -6353,12 +6410,339 @@ def _doc_helper_missing_response(tool: str, exc: BaseException) -> Optional[Dict
     }
 
 
+SEARCH_DOCUMENTS_DESCRIPTION = (
+    "Find files (PDF scans, letters, invoices, certificates, OCR'd photos) by "
+    "keywords in the file name and the indexed text of every attachment the "
+    "user may read. Well over 100,000 files carry several thousand characters "
+    "of text each, so ONE generic word (a brand, a customer, 'Rechnung') "
+    "returns hundreds of hits and wastes the search. Pass 2-4 keywords that "
+    "together identify the one document: subject + document type + sender, "
+    "year or reference number, e.g. [\"Tesla\", \"Zulassung\"] or "
+    "[\"Vaillant\", \"Rechnung\", \"2025-03\"]. ALL keywords must occur (AND). "
+    "Each is a case-insensitive substring, so the stem 'Zulassung' also finds "
+    "'Zulassungsbescheinigung' and 'Fahrzeugzulassung'; prefer stems over "
+    "inflected forms. A keyword containing a space is one literal phrase, and "
+    "file names have no spaces ('Bescheid_GY121272_TeslaModel3_"
+    "Zulassungsbescheinigung_2023-07-13'), so pass words separately. Dates "
+    "appear in file names as YYYY-MM-DD: a year or 'YYYY-MM' works as a "
+    "keyword. Results are ranked (most keywords in the file name first, then "
+    "newest), identical files attached to several records are merged into one "
+    "hit (copies, also_attached_to), and each hit carries text snippets around "
+    "the matches — usually enough to pick the file without opening any. Too "
+    "many hits (hint): add a keyword, do not page. No hits: keyword_counts "
+    "shows which keyword alone has no match. Afterwards: get_document_text "
+    "for the full text, read_attachment to look at a scan or photo, "
+    "create_attachment_download for the original file. To list the files of "
+    "one known record, use search_records on ir.attachment with res_model and "
+    "res_id instead."
+)
+
+
+def _keyword_counts(
+    odoo: OdooClient, keywords: List[str], scope: str, filters: List[Any],
+) -> Dict[str, Optional[int]]:
+    """How many attachments match each keyword on its own (same filters).
+
+    Only asked after an empty result, so the agent learns which keyword killed
+    the search instead of probing them one by one.  A failed count is ``None``:
+    the diagnosis is a convenience and never fails the search.
+    """
+    counts: Dict[str, Optional[int]] = {}
+    for keyword in keywords:
+        domain = document_search.build_domain([keyword], scope, filters)
+        try:
+            counted = call_with_transport_retry(
+                lambda domain=domain: odoo.execute_method(
+                    "ir.attachment", "search_count", domain,
+                ),
+                label="search_count(ir.attachment)",
+            )
+        except Exception as exc:  # noqa: BLE001 — diagnosis only
+            logger.warning(
+                "[search_documents] keyword count failed: %s",
+                compact_error_message(exc)[0],
+            )
+            counted = None
+        counts[keyword] = (
+            counted if isinstance(counted, int) and not isinstance(counted, bool) else None
+        )
+    return counts
+
+
+@mcp.tool(
+    description=SEARCH_DOCUMENTS_DESCRIPTION,
+    annotations=READ_ONLY_TOOL,
+    structured_output=True,
+)
+def search_documents(
+    ctx: Context,
+    keywords: Annotated[
+        Union[List[str], str],
+        Field(
+            description=(
+                "1-6 keywords that must ALL occur, e.g. [\"Tesla\", "
+                "\"Zulassung\"]; give at least two unless the single term is "
+                "unique (a reference or invoice number). Each at least 2 "
+                "characters, matched as a literal substring of the file name "
+                "or the text. A bare string is split at spaces."
+            )
+        ),
+    ],
+    search_in: Annotated[
+        str,
+        Field(
+            description=(
+                "'name_and_text' (default): a keyword may be in the file name "
+                "or the text. 'name': file names only (fast, precise for "
+                "archived documents with descriptive names). 'text': indexed "
+                "text only."
+            )
+        ),
+    ] = document_search.SCOPE_NAME_AND_TEXT,
+    res_model: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Only files attached to this model, e.g. 'account.move', "
+                "'sale.order', 'project.task', 'documents.document' (the "
+                "Documents app archive)."
+            )
+        ),
+    ] = None,
+    res_id: Annotated[
+        Optional[int],
+        Field(description="Only files of this record; needs res_model.", ge=1),
+    ] = None,
+    mimetype: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "'pdf', 'image', an exact MIME type ('application/pdf') or a "
+                "prefix ending in '/' ('image/')."
+            )
+        ),
+    ] = None,
+    created_from: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Uploaded on or after this day, 'YYYY-MM-DD'. This is the "
+                "upload date, NOT the document date: many files were imported "
+                "long after they were written. For the document date use a "
+                "year or 'YYYY-MM' keyword."
+            )
+        ),
+    ] = None,
+    created_to: Annotated[
+        Optional[str],
+        Field(description="Uploaded on or before this day, 'YYYY-MM-DD' (upload date)."),
+    ] = None,
+    limit: Annotated[
+        int,
+        Field(
+            description=(
+                f"Hits per page, 1-{document_search.PAGE_MAX} (capped). The "
+                "best matches come first, so the default is usually enough."
+            ),
+            ge=1,
+        ),
+    ] = document_search.PAGE_DEFAULT,
+    offset: Annotated[
+        int,
+        Field(description="Ranked hits to skip; use next_offset from the previous page.", ge=0),
+    ] = 0,
+    snippet_chars: Annotated[
+        int,
+        Field(
+            description=(
+                "Characters of context per snippet, "
+                f"{document_search.SNIPPET_CHARS_MIN}-{document_search.SNIPPET_CHARS_MAX}."
+            ),
+        ),
+    ] = document_search.SNIPPET_CHARS_DEFAULT,
+) -> Dict[str, Any]:
+    """Keyword search over ``ir.attachment`` with ranking, dedup and snippets.
+
+    NESA Patch 10.  Read RPCs only (one metadata window, an optional
+    ``search_count``, then ``index_content`` one file at a time for the hits
+    of the page, capped by ``SNIPPET_TEXT_BUDGET_CHARS``), all with the
+    acting user's rights: ``ir.attachment._search`` filters by access to the
+    record a file is attached to, so nothing is found here that the user
+    could not open in Odoo.  The full text never leaves the bridge — only
+    snippets do; ``get_document_text`` stays the bounded way to read on.
+    """
+    try:
+        terms = document_search.normalize_keywords(keywords)
+        scope = document_search.normalize_scope(search_in)
+        limit = clamp_limit(limit, document_search.PAGE_MAX)
+        if offset < 0:
+            raise ValueError("offset must be greater than or equal to 0")
+        snippet_chars = document_search.clamp_snippet_chars(snippet_chars)
+        if res_model is not None:
+            validate_model_name(res_model)
+        if res_id is not None and not res_model:
+            raise document_search.DocumentSearchInputError(
+                "res_id needs res_model: a record id only means something "
+                "together with its model.",
+                reason_code="res_id_without_model", invalid_parameter="res_id",
+            )
+        filters = document_search.filter_conditions(
+            res_model=res_model,
+            res_id=res_id,
+            mimetype=document_search.normalize_mimetype(mimetype),
+            created_from=document_search.normalize_date(created_from, "created_from"),
+            created_to=document_search.normalize_date(created_to, "created_to"),
+        )
+        domain = document_search.build_domain(terms, scope, filters)
+        window = document_search.CANDIDATE_WINDOW
+        # Resolved only now: the client is created lazily, and a bad input
+        # must be answered as such even while Odoo is unreachable.
+        odoo = ctx.request_context.lifespan_context.odoo
+        rows = call_with_transport_retry(
+            lambda: odoo.search_read(
+                model_name="ir.attachment",
+                domain=domain,
+                fields=document_search.CANDIDATE_FIELDS,
+                offset=0,
+                limit=window,
+                order=DEFAULT_SEARCH_ORDER,
+            ),
+            label="search_read(ir.attachment)",
+        )
+        rows = rows if isinstance(rows, list) else []
+        window_full = len(rows) >= window
+        total_count: Optional[int] = len(rows)
+        count_error: Optional[str] = None
+        if window_full:
+            # The window is only the newest slice; ask for the real size so
+            # the agent sees how far off a broad search is.
+            total_count = None
+            try:
+                counted = call_with_transport_retry(
+                    lambda: odoo.execute_method("ir.attachment", "search_count", domain),
+                    label="search_count(ir.attachment)",
+                )
+                if isinstance(counted, int) and not isinstance(counted, bool):
+                    total_count = counted
+            except Exception as count_exc:  # noqa: BLE001 — the page is still valid
+                count_error, count_traceback = compact_error_message(count_exc)
+                count_error = count_error or type(count_exc).__name__
+                logger.warning(
+                    "[search_documents] search_count failed: %s\n%s",
+                    count_error, count_traceback or "",
+                )
+        # Unknown total with a full window is treated as "more exist".
+        window_truncated = window_full and (total_count is None or total_count > len(rows))
+
+        groups = document_search.group_and_rank(rows, terms)
+        page = groups[offset : offset + limit]
+
+        # Snippets: Odoo cannot cut a substring over RPC, so each one costs
+        # the whole text of its file.  Read one file at a time, best hit
+        # first, and stop at the budget — never a page of full texts at once.
+        result: List[Dict[str, Any]] = []
+        snippet_error: Optional[str] = None
+        text_budget = document_search.SNIPPET_TEXT_BUDGET_CHARS
+        for group in page:
+            row = group["row"]
+            attachment_id = row["id"]
+            text: Any = None
+            text_available = False
+            skipped: Optional[str] = None
+            if scope == document_search.SCOPE_NAME or snippet_error is not None:
+                pass
+            elif not document_search.snippet_source_allowed(row):
+                skipped = document_search.SNIPPET_SKIPPED_LARGE
+            elif text_budget <= 0:
+                skipped = document_search.SNIPPET_SKIPPED_BUDGET
+            else:
+                try:
+                    text_rows = call_with_transport_retry(
+                        lambda attachment_id=attachment_id: odoo.read_records(
+                            "ir.attachment", [attachment_id], fields=["index_content"],
+                        ),
+                        label="read(ir.attachment.index_content)",
+                    )
+                    if text_rows and isinstance(text_rows[0], dict):
+                        content = text_rows[0].get("index_content") or ""
+                        text = content if isinstance(content, str) else str(content)
+                        text_available = True
+                        text_budget -= len(text)
+                except Exception as text_exc:  # noqa: BLE001 — hits stay usable
+                    # One failure ends the snippet reads of this answer: the
+                    # cause (access, transport) will not differ for the rest.
+                    snippet_error, text_traceback = compact_error_message(text_exc)
+                    # An exception without text (TimeoutError()) must still
+                    # stop the reads and show up in the answer.
+                    snippet_error = snippet_error or type(text_exc).__name__
+                    logger.warning(
+                        "[search_documents] snippet read failed: %s\n%s",
+                        snippet_error, text_traceback or "",
+                    )
+            hit = document_search.build_hit(
+                group, terms, text=text, text_available=text_available,
+                snippet_chars=snippet_chars,
+            )
+            if skipped:
+                hit["snippet_skipped"] = skipped
+            result.append(hit)
+
+        unique_count = len(groups)
+        has_more = (offset + len(page)) < unique_count
+        response: Dict[str, Any] = {
+            "success": True,
+            "tool": "search_documents",
+            "keywords": terms,
+            "search_in": scope,
+            "count": len(result),
+            "unique_count": unique_count,
+            "total_count": total_count,
+            "offset": offset,
+            "limit": limit,
+            "has_more": has_more,
+            "next_offset": (offset + len(page)) if has_more else None,
+            "ranking": "keywords_in_name desc, id desc",
+            "result": result,
+        }
+        if window_truncated:
+            response["window_truncated"] = True
+            response["window"] = window
+        if count_error is not None:
+            response["total_count_error"] = count_error
+        if snippet_error is not None:
+            response["snippet_error"] = snippet_error
+        if not groups:
+            if len(terms) > 1:
+                response["keyword_counts"] = _keyword_counts(odoo, terms, scope, filters)
+            response["hint"] = document_search.empty_result_hint(
+                terms, response.get("keyword_counts"), bool(filters), scope,
+            )
+        else:
+            # Copies of one file are not breadth: 120 attachments of the same
+            # scan are a single document to read.
+            if window_truncated:
+                match_count = total_count if total_count is not None else len(rows)
+            else:
+                match_count = unique_count
+            hint = document_search.broad_result_hint(
+                match_count, terms, window_truncated,
+            )
+            if hint:
+                response["hint"] = hint
+        return response
+    except Exception as e:
+        return error_response("search_documents", e)
+
+
 @mcp.tool(
     description=(
-        "Read the indexed text (OCR/PDF text layer) of an attachment in bounded "
-        "windows. Use this after finding candidates via "
-        "search_records('ir.attachment', [['index_content','ilike',...]]) — "
-        "never pull index_content through a plain field read, it is unbounded."
+        "Read the indexed text (OCR/PDF text layer) of ONE attachment in "
+        "bounded windows, by the attachment_id from search_documents (whose "
+        "snippets often answer the question already). total_chars tells how "
+        "long the text is; page with next_offset only if the first window did "
+        "not contain what you need. Never pull index_content through a plain "
+        "field read, it is unbounded. Empty text means the file was never "
+        "OCR'd: look at it with read_attachment."
     ),
     annotations=READ_ONLY_TOOL,
     structured_output=True,
@@ -6443,9 +6827,13 @@ def get_document_text(
 
 @mcp.tool(
     description=(
-        "Look at an attachment: images come back as an actual image (downscaled "
-        "server-side), PDFs and text files as extracted text. Use "
-        "create_attachment_download when the untouched original file is needed."
+        "Look at ONE attachment: images come back as an actual image (downscaled "
+        "server-side), PDFs and text files as extracted text (no page image). "
+        "The answer names the record it is attached to. For the text of a file "
+        "found with search_documents prefer its snippets or get_document_text; "
+        "use this for photos and scanned images. Use "
+        "create_attachment_download when the untouched original file is needed, "
+        "e.g. to render a PDF page."
     ),
     annotations=READ_ONLY_TOOL,
     structured_output=False,

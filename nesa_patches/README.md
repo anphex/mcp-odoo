@@ -288,6 +288,40 @@ WARNING („use a Markup object instead“); das ist erwartet.
 |---|---|
 | `server.py _chatter_body_is_html`, `_build_chatter_payload`, Tool-Beschreibung `chatter_post` | `tests/test_server.py` `test_chatter_post_sends_html_body_unescaped`, `test_chatter_post_leaves_plain_text_to_odoo_escaping`, `test_chatter_body_html_detection*` |
 
+## Patch 10 — Dokumentsuche mit Suchbegriffen (2026-11-11)
+
+Anlass: Ein Agent suchte Anhänge mit dem Einzelwort „Tesla“ und bekam 149
+Treffer, fast nur Abrechnungen und Geschäftsbriefe. Messung Staging: rund
+122.000 Anhänge tragen echten Volltext (im Schnitt 3.100 Zeichen), ein
+`ilike` darüber dauert etwa 0,5 s. Teuer ist also nie die Abfrage, sondern
+das Durchlesen: „Tesla“ trifft 227 Dateien, „Tesla“ UND „Zulassung“ 21.
+
+| Teil | Verhalten | Wo |
+|---|---|---|
+| Tool | `search_documents(keywords, search_in, res_model, res_id, mimetype, created_from, created_to, limit, offset, snippet_chars)`. 1–6 Suchbegriffe, alle müssen vorkommen, jeder als Teilstring in Dateiname oder Volltext (`search_in`: `name_and_text`, `name`, `text`). Ein bloßer String wird an Leerzeichen geteilt; ein Listenelement mit Leerzeichen bleibt eine wörtliche Phrase. `%`, `_` und `\` werden maskiert, ein Begriff trifft also wörtlich. | `server.py search_documents`, `document_search.py normalize_keywords`, `build_domain`, `escape_like` |
+| Rechte | Nur Lese-RPCs auf `ir.attachment` mit dem Konto des Nutzers. `ir.attachment._search` filtert nach Zugriff auf den Datensatz, an dem die Datei hängt; die Domain nennt weder `id` noch `res_field`, Odoo ergänzt also selbst `res_field = False` (keine Avatare, Produktbilder). | `document_search.build_domain` |
+| Rangfolge | Bis zu 300 Treffer (neueste zuerst) werden als Metadaten geholt, gleiche Dateien (gleiche `checksum`) zu einem Treffer zusammengefasst (`copies`, `also_attached_to`, höchstens 5 genannt) und sortiert: mehr Suchbegriffe im Dateinamen zuerst, dann neueste. `offset`/`limit` (höchstens 25) blättern über diese Liste. | `document_search.group_and_rank`, `CANDIDATE_WINDOW`, `PAGE_MAX` |
+| Ausschnitte | Für die Treffer der Seite wird `index_content` gelesen und je Suchbegriff ein Fenster um die erste Fundstelle geschnitten (`snippet_chars` 40–400, Standard 160, höchstens 3 je Treffer, überlappende zusammengelegt). Der Volltext verlässt den Fork nicht. Odoo kann per RPC keinen Teilstring liefern, ein Ausschnitt kostet also den ganzen Text der Datei. Zwei Grenzen: (1) textartige Dateien (`text/*`, XML, JSON, CSV) über 300 kB werden nicht geladen, weil dort die Dateigröße die Textgröße ist; bei PDFs und Bildern sagt die Dateigröße nichts. (2) Die Texte werden einzeln gelesen, bester Treffer zuerst, bis 1.000.000 Zeichen je Suche übertragen sind; die übrigen Treffer kommen ohne Ausschnitt (`snippet_skipped`). Schlimmster Fall: Budget plus ein übergroßer Text, wie beim Einzelabruf über `get_document_text`. Ein fehlgeschlagener Textabruf beendet die Ausschnitte dieser Antwort (`snippet_error`), die Treffer bleiben. | `document_search.extract_snippets`, `snippet_source_allowed`, `SNIPPET_TEXT_BUDGET_CHARS`; `server.py search_documents` |
+| Zu breit | Ab 25 verschiedenen Dateien oder wenn das 300er-Fenster nicht reicht (`window_truncated`, `total_count` aus `search_count`): `hint` „Begriff ergänzen, nicht blättern“. Viele Kopien derselben Datei zählen nicht als breit. | `document_search.broad_result_hint` |
+| Kein Treffer | Bei mehreren Begriffen zählt der Fork je Begriff einzeln nach (`keyword_counts`) und nennt im `hint` den Begriff ohne Treffer. Schlägt eine Zählung fehl, steht dort `null`. | `server.py _keyword_counts`, `document_search.empty_result_hint` |
+| Fehler | Eingabefehler vor dem ersten RPC mit `reason_code` (`keywords_missing`, `keyword_too_short`, `keyword_too_long`, `too_many_keywords`, `invalid_keywords`, `invalid_search_in`, `res_id_without_model`, `invalid_mimetype`, `invalid_date`) und `error_details`. | `document_search.DocumentSearchInputError`, `server.py error_response` |
+| Wegweiser | `search_records` erklärt, dass `ilike` den Wert als EINEN Teilstring sucht (ein Tripel je Wort), und hängt bei einer Textsuche auf `ir.attachment` (`name`/`index_content` mit like-Operator) einen `hint` auf `search_documents` an. `get_document_text` und `read_attachment` nennen das Tool als Einstieg. | `server.py search_records`, `_is_attachment_text_search`, Tool-Beschreibungen |
+
+### Server-Hinweise unter 4.096 Zeichen
+
+Der Client schneidet die Server-Hinweise nach 4.096 Zeichen ab. Gesendet
+wurden 4.694, der Block „SUPPLIER FACTS“ kam deshalb fast nicht mehr an.
+Die Details zur Bankabstimmung stehen jetzt wortgleich in der Beschreibung
+von `execute_method` (`BANK_RECONCILIATION_GUIDE`; Tool-Beschreibungen
+kommen ungekürzt an), in den Hinweisen bleiben Regel und Verweis. Neu ist
+der Abschnitt „DOCUMENTS“ direkt nach „READ“. Stand: 4.026 Zeichen;
+`test_server_instructions_fit_the_client_limit` hält die Grenze.
+
+Keine Odoo-Gegenseite nötig, kein Modul-Upgrade.
+
+Tests: `tests/test_document_search.py`, `tests/test_server.py`
+(`test_server_instructions_*`).
+
 ## Sync mit Upstream
 
 ```bash

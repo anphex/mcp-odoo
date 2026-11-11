@@ -22,7 +22,18 @@ All notable changes to this project will be documented in this file.
   `nesa.auto.reconcile.engine.reconcile_bank_line` and state that private
   underscore methods are refused by Odoo for the web client and RPC alike.
 
+- Added `search_documents`: keyword search over attachments (file name and
+  indexed text) with AND-combined literal keywords, merged identical files,
+  file-name matches ranked first, text snippets per hit, a "narrow it" hint
+  for broad results and per-keyword counts after an empty result.
+  `search_records` now explains that `ilike` matches one literal substring and
+  points text searches on `ir.attachment` to the new tool.
+
 ### Fixed
+- Server instructions fit the client's 4,096 character limit again (they had
+  grown to 4,694 and lost the supplier rule at the end). The bank
+  reconciliation procedure moved verbatim into the `execute_method`
+  description; the instructions keep the rule and a pointer.
 - Removed the wrong instruction that `bank.rec.widget` cannot be driven over
   RPC. It can, through stateful `onchange` calls; agents should use the public
   command instead.

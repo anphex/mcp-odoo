@@ -180,6 +180,25 @@ def test_server_instructions_name_the_public_bank_reconciliation_command():
     assert "BANK RECONCILIATION:" in instructions
     section = instructions.split("BANK RECONCILIATION:", 1)[1]
     section = section.split("SUPPLIER FACTS:", 1)[0]
+    # The instructions keep the rule and the pointer; the full procedure
+    # moved into the execute_method description (2026-11-11), because the
+    # client cuts the instructions after 4,096 characters.
+    for marker in (
+        "bank.rec.widget",
+        "nesa.auto.reconcile.engine",
+        "reconcile_bank_line",
+        "execute_method tool description",
+        "PRIVATE METHODS:",
+        "starting with '_'",
+        "execute_method cannot reach them",
+        "tell the user that one is missing",
+    ):
+        assert marker in section
+
+    tools = {tool.name: tool for tool in asyncio.run(server.mcp.list_tools())}
+    guide = tools["execute_method"].description
+    assert "BANK RECONCILIATION:" in guide
+    guide = guide.split("BANK RECONCILIATION:", 1)[1]
     for marker in (
         "bank.rec.widget",
         "onchange",
@@ -195,14 +214,39 @@ def test_server_instructions_name_the_public_bank_reconciliation_command():
         "open at -100 paid with -95 also needs +5",
         "never from a guess",
         "Partial payments, foreign currency and taxed rest lines",
-        "PRIVATE METHODS:",
-        "starting with '_'",
-        "execute_method cannot reach them",
-        "tell the user that one is missing",
+    ):
+        assert marker in guide
+    # The command takes a flat id list; a nested one is rejected.
+    assert "[invoice_ids]" not in guide
+
+
+def test_server_instructions_fit_the_client_limit():
+    server = importlib.import_module("odoo_mcp.server")
+
+    instructions = server.mcp.instructions or ""
+    # The client cuts longer instructions without notice; on 2026-11-11 that
+    # had silently removed the supplier rule at the end.
+    assert len(instructions) <= server.SERVER_INSTRUCTIONS_MAX_CHARS == 4096
+    assert instructions.rstrip().endswith("as the customer number.")
+
+
+def test_server_instructions_route_document_searches_to_the_keyword_tool():
+    server = importlib.import_module("odoo_mcp.server")
+
+    instructions = server.mcp.instructions or ""
+    assert "DOCUMENTS:" in instructions
+    section = instructions.split("DOCUMENTS:", 1)[1].split("RECORD CHECK", 1)[0]
+    for marker in (
+        "search_documents",
+        "never with one generic word",
+        "2-4 keywords",
+        "[\"Tesla\", \"Zulassung\"]",
+        "all must match",
+        "snippets",
+        "get_document_text",
+        "read_attachment",
     ):
         assert marker in section
-    # The command takes a flat id list; a nested one is rejected.
-    assert "[invoice_ids]" not in section
 
 
 def test_server_registers_expected_tools_and_resources_without_lifespan():
@@ -257,9 +301,11 @@ def test_server_registers_expected_tools_and_resources_without_lifespan():
         "price_preview",
         # NESA 2026-09-18 — effective form view, metadata and values in one call.
         "inspect_record_form",
+        # NESA 2026-11-11 — keyword search over attachments with snippets.
+        "search_documents",
     }
     assert expected_tools <= tools
-    assert len(tools) == 37
+    assert len(tools) == 38
     assert "odoo://models" in resources
     assert {
         "odoo://model/{model_name}",
@@ -1282,7 +1328,7 @@ def test_profile_health_and_prompts_are_available():
 
     health = call_tool_json(server, "health_check", {})
     assert health["success"] is True
-    assert health["server"]["tool_count"] == 37
+    assert health["server"]["tool_count"] == 38
     assert health["runtime"]["chatter_direct_enabled"] is False
     assert health["runtime"]["broad_unknown_method_mode"]["enabled"] is False
 
@@ -2535,7 +2581,7 @@ def test_max_smart_fields_invalid_env_falls_back_to_default(monkeypatch):
 def test_mcp_surface_counts_reports_v030_totals():
     server = importlib.import_module("odoo_mcp.server")
     counts = server.mcp_surface_counts()
-    assert counts["tool_count"] == 37
+    assert counts["tool_count"] == 38
     assert counts["prompt_count"] == 5
     # 1 fixed resource + 3 templates = 4
     assert counts["resource_count"] == 4
